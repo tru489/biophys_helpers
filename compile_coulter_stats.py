@@ -40,11 +40,8 @@ def parse_cli_args():
 
     args = parser.parse_args()
 
-    
-    if Path(args.directory).is_dir:
-        print(f"The directory '{args.directory}' exists.")
-    else:
-        print(f"The directory '{args.directory}' does not exist.")
+    if not Path(args.directory).is_dir:
+        raise FileNotFoundError(f"The directory '{args.directory}' does not exist.")
 
     return args.directory
 
