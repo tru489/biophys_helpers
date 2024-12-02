@@ -11,7 +11,7 @@ def main():
     data
     """
     # Get directory path
-    dir_path = parse_cli_args()
+    dir_path, run_stats, run_sc = parse_cli_args()
     dp_obj = Path(dir_path)
 
     # Filter files
@@ -22,31 +22,44 @@ def main():
     filenames.sort()
     full_fpaths = [dp_obj / Path(filename) for filename in filenames]
 
-    df_sc = get_sc_volume_fromdir(full_fpaths)
-    df_sc.to_csv(dp_obj / Path('single_cell_volumes.csv'), index=False)
+    if run_sc:
+        df_sc = get_sc_volume_fromdir(full_fpaths)
+        df_sc.to_csv(dp_obj / Path('single_cell_volumes.csv'), index=False)
 
-    df_stats = get_volume_stats_fromdir(full_fpaths)
-    df_stats.to_csv(dp_obj / Path('stats.csv'))
+    if run_stats:
+        df_stats = get_volume_stats_fromdir(full_fpaths)
+        df_stats.to_csv(dp_obj / Path('stats.csv'))
 
 def parse_cli_args():
     """
     Parse CLI arguments. Takes path to coulter counter directory as CLI argument
+    Arguments:
+        None: saves stats and single cell data files
+        -stats: only saves stats file
+        -single: only saves single cell data
 
     Raises:
         FileNotFoundError: directory does not exist
 
     Returns:
-        str: directory
+        tuple(str, bool, bool): directory, whether just stats are requested, 
+            whether just single cell volumes are requested
     """
     parser = argparse.ArgumentParser(description="Process a directory path.")
     parser.add_argument('directory', type=str, help='Path to the directory')
+    parser.add_argument('-stats', action='store_true', help='Include stats')
+    parser.add_argument('-single', action='store_true', help='Single mode')
 
     args = parser.parse_args()
 
     if not Path(args.directory).is_dir:
         raise FileNotFoundError(f"The directory '{args.directory}' does not exist.")
 
-    return args.directory
+    if not args.stats and not args.single:
+        args.stats = True
+        args.single = True
+
+    return args.directory, args.stats, args.single
 
 def get_sc_volume_fromdir(full_fpaths) -> pd.DataFrame:
     """
