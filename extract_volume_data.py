@@ -6,9 +6,9 @@ import numpy as np
 
 def main():
     """
-    Write 2 CSVs from coulter counter files, 1 with summary stats based on pre-
-    selected data from multisizer software, and 1 with full single-cell volume 
-    data
+    Write 2 CSVs from a directory containing coulter counter files, 1 with 
+    summary stats based on preselected data from multisizer software, and 1 
+    with full single-cell volume data
     """
     # Get directory path
     dir_path, run_stats, run_sc = parse_cli_args()
