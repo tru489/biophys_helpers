@@ -37,8 +37,8 @@ def parse_cli_args():
 
 def aggr_csvs(dirpath: Path, aggr_dir_name: str):
     # Define the regex patterns
-    subdir_pattern = re.compile(r"\d{8}\.\d{6}[a-zA-Z\d_-]*")
-    csv_pattern = re.compile(r"\d{4}-\d{2}-\d{2}[a-zA-Z\d_-]*\.csv")
+    subdir_pattern = re.compile(r"\d{8}\.\d{6}[a-zA-Z\d\s_+-]*")
+    csv_pattern = re.compile(r"\d{4}-\d{2}-\d{2}[a-zA-Z\d\s_+-]*\.csv")
 
     # Iterate through each subdirectory in the base directory
     for subdir in dirpath.iterdir():
@@ -56,6 +56,7 @@ def aggr_csvs(dirpath: Path, aggr_dir_name: str):
                     # Look for .csv files matching the pattern
                     for file in inner_subdir.iterdir():
                         if file.is_file() and csv_pattern.match(file.name):
+                            print(f'Found: {file.name}')
                             # Define the new directory path
                             new_dir = dirpath / aggr_dir_name
                             new_dir.mkdir(exist_ok=True)
