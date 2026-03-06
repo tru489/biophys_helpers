@@ -1,0 +1,7 @@
+name: biophys_helpers
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas

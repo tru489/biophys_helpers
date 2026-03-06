@@ -22,12 +22,14 @@ def main():
     filenames.sort()
     full_fpaths = [dp_obj / Path(filename) for filename in filenames]
 
+    file_stems, vol_list, stats_list = _parse_coulter_files(full_fpaths)
+
     if run_sc:
-        df_sc = get_sc_volume_fromdir(full_fpaths)
+        df_sc = _build_sc_df(file_stems, vol_list)
         df_sc.to_csv(dp_obj / Path('single_cell_volumes.csv'), index=False)
 
     if run_stats:
-        df_stats = get_volume_stats_fromdir(full_fpaths)
+        df_stats = _build_stats_df(file_stems, stats_list)
         df_stats.to_csv(dp_obj / Path('stats.csv'))
 
 def parse_cli_args():
@@ -61,65 +63,68 @@ def parse_cli_args():
 
     return args.directory, args.stats, args.single
 
+def _parse_coulter_files(full_fpaths) -> tuple:
+    """
+    Opens each .#m4 file once and extracts both single-cell volumes and stats.
+
+    Args:
+        full_fpaths (list(Path)): list of file paths to be parsed
+
+    Returns:
+        tuple(list(str), list(np.array), list(dict)): file stems, volumes per
+            file, stats per file
+    """
+    file_stems, vol_list, stats_list = [], [], []
+    n = len(full_fpaths)
+    for i, fn in enumerate(full_fpaths, 1):
+        print(f"Parsing file {i}/{n}: {fn.name}")
+        coulter_file = CoulterFile(fn.resolve())
+        file_stems.append(Path(fn).stem)
+        vol_list.append(coulter_file.get_volumes())
+        stats_list.append(coulter_file.get_stats())
+    return file_stems, vol_list, stats_list
+
+def _build_sc_df(file_stems, vol_list) -> pd.DataFrame:
+    max_length = max(len(arr) for arr in vol_list)
+    padded_arrays = []
+    for arr in vol_list:
+        padded_arr = np.full(max_length, np.nan)
+        padded_arr[:len(arr)] = arr
+        padded_arrays.append(padded_arr)
+    return pd.DataFrame(np.column_stack(padded_arrays), columns=file_stems)
+
+def _build_stats_df(file_stems, stats_list) -> pd.DataFrame:
+    keys_ = stats_list[0].keys()
+    full_dict = {fs: [d[k] for k in keys_] for fs, d in zip(file_stems, stats_list)}
+    df = pd.DataFrame.from_dict(full_dict)
+    df.index = keys_
+    return df
+
 def get_sc_volume_fromdir(full_fpaths) -> pd.DataFrame:
     """
     Gets a dataframe containing single cell volume data from dir of .#m4 files
 
     Args:
-        full_fpaths (list(str)): list of file paths to be parsed
+        full_fpaths (list(Path)): list of file paths to be parsed
 
     Returns:
         DataFrame: single-cell volume data for each coulter counter file in dir
     """
-    vol_list = []
-    file_stems = []
-    for fn in full_fpaths:
-        coulter_file = CoulterFile(fn.resolve())
-        vol_list.append(coulter_file.get_volumes())
-        file_stems.append(Path(fn).stem)
-    
-    max_length = max(len(arr) for arr in vol_list)
-
-    # Pad the arrays with NaN
-    padded_arrays = []
-    for arr in vol_list:
-        # Create a new array filled with NaN, and then fill it with the values of the original array
-        padded_arr = np.full(max_length, np.nan)  # or you can use None
-        padded_arr[:len(arr)] = arr
-        padded_arrays.append(padded_arr)
-
-    # Convert to a 2D numpy array
-    data_to_write = np.column_stack(padded_arrays)
-
-    # Write to CSV using pandas for easier handling
-    return pd.DataFrame(data_to_write, columns=file_stems)
+    file_stems, vol_list, _ = _parse_coulter_files(full_fpaths)
+    return _build_sc_df(file_stems, vol_list)
 
 def get_volume_stats_fromdir(full_fpaths) -> pd.DataFrame:
     """
     Gets a dataframe containing volume statistic data from dir of .#m4 files
 
     Args:
-        full_fpaths (list(str)): list of file paths to be parsed
+        full_fpaths (list(Path)): list of file paths to be parsed
 
     Returns:
         DataFrame: volume stat data for each coulter counter file in dir
     """
-    all_dicts = []
-    file_stems = []
-    for fn in full_fpaths:
-        coulter_file = CoulterFile(fn.resolve())
-        dict_single = coulter_file.get_stats()
-        all_dicts.append(dict_single)
-        file_stems.append(Path(fn).stem)
-    
-    keys_ = all_dicts[0].keys()
-    full_dict = {fs: [] for fs in file_stems}
-    for i, fs in enumerate(file_stems):
-        for k in keys_:
-            full_dict[fs].append(all_dicts[i][k])
-    df = pd.DataFrame.from_dict(full_dict)
-    df.index = keys_
-    return df
+    file_stems, _, stats_list = _parse_coulter_files(full_fpaths)
+    return _build_stats_df(file_stems, stats_list)
 
 if __name__ == "__main__":
     main()
