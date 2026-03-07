@@ -1,3 +1,18 @@
+"""
+extract_coulter_data.py
+
+Parses a directory of Coulter counter (.#m4) files and exports CSV files
+containing single-cell volume measurements and/or summary statistics
+pre-selected in the Multisizer software.
+
+Usage:
+    python extract_coulter_data.py <directory> [-stats] [-single]
+
+    <directory>   Path to folder containing .#m4 files
+    -stats        Write only stats.csv
+    -single       Write only single_cell_volumes.csv
+    (no flags)    Write both output files
+"""
 import pandas as pd
 import argparse
 from pathlib import Path
