@@ -6,11 +6,12 @@ containing single-cell volume measurements and/or summary statistics
 pre-selected in the Multisizer software.
 
 Usage:
-    python extract_coulter_data.py <directory> [-stats] [-single]
+    python extract_coulter_data.py <directory> [-stats] [-single] [-r]
 
     <directory>   Path to folder containing .#m4 files
-    -stats        Write only stats.csv
-    -single       Write only single_cell_volumes.csv
+    -stats        Write only <dirname>_volume_stats.csv
+    -single       Write only <dirname>_single_cell_volumes.csv
+    -r            Recursively include .#m4 files from subdirectories
     (no flags)    Write both output files
 """
 import pandas as pd
@@ -21,31 +22,26 @@ import numpy as np
 
 def main():
     """
-    Write 2 CSVs from a directory containing coulter counter files, 1 with 
-    summary stats based on preselected data from multisizer software, and 1 
+    Write 2 CSVs from a directory containing coulter counter files, 1 with
+    summary stats based on preselected data from multisizer software, and 1
     with full single-cell volume data
     """
     # Get directory path
-    dir_path, run_stats, run_sc = parse_cli_args()
+    dir_path, run_stats, run_sc, recursive = parse_cli_args()
     dp_obj = Path(dir_path)
+    dirname = dp_obj.name
 
-    # Filter files
-    file_criteria = lambda entry: entry.is_file() \
-        and not entry.name.startswith('.') \
-        and '.#m4' in entry.name
-    filenames = [entry.name for entry in dp_obj.iterdir() if file_criteria(entry)]
-    filenames.sort()
-    full_fpaths = [dp_obj / Path(filename) for filename in filenames]
+    full_fpaths, display_names = _collect_files(dp_obj, recursive)
 
-    file_stems, vol_list, stats_list = _parse_coulter_files(full_fpaths)
+    file_stems, vol_list, stats_list = _parse_coulter_files(full_fpaths, display_names)
 
     if run_sc:
         df_sc = _build_sc_df(file_stems, vol_list)
-        df_sc.to_csv(dp_obj / Path('single_cell_volumes.csv'), index=False)
+        df_sc.to_csv(dp_obj / Path(f'{dirname}_single_cell_volumes.csv'), index=False)
 
     if run_stats:
         df_stats = _build_stats_df(file_stems, stats_list)
-        df_stats.to_csv(dp_obj / Path('stats.csv'))
+        df_stats.to_csv(dp_obj / Path(f'{dirname}_volume_stats.csv'))
 
 def parse_cli_args():
     """
@@ -66,6 +62,7 @@ def parse_cli_args():
     parser.add_argument('directory', type=str, help='Path to the directory')
     parser.add_argument('-stats', action='store_true', help='Include stats')
     parser.add_argument('-single', action='store_true', help='Single mode')
+    parser.add_argument('-r', action='store_true', help='Recursively include subdirectories')
 
     args = parser.parse_args()
 
@@ -76,9 +73,46 @@ def parse_cli_args():
         args.stats = True
         args.single = True
 
-    return args.directory, args.stats, args.single
+    return args.directory, args.stats, args.single, args.r
 
-def _parse_coulter_files(full_fpaths) -> tuple:
+def _collect_files(dp_obj: Path, recursive: bool) -> tuple:
+    """
+    Collect .#m4 files from dp_obj. If recursive, also descends into subdirectories,
+    prefixing each file stem with underscore-joined subdir path components.
+
+    Args:
+        dp_obj (Path): root directory
+        recursive (bool): whether to recurse into subdirectories
+
+    Returns:
+        tuple(list(Path), list(str)): full file paths and display names
+    """
+    is_m4 = lambda p: not p.name.startswith('.') and '.#m4' in p.name
+
+    full_fpaths = []
+    display_names = []
+
+    # Files directly in the root dir (no prefix)
+    root_files = sorted([e for e in dp_obj.iterdir() if e.is_file() and is_m4(e)],
+                        key=lambda p: p.name)
+    for f in root_files:
+        full_fpaths.append(f)
+        display_names.append(f.stem)
+
+    if recursive:
+        subdirs = sorted([e for e in dp_obj.iterdir() if e.is_dir() and not e.name.startswith('.')])
+        for subdir in subdirs:
+            for f in sorted(subdir.rglob('*') if True else [], key=lambda p: p):
+                if f.is_file() and is_m4(f):
+                    rel = f.relative_to(dp_obj)
+                    prefix = '_'.join(rel.parts[:-1])
+                    display_names.append(f'{prefix}_{f.stem}')
+                    full_fpaths.append(f)
+
+    return full_fpaths, display_names
+
+
+def _parse_coulter_files(full_fpaths, display_names=None) -> tuple:
     """
     Opens each .#m4 file once and extracts both single-cell volumes and stats.
 
@@ -89,12 +123,14 @@ def _parse_coulter_files(full_fpaths) -> tuple:
         tuple(list(str), list(np.array), list(dict)): file stems, volumes per
             file, stats per file
     """
+    if display_names is None:
+        display_names = [Path(fn).stem for fn in full_fpaths]
     file_stems, vol_list, stats_list = [], [], []
     n = len(full_fpaths)
-    for i, fn in enumerate(full_fpaths, 1):
+    for i, (fn, name) in enumerate(zip(full_fpaths, display_names), 1):
         print(f"Parsing file {i}/{n}: {fn.name}")
         coulter_file = CoulterFile(fn.resolve())
-        file_stems.append(Path(fn).stem)
+        file_stems.append(name)
         vol_list.append(coulter_file.get_volumes())
         stats_list.append(coulter_file.get_stats())
     return file_stems, vol_list, stats_list
