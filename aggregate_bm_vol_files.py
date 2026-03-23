@@ -21,6 +21,7 @@ import argparse
 from pathlib import Path
 import re
 import shutil
+import pandas as pd
 
 
 def main():
@@ -85,40 +86,27 @@ def parse_cli_args():
 
 def _find_bm_csvs(superdir: Path) -> list:
     """
-    Finds buoyant mass CSV files within a superdir.
-
-    Each direct subdir of superdir may contain one run subdir matching
-    \d{8}.\d{6}... from which a dated CSV is collected.
+    Finds buoyant mass CSV files within a superdir, searching recursively
+    at any depth for directories matching *_mass_results. Collects all CSV
+    files within those directories, excluding any named curation_index*.csv.
 
     Args:
         superdir (Path): superdir to search
 
-    Raises:
-        RuntimeError: more than one BM CSV found within a single sample subdir
-
     Returns:
         list(Path): matched CSV files
     """
-    subdir_pattern = re.compile(r"\d{8}\.\d{6}[a-zA-Z\d\s_+-]*")
-    csv_pattern = re.compile(r"\d{4}-\d{2}-\d{2}[a-zA-Z\d\s_+-]*\.csv")
+    run_dir_pattern = re.compile(r".+_mass_results$")
     found = []
 
-    for subdir in sorted(superdir.iterdir()):
-        if not subdir.is_dir():
+    for run_dir in sorted(superdir.rglob('*')):
+        if not (run_dir.is_dir() and run_dir_pattern.match(run_dir.name)):
             continue
-        subdir_found = False
-        for inner_subdir in subdir.iterdir():
-            if not (inner_subdir.is_dir() and subdir_pattern.match(inner_subdir.name)):
-                continue
-            if subdir_found:
-                raise RuntimeError(
-                    f"Multiple BM CSVs found in directory {subdir.name}"
-                )
-            for file in inner_subdir.iterdir():
-                if file.is_file() and csv_pattern.match(file.name):
-                    found.append(file)
-                    subdir_found = True
-                    break
+        for file in sorted(run_dir.iterdir()):
+            if (file.is_file()
+                    and file.suffix == '.csv'
+                    and not file.name.startswith('curation_index')):
+                found.append(file)
 
     return found
 
@@ -127,7 +115,7 @@ def _find_fxm_csvs(superdir: Path) -> list:
     """
     Finds FXM ProcessedVolumes CSV files within a superdir.
 
-    Looks for run dirs matching \d{8}_\d{6}_imaging_fxm_results, then descends
+    Looks for run dirs matching \\d{8}_\\d{6}_imaging_fxm_results, then descends
     into stage2_analysis/ for *_ProcessedVolumes.csv files.
 
     Args:
@@ -156,6 +144,36 @@ def _find_fxm_csvs(superdir: Path) -> list:
     return found
 
 
+def _build_mass_pg_csv(all_bm_files: list, aggr_dir: Path):
+    """
+    Reads the mass_pg column from every BM CSV across all superdirs and writes
+    a single combined CSV to aggr_dir/mass_pg.csv. Each column is named by
+    joining the superdir name and the relative path components from superdir
+    down to the file with underscores, e.g. superdir_groupA_run_dir_file.csv.
+
+    Args:
+        all_bm_files (list(tuple(Path, Path))): (csv_path, superdir) pairs
+        aggr_dir (Path): aggregated/ directory where the summary is written
+    """
+    series_list = []
+    for f, superdir in all_bm_files:
+        df = pd.read_csv(f)
+        if 'mass_pg' not in df.columns:
+            continue
+        rel_parts = f.relative_to(superdir).parts  # (..., mass_results_dir, file.csv)
+        rel_parts = rel_parts[:-2] + rel_parts[-1:]  # drop the mass_results dir
+        col_name = '_'.join((superdir.name,) + rel_parts)
+        series_list.append(df['mass_pg'].rename(col_name))
+
+    if not series_list:
+        return
+
+    combined = pd.concat(series_list, axis=1)
+    out_path = aggr_dir / 'mass_pg.csv'
+    combined.to_csv(out_path, index=False)
+    print(f"\n[mass_pg] Summary written to {out_path}")
+
+
 def aggregate_all(superdirs: list, output_dir: Path):
     """
     Aggregates BM and FXM CSVs from all superdirs into:
@@ -167,16 +185,19 @@ def aggregate_all(superdirs: list, output_dir: Path):
         output_dir (Path): parent directory for the aggregated folder
     """
     aggr_dir = output_dir / 'aggregated'
+    all_bm_files = []
 
     for superdir in superdirs:
         print(f"\nProcessing: {superdir.name}")
 
         bm_files = _find_bm_csvs(superdir)
-        for f in bm_files:
+        if bm_files:
             dest = aggr_dir / 'smr_data' / superdir.name
             dest.mkdir(parents=True, exist_ok=True)
-            print(f"  [BM]  {f.name}")
-            shutil.copy(f, dest / f.name)
+            for f in bm_files:
+                print(f"  [BM]  {f.name}")
+                shutil.copy(f, dest / f.name)
+                all_bm_files.append((f, superdir))
 
         fxm_files = _find_fxm_csvs(superdir)
         for f in fxm_files:
@@ -188,6 +209,8 @@ def aggregate_all(superdirs: list, output_dir: Path):
         if not bm_files and not fxm_files:
             print("  No matching files found.")
 
+    aggr_dir.mkdir(parents=True, exist_ok=True)
+    _build_mass_pg_csv(all_bm_files, aggr_dir)
     print(f"\nDone. Output written to: {aggr_dir}")
 
 
