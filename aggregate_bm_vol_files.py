@@ -21,7 +21,11 @@ import argparse
 from pathlib import Path
 import re
 import shutil
+from datetime import datetime
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 
 def main():
@@ -172,6 +176,33 @@ def _build_mass_pg_csv(all_bm_files: list, aggr_dir: Path):
     out_path = aggr_dir / 'mass_pg.csv'
     combined.to_csv(out_path, index=False)
     print(f"\n[mass_pg] Summary written to {out_path}")
+    _plot_mass_pg_histograms(combined, aggr_dir)
+
+
+def _plot_mass_pg_histograms(combined: pd.DataFrame, aggr_dir: Path):
+    """
+    Saves a histogram PNG for each column in combined into aggr_dir/fig/.
+
+    Args:
+        combined (pd.DataFrame): mass_pg data, one column per sample
+        aggr_dir (Path): aggregated/ directory; fig/ subfolder is created here
+    """
+    fig_dir = aggr_dir / 'fig' / 'mass_pg'
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    for col in combined.columns:
+        data = combined[col].dropna()
+        fig, ax = plt.subplots(figsize=(14, 6))
+        ax.hist(data, bins=40, edgecolor='black', linewidth=0.5)
+        ax.set_title(col, fontsize=8, wrap=True)
+        ax.set_xlabel('mass (pg)')
+        ax.set_ylabel('count')
+        plt.tight_layout()
+        safe_name = col.replace('/', '_').replace(' ', '_')
+        fig.savefig(fig_dir / f'{safe_name}.png', dpi=150)
+        plt.close(fig)
+
+    print(f"[mass_pg] {len(combined.columns)} histograms written to {fig_dir}")
 
 
 def aggregate_all(superdirs: list, output_dir: Path):
@@ -184,7 +215,8 @@ def aggregate_all(superdirs: list, output_dir: Path):
         superdirs (list(Path)): list of superdirs to process
         output_dir (Path): parent directory for the aggregated folder
     """
-    aggr_dir = output_dir / 'aggregated'
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    aggr_dir = output_dir / f'{timestamp}_aggregated'
     all_bm_files = []
 
     for superdir in superdirs:

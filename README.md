@@ -10,15 +10,15 @@ Helper scripts for analyzing biophysical data from Coulter counter, SMR, and ima
 
 Parses a directory of Coulter counter `.#m4` files and writes one or both of:
 
-- `single_cell_volumes.csv` — single-cell volume measurements, one column per
+- `<dirname>_single_cell_volumes.csv` — single-cell volume measurements, one column per
   file, NaN-padded to equal length
-- `stats.csv` — summary statistics pre-selected in the Multisizer software,
+- `<dirname>_volume_stats.csv` — summary statistics pre-selected in the Multisizer software,
   one column per file
 
 **Usage**
 
 ```
-python extract_coulter_data.py <directory> [-stats] [-single]
+python extract_coulter_data.py <directory> [-stats] [-single] [-r]
 ```
 
 | Argument | Description |
@@ -26,6 +26,7 @@ python extract_coulter_data.py <directory> [-stats] [-single]
 | `directory` | Path to folder containing `.#m4` files |
 | `-stats` | Write only the stats CSV |
 | `-single` | Write only the single-cell volumes CSV |
+| `-r` | Recursively include `.#m4` files from subdirectories; column names are prefixed with the relative subdir path |
 
 If neither `-stats` nor `-single` is provided, both files are written.
 
@@ -40,6 +41,9 @@ python extract_coulter_data.py "E:/data/my_experiment" -stats
 
 # Write only the single-cell volumes CSV
 python extract_coulter_data.py "E:/data/my_experiment" -single
+
+# Include .#m4 files from all subdirectories
+python extract_coulter_data.py "E:/data/my_experiment" -r
 ```
 
 ---
@@ -48,27 +52,33 @@ python extract_coulter_data.py "E:/data/my_experiment" -single
 
 Aggregates buoyant mass (BM) CSVs from SMR runs and/or FXM volume
 (`_ProcessedVolumes.csv`) CSVs from FXM runs across one or more experiment
-superdirectories. Results are copied into a single `aggregated/` folder,
-organised by data type and superdir name:
+superdirectories. Results are copied into a timestamped `<timestamp>_aggregated/`
+folder, organised by data type and superdir name. Additionally writes a combined
+`mass_pg.csv` and per-sample histogram PNGs.
 
 ```
-aggregated/
-  buoyant_mass/
+<timestamp>_aggregated/
+  smr_data/
     <superdir_name>/
       <csv files>
-  volumes/
+  imaging_fxm/
     <superdir_name>/
       <csv files>
+  mass_pg.csv
+  fig/
+    mass_pg/
+      <sample>.png
 ```
 
 **Expected directory structure**
 
-BM files (produced by SMR software):
+BM files (produced by SMR software) — searched recursively for any directory
+named `*_mass_results`; all CSVs within (except `curation_index*.csv`) are collected:
 ```
 <superdir>/
-  <sample_subdir>/
-    <YYYYMMDD.HHMMSS>_run/
-      <YYYY-MM-DD>_<name>.csv
+  .../<any_depth>/
+    <name>_mass_results/
+      <csv files>
 ```
 
 FXM volume files (produced by `FXMAnalysis.py`):

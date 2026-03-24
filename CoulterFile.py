@@ -20,7 +20,10 @@ class CoulterFile():
         with fp.open('r') as file:
             lines = file.readlines()
 
-        self.stats = self._get_selection_stats(lines)
+        try:
+            self.stats = self._get_selection_stats(lines)
+        except ValueError:
+            self.stats = None
         self.bin_edges_diameter, self.bin_edges_volume, self.bin_counts = \
             self._get_hist(lines)
         self.diameters, self.volumes = self._get_single_cell(lines)
@@ -143,8 +146,16 @@ class CoulterFile():
     def get_diameters(self) -> np.array:
         return self.diameters
     
-    def get_volumes(self) -> np.array:
+    def get_volumes_ungated(self) -> np.array:
         return self.volumes
+
+    def get_volumes_gated(self) -> np.array:
+        if self.stats is None:
+            return None
+        min_size = float(self.stats['MinSize'])
+        max_size = float(self.stats['MaxSize'])
+        mask = (self.volumes >= min_size) & (self.volumes <= max_size)
+        return self.volumes[mask]
 
 
 def pairwise_mean(lst) -> list:

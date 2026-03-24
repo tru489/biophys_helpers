@@ -17,8 +17,12 @@ Usage:
 import pandas as pd
 import argparse
 from pathlib import Path
+from datetime import datetime
 from CoulterFile import CoulterFile
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 def main():
     """
@@ -33,15 +37,35 @@ def main():
 
     full_fpaths, display_names = _collect_files(dp_obj, recursive)
 
-    file_stems, vol_list, stats_list = _parse_coulter_files(full_fpaths, display_names)
+    all_stems, vol_list, stats_stems, gated_vol_list, stats_list, skipped = \
+        _parse_coulter_files(full_fpaths, display_names)
+
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    out_dir = dp_obj / f'{timestamp}_coulter-processed'
+    out_dir.mkdir()
 
     if run_sc:
-        df_sc = _build_sc_df(file_stems, vol_list)
-        df_sc.to_csv(dp_obj / Path(f'{dirname}_single_cell_volumes.csv'), index=False)
+        _build_sc_df(all_stems, vol_list).to_csv(
+            out_dir / f'{dirname}_sc_volumes_ungated.csv', index=False)
+        if stats_stems:
+            _build_sc_df(stats_stems, gated_vol_list).to_csv(
+                out_dir / f'{dirname}_sc_volumes_gated.csv', index=False)
 
-    if run_stats:
-        df_stats = _build_stats_df(file_stems, stats_list)
-        df_stats.to_csv(dp_obj / Path(f'{dirname}_volume_stats.csv'))
+        # histograms: gated where available, ungated as fallback
+        hist_vols = dict(zip(all_stems, vol_list))
+        for stem, gated in zip(stats_stems, gated_vol_list):
+            hist_vols[stem] = gated
+        _plot_sc_histograms(hist_vols, out_dir)
+
+    if run_stats and stats_stems:
+        _build_stats_df(stats_stems, stats_list).to_csv(
+            out_dir / f'{dirname}_volume_stats.csv')
+
+    if skipped:
+        print(f"\nWarning: {len(skipped)} file(s) missing [SizeStats] — "
+              f"excluded from gated and stats outputs:")
+        for name in skipped:
+            print(f"  {name}")
 
 def parse_cli_args():
     """
@@ -125,15 +149,22 @@ def _parse_coulter_files(full_fpaths, display_names=None) -> tuple:
     """
     if display_names is None:
         display_names = [Path(fn).stem for fn in full_fpaths]
-    file_stems, vol_list, stats_list = [], [], []
+    all_stems, vol_list = [], []
+    stats_stems, gated_vol_list, stats_list = [], [], []
+    skipped = []
     n = len(full_fpaths)
     for i, (fn, name) in enumerate(zip(full_fpaths, display_names), 1):
         print(f"Parsing file {i}/{n}: {fn.name}")
         coulter_file = CoulterFile(fn.resolve())
-        file_stems.append(name)
-        vol_list.append(coulter_file.get_volumes())
-        stats_list.append(coulter_file.get_stats())
-    return file_stems, vol_list, stats_list
+        all_stems.append(name)
+        vol_list.append(coulter_file.get_volumes_ungated())
+        if coulter_file.get_stats() is not None:
+            stats_stems.append(name)
+            gated_vol_list.append(coulter_file.get_volumes_gated())
+            stats_list.append(coulter_file.get_stats())
+        else:
+            skipped.append(fn.name)
+    return all_stems, vol_list, stats_stems, gated_vol_list, stats_list, skipped
 
 def _build_sc_df(file_stems, vol_list) -> pd.DataFrame:
     max_length = max(len(arr) for arr in vol_list)
@@ -151,6 +182,30 @@ def _build_stats_df(file_stems, stats_list) -> pd.DataFrame:
     df.index = keys_
     return df
 
+def _plot_sc_histograms(hist_vols: dict, out_dir: Path):
+    """
+    Saves a histogram PNG for each sample into out_dir/fig/.
+
+    Args:
+        hist_vols (dict): {display_name: volume_array} — gated where available,
+            ungated as fallback
+        out_dir (Path): timestamped output directory; fig/ subfolder created here
+    """
+    fig_dir = out_dir / 'fig'
+    fig_dir.mkdir(exist_ok=True)
+    for col, data in hist_vols.items():
+        fig, ax = plt.subplots(figsize=(14, 6))
+        ax.hist(data, bins=40, edgecolor='black', linewidth=0.5)
+        ax.set_title(col, fontsize=8, wrap=True)
+        ax.set_xlabel('volume (fL)')
+        ax.set_ylabel('count')
+        plt.tight_layout()
+        safe_name = col.replace('/', '_').replace(' ', '_')
+        fig.savefig(fig_dir / f'{safe_name}.png', dpi=150)
+        plt.close(fig)
+    print(f"[histograms] {len(hist_vols)} histograms written to {fig_dir}")
+
+
 def get_sc_volume_fromdir(full_fpaths) -> pd.DataFrame:
     """
     Gets a dataframe containing single cell volume data from dir of .#m4 files
@@ -161,8 +216,8 @@ def get_sc_volume_fromdir(full_fpaths) -> pd.DataFrame:
     Returns:
         DataFrame: single-cell volume data for each coulter counter file in dir
     """
-    file_stems, vol_list, _ = _parse_coulter_files(full_fpaths)
-    return _build_sc_df(file_stems, vol_list)
+    all_stems, vol_list, _, _, _, _ = _parse_coulter_files(full_fpaths)
+    return _build_sc_df(all_stems, vol_list)
 
 def get_volume_stats_fromdir(full_fpaths) -> pd.DataFrame:
     """
@@ -174,8 +229,8 @@ def get_volume_stats_fromdir(full_fpaths) -> pd.DataFrame:
     Returns:
         DataFrame: volume stat data for each coulter counter file in dir
     """
-    file_stems, _, stats_list = _parse_coulter_files(full_fpaths)
-    return _build_stats_df(file_stems, stats_list)
+    _, _, stats_stems, _, stats_list, _ = _parse_coulter_files(full_fpaths)
+    return _build_stats_df(stats_stems, stats_list)
 
 if __name__ == "__main__":
     main()
