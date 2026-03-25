@@ -11,8 +11,8 @@ Usage:
     <directory>   Path to folder containing .#m4 files
     -stats        Write only <dirname>_volume_stats.csv
     -single       Write only <dirname>_single_cell_volumes.csv
-    -r            Recursively include .#m4 files from subdirectories
     (no flags)    Write both output files
+    -r            Recursively include .#m4 files from subdirectories
 """
 import pandas as pd
 import argparse
@@ -48,14 +48,13 @@ def main():
         _build_sc_df(all_stems, vol_list).to_csv(
             out_dir / f'{dirname}_sc_volumes_ungated.csv', index=False)
         if stats_stems:
-            _build_sc_df(stats_stems, gated_vol_list).to_csv(
-                out_dir / f'{dirname}_sc_volumes_gated.csv', index=False)
+            gated_csv = out_dir / f'{dirname}_sc_volumes_gated.csv'
+            _build_sc_df(stats_stems, gated_vol_list).to_csv(gated_csv, index=False)
+            _write_gating_log(out_dir, dp_obj, dirname, stats_stems, gated_vol_list,
+                              stats_list, all_stems, vol_list, skipped, timestamp)
 
-        # histograms: gated where available, ungated as fallback
-        hist_vols = dict(zip(all_stems, vol_list))
-        for stem, gated in zip(stats_stems, gated_vol_list):
-            hist_vols[stem] = gated
-        _plot_sc_histograms(hist_vols, out_dir)
+        _plot_sc_histograms(stats_stems, stats_list, all_stems, vol_list,
+                            skipped, out_dir)
 
     if run_stats and stats_stems:
         _build_stats_df(stats_stems, stats_list).to_csv(
@@ -163,7 +162,7 @@ def _parse_coulter_files(full_fpaths, display_names=None) -> tuple:
             gated_vol_list.append(coulter_file.get_volumes_gated())
             stats_list.append(coulter_file.get_stats())
         else:
-            skipped.append(fn.name)
+            skipped.append(name)
     return all_stems, vol_list, stats_stems, gated_vol_list, stats_list, skipped
 
 def _build_sc_df(file_stems, vol_list) -> pd.DataFrame:
@@ -182,28 +181,146 @@ def _build_stats_df(file_stems, stats_list) -> pd.DataFrame:
     df.index = keys_
     return df
 
-def _plot_sc_histograms(hist_vols: dict, out_dir: Path):
+def _plot_sc_histograms(stats_stems, stats_list, all_stems, vol_list,
+                        skipped, out_dir: Path):
     """
-    Saves a histogram PNG for each sample into out_dir/fig/.
+    Saves histogram PNGs into out_dir/fig/.
 
-    Args:
-        hist_vols (dict): {display_name: volume_array} — gated where available,
-            ungated as fallback
-        out_dir (Path): timestamped output directory; fig/ subfolder created here
+    Files sharing the same (MinSize, MaxSize) gate are overlaid on one plot
+    (group_01.png, group_02.png, …), with vertical cutoff lines and shaded
+    accepted region. Files missing [SizeStats] are plotted individually.
     """
+    from collections import defaultdict
+
     fig_dir = out_dir / 'fig'
     fig_dir.mkdir(exist_ok=True)
-    for col, data in hist_vols.items():
-        fig, ax = plt.subplots(figsize=(14, 6))
-        ax.hist(data, bins=40, edgecolor='black', linewidth=0.5)
-        ax.set_title(col, fontsize=8, wrap=True)
+
+    ungated = {stem: vols for stem, vols in zip(all_stems, vol_list)}
+
+    # Build groups: (lo, hi) -> [(stem, vols), ...]
+    groups = defaultdict(list)
+    for stem, stats in zip(stats_stems, stats_list):
+        lo = float(stats['MinSize'])
+        hi = float(stats['MaxSize'])
+        groups[(lo, hi)].append((stem, ungated[stem]))
+
+    log_bins = np.logspace(np.log10(20), np.log10(100_000), 201)
+
+    n_written = 0
+    for i, ((lo, hi), entries) in enumerate(groups.items(), 1):
+        arrays = [vols[~np.isnan(vols)] for _, vols in entries]
+        arrays = [a for a in arrays if len(a) > 0]
+        if not arrays:
+            continue
+
+        fig, ax = plt.subplots(figsize=(14, 5))
+        for (stem, _), vals in zip(entries, arrays):
+            ax.hist(vals, bins=log_bins, alpha=0.5, edgecolor='black',
+                    linewidth=0.3, label=stem)
+        ax.axvline(lo, color='red', linestyle='--', linewidth=1.2,
+                   label=f'lower = {lo:.4g}')
+        ax.axvline(hi, color='steelblue', linestyle='--', linewidth=1.2,
+                   label=f'upper = {hi:.4g}')
+        ax.axvspan(lo, hi, alpha=0.08, color='green')
+        ax.set_xscale('log')
+        ax.set_xlim(20, 100_000)
         ax.set_xlabel('volume (fL)')
         ax.set_ylabel('count')
-        plt.tight_layout()
-        safe_name = col.replace('/', '_').replace(' ', '_')
-        fig.savefig(fig_dir / f'{safe_name}.png', dpi=150)
+        ax.set_title(f'Group {i}   lower = {lo:.4g} fL   upper = {hi:.4g} fL',
+                     fontsize=9)
+        ax.legend(fontsize=7, loc='upper right')
+        fig.tight_layout()
+        out_path = fig_dir / f'group_{i:02d}.png'
+        fig.savefig(out_path, dpi=150)
         plt.close(fig)
-    print(f"[histograms] {len(hist_vols)} histograms written to {fig_dir}")
+        print(f"Written: {out_path}")
+        n_written += 1
+
+    # Individual plots for files without gate stats
+    for stem in skipped:
+        vols = ungated.get(stem)
+        if vols is None or len(vols) == 0:
+            continue
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.hist(vols[~np.isnan(vols)], bins=log_bins, edgecolor='black',
+                linewidth=0.3)
+        ax.set_xscale('log')
+        ax.set_xlim(20, 100_000)
+        ax.set_title(stem, fontsize=8, wrap=True)
+        ax.set_xlabel('volume (fL)')
+        ax.set_ylabel('count')
+        fig.tight_layout()
+        safe_name = stem.replace('/', '_').replace(' ', '_')
+        out_path = fig_dir / f'{safe_name}.png'
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"Written: {out_path}")
+        n_written += 1
+
+    print(f"[histograms] {n_written} histogram(s) written to {fig_dir}")
+
+
+def _write_gating_log(out_dir, dp_obj, dirname, stats_stems, gated_vol_list,
+                      stats_list, all_stems, vol_list, skipped, timestamp):
+    """Write a plain-text log of gating cutoffs and removal statistics."""
+    from collections import defaultdict
+
+    log_path = out_dir / f'{dirname}_sc_volumes_gated_log.txt'
+    ungated_counts = {stem: len(vols) for stem, vols in zip(all_stems, vol_list)}
+
+    # Group files by (MinSize, MaxSize)
+    groups = defaultdict(list)
+    for stem, gated, stats in zip(stats_stems, gated_vol_list, stats_list):
+        lo = float(stats['MinSize'])
+        hi = float(stats['MaxSize'])
+        n_before = ungated_counts.get(stem, len(gated))
+        n_after = len(gated)
+        groups[(lo, hi)].append((stem, n_before, n_after))
+
+    total_before = total_after = 0
+    lines = []
+
+    lines.append("extract_coulter_data — Gating Log")
+    lines.append("=" * 60)
+    lines.append(f"Input:   {dp_obj}")
+    lines.append(f"Output:  {dirname}_sc_volumes_gated.csv")
+    ts = timestamp
+    lines.append(f"Run:     {ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}")
+    lines.append("")
+    lines.append("Gate groups")
+    lines.append("-" * 60)
+
+    for i, ((lo, hi), entries) in enumerate(groups.items(), 1):
+        lines.append(f"Group {i}   lower = {lo:.4g} fL   upper = {hi:.4g} fL")
+        for stem, n_before, n_after in entries:
+            n_removed = n_before - n_after
+            pct = 100 * n_removed / n_before if n_before else 0
+            total_before += n_before
+            total_after += n_after
+            lines.append(
+                f"  {stem:<60s}  {n_before} → {n_after}"
+                f"  ({n_removed} removed, {pct:.1f}%)"
+            )
+        lines.append("")
+
+    if skipped:
+        lines.append("Skipped (no [SizeStats] section)")
+        lines.append("-" * 60)
+        for name in skipped:
+            n = ungated_counts.get(name, '?')
+            lines.append(f"  {name:<60s}  {n} values (not gated)")
+        lines.append("")
+
+    n_samples = sum(len(v) for v in groups.values())
+    total_removed = total_before - total_after
+    total_pct = 100 * total_removed / total_before if total_before else 0
+    lines.append(
+        f"Total: {total_before} → {total_after} values retained across "
+        f"{n_samples} sample(s)  ({total_removed} removed, {total_pct:.1f}%)"
+    )
+
+    log_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    print(f"Written: {log_path}")
 
 
 def get_sc_volume_fromdir(full_fpaths) -> pd.DataFrame:
