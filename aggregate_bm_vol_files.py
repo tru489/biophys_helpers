@@ -3,19 +3,36 @@ aggregate_bm_vol_files.py
 
 Aggregates buoyant mass (BM) CSVs from SMR runs and FXM volume CSVs
 (_ProcessedVolumes.csv) from iFXM runs across one or more experiment
-superdirectories. Files are copied into an aggregated/ folder organised
-by data type and superdir name.
+superdirectories. Files are copied into a timestamped output directory organised
+by data type and superdir name. Also writes a combined mass_pg.csv summary and
+per-sample histogram PNGs.
+
+Both BM and FXM results are expected to be nested under a sample subdir:
+    <superdir>/<sample_subdir>/<run_dir>/<results>
+
+Output structure:
+    <YYYYMMDD-HHMMSS>_aggregated/
+      smr_data/
+        <superdir_name>/
+          <csv files>
+      imaging_fxm/
+        <superdir_name>/
+          <csv files>
+      mass_pg.csv
+      fig/
+        mass_pg/
+          <sample>.png
 
 Usage:
     python aggregate_bm_vol_files.py <superdir1> [superdir2 ...]
     python aggregate_bm_vol_files.py --from-file <paths.txt> [--output <dir>]
+    python aggregate_bm_vol_files.py --summary-only <aggr_dir>
 
-    directories     One or more superdir paths (positional)
-    --from-file     Text file listing superdir paths, one per line
-    --output        Parent directory for aggregated/ (default: parent of first superdir)
-
-Both BM and FXM results are expected to be nested under a sample subdir:
-    <superdir>/<sample_subdir>/<run_dir>/<results>
+    directories       One or more superdir paths (positional)
+    --from-file       Text file listing superdir paths, one per line
+    --output          Parent directory for the output folder (default: parent of first superdir)
+    --summary-only    Re-generate mass_pg.csv from an existing aggregated directory
+                      without re-copying files
 """
 import argparse
 from pathlib import Path
@@ -29,22 +46,26 @@ import matplotlib.pyplot as plt
 
 
 def main():
-    superdirs, output_dir = parse_cli_args()
-    aggregate_all(superdirs, output_dir)
+    args = parse_cli_args()
+    if args.summary_only:
+        build_summary_from_aggr_dir(Path(args.summary_only))
+    else:
+        superdirs, output_dir = _resolve_dirs(args)
+        aggregate_all(superdirs, output_dir)
 
 
 def parse_cli_args():
     """
-    Parses CLI args. Accepts one or more superdir paths as positional arguments,
-    or a text file listing superdir paths (one per line) via --from-file.
-    An optional --output flag sets the parent directory for the aggregated folder;
-    defaults to the parent of the first superdir.
+    Parses CLI args and returns the raw argparse Namespace.
 
-    Raises:
-        FileNotFoundError: a provided directory or path file does not exist
+    Two modes:
+      Normal mode     — one or more superdir paths (positional) or --from-file.
+                        Runs full file discovery, copying, and summary generation.
+      Summary-only    — --summary-only <aggr_dir> skips discovery/copying and
+                        re-generates mass_pg.csv from an existing aggregated dir.
 
     Returns:
-        tuple(list(Path), Path): list of superdirs, output parent directory
+        argparse.Namespace
     """
     parser = argparse.ArgumentParser(
         description="Aggregate BM and FXM volume CSVs from one or more superdirs."
@@ -62,11 +83,29 @@ def parse_cli_args():
         help='Parent directory for the aggregated folder '
              '(default: parent of the first superdir)'
     )
+    parser.add_argument(
+        '--summary-only', type=str, metavar='AGGR_DIR',
+        help='Path to an existing aggregated directory; re-generates mass_pg.csv '
+             'from its smr_data/ subdirectory without re-copying any files'
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
+def _resolve_dirs(args) -> tuple:
+    """
+    Resolves superdirs and output_dir from a parsed argparse Namespace.
+    Only used in normal aggregation mode (not --summary-only).
+
+    Raises:
+        ValueError: both positional directories and --from-file were supplied,
+                    or neither was supplied
+        FileNotFoundError: a provided directory or path file does not exist
+
+    Returns:
+        tuple(list(Path), Path): list of superdirs, output parent directory
+    """
     if args.from_file and args.directories:
-        parser.error("Provide either positional directories or --from-file, not both.")
+        raise ValueError("Provide either positional directories or --from-file, not both.")
 
     if args.from_file:
         fpath = Path(args.from_file)
@@ -77,15 +116,51 @@ def parse_cli_args():
     elif args.directories:
         superdirs = [Path(d) for d in args.directories]
     else:
-        parser.error("Provide at least one directory or use --from-file.")
+        raise ValueError("Provide at least one directory or use --from-file.")
 
     for sd in superdirs:
         if not sd.is_dir():
             raise FileNotFoundError(f"Directory '{sd}' does not exist.")
 
     output_dir = Path(args.output) if args.output else superdirs[0].parent
-
     return superdirs, output_dir
+
+
+def build_summary_from_aggr_dir(aggr_dir: Path):
+    """
+    Re-generates mass_pg.csv from an existing aggregated directory without
+    re-running file discovery or copying. Reads all CSVs from smr_data/
+    subdirectories and passes them to _build_mass_pg_csv.
+
+    Expected structure:
+        <aggr_dir>/smr_data/<superdir_name>/<csv files>
+
+    Args:
+        aggr_dir (Path): path to an existing timestamped aggregated directory
+
+    Raises:
+        FileNotFoundError: aggr_dir or smr_data/ subdir does not exist
+    """
+    smr_dir = aggr_dir / 'smr_data'
+    if not smr_dir.is_dir():
+        raise FileNotFoundError(f"smr_data/ not found in '{aggr_dir}'")
+
+    all_bm_files = []
+    for superdir in sorted(smr_dir.iterdir()):
+        if not superdir.is_dir():
+            continue
+        for f in sorted(superdir.iterdir()):
+            if f.is_file() and f.suffix == '.csv':
+                all_bm_files.append((f, superdir))
+
+    if not all_bm_files:
+        print("No BM CSV files found in smr_data/.")
+        return
+
+    print(f"Found {len(all_bm_files)} BM CSV file(s) across "
+          f"{len(set(s for _, s in all_bm_files))} superdir(s).")
+    _build_mass_pg_csv(all_bm_files, aggr_dir)
+    print(f"\nDone. Output written to: {aggr_dir}")
 
 
 def _find_bm_csvs(superdir: Path) -> list:
