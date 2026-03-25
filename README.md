@@ -118,6 +118,7 @@ python aggregate_bm_vol_files.py "E:/data/6um_silica"
 
 # Multiple superdirs
 python aggregate_bm_vol_files.py "E:/data/6um_silica" "E:/data/10um_silica"
+find expm_dir -type d -name "l1210_data_*" | xargs python aggregate_bm_vol_files.py
 
 # Superdirs listed in a text file
 python aggregate_bm_vol_files.py --from-file my_experiments.txt
