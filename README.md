@@ -11,37 +11,35 @@ Helper scripts for analyzing biophysical data from Coulter counter, SMR, and ima
 Parses a directory of Coulter counter `.#m4` files and writes output files into a
 timestamped `<YYYYMMDD-HHMMSS>_coulter-processed/` directory. Outputs include:
 
-- `<dirname>_sc_volumes_ungated.csv` — all single-cell volume measurements, one column per file, NaN-padded to equal length
-- `<dirname>_sc_volumes_gated.csv` — single-cell volumes for files that have Multisizer gate data
+- `<dirname>_sc_volumes.csv` — all single-cell volume measurements (ungated), one column per file, NaN-padded to equal length
 - `<dirname>_volume_stats.csv` — summary statistics pre-selected in the Multisizer software, one column per file
-- `fig/<sample>.png` — histogram per sample (gated where available, ungated as fallback)
+- `fig/<sample>.png` — ungated histogram per sample
 
 **Usage**
 
 ```
-python extract_coulter_data.py <directory> [-stats] [-single] [-r]
+python extract_coulter_data.py <directory> [-stats] [-single-stats] [-r]
 ```
 
 | Argument | Description |
 |---|---|
 | `directory` | Path to folder containing `.#m4` files |
-| `-stats` | Write only the stats CSV |
-| `-single` | Write only the single-cell volumes CSVs and histograms |
+| _(no flags)_ | Write single-cell volumes CSV and histograms (default) |
+| `-stats` | Write only the stats CSV (no volumes, no histograms) |
+| `-single-stats` | Write both the single-cell volumes CSV and the stats CSV + histograms |
 | `-r` | Recursively include `.#m4` files from subdirectories; column names are prefixed with the relative subdir path |
-
-If neither `-stats` nor `-single` is provided, both are written.
 
 **Examples**
 
 ```bash
-# Write all output files
+# Write single-cell volumes CSV and histograms (default)
 python extract_coulter_data.py "E:/data/my_experiment"
 
 # Write only the stats CSV
 python extract_coulter_data.py "E:/data/my_experiment" -stats
 
-# Write only the single-cell volumes CSV and histograms
-python extract_coulter_data.py "E:/data/my_experiment" -single
+# Write both single-cell volumes CSV and stats CSV + histograms
+python extract_coulter_data.py "E:/data/my_experiment" -single-stats
 
 # Include .#m4 files from all subdirectories
 python extract_coulter_data.py "E:/data/my_experiment" -r
@@ -141,31 +139,33 @@ E:/data/control_run
 
 ---
 
-### `apply_bm_cutoffs.py`
+### `gate_bm_coulter.py`
 
-Interactive GUI for applying upper/lower cutoffs to columns of a `mass_pg.csv` file
-(typically produced by `aggregate_bm_vol_files.py`). The user groups columns, sets
-shared cutoffs visually via overlaid histograms, and repeats until all columns are
-processed.
+Interactive GUI for applying upper/lower cutoffs to columns of a `mass_pg.csv` or
+single-cell volumes CSV file. Supports both buoyant mass (linear scale) and Coulter
+counter volume (log scale) data.
 
 **Workflow**
 
-1. A scrollable multi-select list of all column names is shown with a running
+1. A dialog asks whether you are gating **Buoyant Mass** or **Coulter Counter Volume** data.
+   This sets the histogram scale, bin layout, and output directory naming.
+2. A scrollable multi-select list of all column names is shown with a running
    counter of columns remaining.
-2. Select one or more columns and click **"Set cutoffs for selection"**. A histogram
-   window opens showing the selected columns overlaid with shared linear bin edges.
-3. Click once on the histogram to set a lower cutoff (red dashed line), then again
+3. Select one or more columns and click **"Set cutoffs for selection"**. A histogram
+   window opens showing the selected columns overlaid with shared bin edges.
+4. Click once on the histogram to set a lower cutoff (red dashed line), then again
    to set an upper cutoff (blue dashed line). The accepted region is shaded green.
    Use **Reset** to start over, **Accept** to confirm.
-4. Repeat steps 2–3 until all columns are assigned. **Done** then becomes available.
-5. Output is written to a timestamped directory alongside the input file.
+5. Repeat steps 3–4 until all columns are assigned. **Done** then becomes available.
+6. Output is written to a timestamped directory alongside the input file.
 
 **Output structure**
 
 ```
-<YYYYMMDD-HHMMSS>_gated_bm_data/
+<YYYYMMDD-HHMMSS>_gated_bm_data/    (or _gated_cc_data/ for Coulter Counter Volume)
   <stem>_cutoff.csv         gated data (values outside cutoffs removed, columns NaN-padded)
   <stem>_cutoff_log.txt     per-column removal statistics
+  <stem>_cutoff_stats.csv   descriptive statistics on gated data (n, mean, median, mode, std, CV)
   histograms/
     group_01.png            overlaid histogram for each cutoff group, with cutoff lines
     group_02.png
@@ -175,23 +175,27 @@ processed.
 **Usage**
 
 ```
-python apply_bm_cutoffs.py <mass_pg.csv>
+python gate_bm_coulter.py <csv_file>
 ```
 
 | Argument | Description |
 |---|---|
-| `mass_pg.csv` | Path to a CSV file where each column is a dataset (no row index) |
+| `csv_file` | Path to a CSV file where each column is a dataset (no row index). Typically `mass_pg.csv` from `aggregate_bm_vol_files.py` or a `sc_volumes.csv` from `extract_coulter_data.py`. |
 
 **Examples**
 
 ```bash
-python apply_bm_cutoffs.py "E:/results/20260324-123456_aggregated/mass_pg.csv"
+# Gate buoyant mass data
+python gate_bm_coulter.py "E:/results/20260324-123456_aggregated/mass_pg.csv"
+
+# Gate Coulter counter volume data
+python gate_bm_coulter.py "E:/data/20260324-123456_coulter-processed/my_experiment_sc_volumes.csv"
 ```
 
 **Example cutoff log (`mass_pg_cutoff_log.txt`)**
 
 ```
-apply_bm_cutoffs — Cutoff Log
+apply_bm_cutoffs — Buoyant Mass Cutoff Log
 ============================================================
 Input:   E:/results/.../mass_pg.csv
 Output:  mass_pg_cutoff.csv
