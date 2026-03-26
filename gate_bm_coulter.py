@@ -1,28 +1,36 @@
 """
 apply_bm_cutoffs.py
 
-Interactive GUI for applying upper/lower cutoffs to columns of a mass_pg CSV file
-(typically produced by aggregate_bm_vol_files.py). The user groups columns, sets
-shared cutoffs visually via overlaid linear-scale histograms, and repeats until all
-columns are processed. Outputs are written to a timestamped directory.
+Interactive GUI for applying upper/lower cutoffs to columns of a mass_pg or
+single-cell volumes CSV file. Supports both buoyant mass (linear scale) and
+Coulter counter volume (log scale) data. The user selects a data type on
+launch, groups columns, sets shared cutoffs visually via overlaid histograms,
+and repeats until all columns are processed. Outputs are written to a
+timestamped directory.
 
 Workflow:
-    1. A scrollable list of all column names is shown. The user multi-selects a group
-       and clicks "Set cutoffs for selection".
-    2. A histogram window opens showing all selected columns overlaid with shared bin
-       edges. The user clicks once to set a lower cutoff (red dashed line) and again
-       to set an upper cutoff (blue dashed line). "Accept" records the cutoffs.
-    3. Steps 1-2 repeat until all columns are assigned. "Done" then becomes available.
-    4. On "Done", a timestamped output directory is created containing:
+    1. A data-type selection dialog asks whether you are gating Buoyant Mass
+       or Coulter Counter Volume data.
+    2. A scrollable list of all column names is shown. The user multi-selects
+       a group and clicks "Set cutoffs for selection".
+    3. A histogram window opens showing all selected columns overlaid with
+       shared bin edges. The user clicks once to set a lower cutoff (red dashed
+       line) and again to set an upper cutoff (blue dashed line). "Accept"
+       records the cutoffs.
+    4. Steps 2-3 repeat until all columns are assigned. "Done" then becomes
+       available.
+    5. On "Done", a timestamped output directory is created containing:
          - <stem>_cutoff.csv        gated data (values outside cutoffs removed)
          - <stem>_cutoff_log.txt    per-column removal statistics
+         - <stem>_cutoff_stats.csv  per-column descriptive statistics on gated data
          - histograms/group_NN.png  saved histogram for each group
 
 Usage:
-    python apply_bm_cutoffs.py <mass_pg.csv>
+    python apply_bm_cutoffs.py <csv_file>
 
-    <mass_pg.csv>   Path to a CSV file where each column is a dataset (no row index).
-                    Typically produced by aggregate_bm_vol_files.py.
+    <csv_file>   Path to a CSV file where each column is a dataset (no row
+                 index). Typically mass_pg.csv from aggregate_bm_vol_files.py
+                 or a sc_volumes CSV from extract_coulter_data.py.
 """
 import argparse
 import sys
@@ -40,6 +48,32 @@ from tkinter import messagebox
 
 
 # ---------------------------------------------------------------------------
+# Mode configuration
+# ---------------------------------------------------------------------------
+
+_MODE = {
+    'bm': {
+        'label':      'Buoyant Mass',
+        'unit':       'pg',
+        'xlabel':     'Buoyant Mass (pg)',
+        'scale':      'linear',
+        'bins':       lambda vals: np.linspace(vals.min(), vals.max(), 201),
+        'xlim':       None,
+        'dir_suffix': '_gated_bm_data',
+    },
+    'cc': {
+        'label':      'Coulter Counter Volume',
+        'unit':       'fL',
+        'xlabel':     'Total Volume (fL)',
+        'scale':      'log',
+        'bins':       lambda _: np.logspace(np.log10(20), np.log10(100_000), 201),
+        'xlim':       (20, 100_000),
+        'dir_suffix': '_gated_cc_data',
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -54,7 +88,8 @@ def parse_cli_args() -> Path:
         Path: path to the CSV file to process
     """
     parser = argparse.ArgumentParser(
-        description="Interactively apply cutoffs to columns of a mass_pg CSV file."
+        description="Interactively apply cutoffs to columns of a mass_pg or "
+                    "single-cell volumes CSV file."
     )
     parser.add_argument('csv_file', type=str, help='Path to the CSV file')
     args = parser.parse_args()
@@ -65,6 +100,53 @@ def parse_cli_args() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Data type selection dialog
+# ---------------------------------------------------------------------------
+
+def _ask_data_type(root: tk.Tk) -> str:
+    """
+    Shows a modal dialog asking whether the user is gating Buoyant Mass or
+    Coulter Counter Volume data. Blocks until one button is clicked.
+
+    If the user closes the window without selecting, the application exits.
+
+    Args:
+        root (tk.Tk): parent window
+
+    Returns:
+        str: 'bm' or 'cc'
+    """
+    result = {'mode': None}
+
+    top = tk.Toplevel(root)
+    top.title("Select data type")
+    top.grab_set()
+    top.resizable(False, False)
+
+    tk.Label(top, text="What type of data are you gating?",
+             font=('TkDefaultFont', 11), pady=12, padx=20).pack()
+
+    btn_frame = tk.Frame(top)
+    btn_frame.pack(padx=20, pady=(0, 16))
+
+    def _select(mode):
+        result['mode'] = mode
+        top.destroy()
+
+    tk.Button(btn_frame, text="Buoyant Mass", width=22,
+              command=lambda: _select('bm')).pack(side=tk.LEFT, padx=8)
+    tk.Button(btn_frame, text="Coulter Counter Volume", width=22,
+              command=lambda: _select('cc')).pack(side=tk.LEFT, padx=8)
+
+    top.protocol('WM_DELETE_WINDOW', lambda: sys.exit(0))
+    root.wait_window(top)
+
+    if result['mode'] is None:
+        sys.exit(0)
+    return result['mode']
+
+
+# ---------------------------------------------------------------------------
 # Cutoff window
 # ---------------------------------------------------------------------------
 
@@ -72,30 +154,31 @@ class CutoffWindow:
     """
     Modal tkinter Toplevel containing an embedded matplotlib histogram.
 
-    Displays all selected columns as overlaid histograms with shared linear bin
-    edges. The user clicks once to set a lower cutoff (red dashed line) and again
-    to set an upper cutoff (blue dashed line), with the accepted region shaded green.
-    Reset clears both lines and restarts. Accept is only enabled once both cutoffs
-    are set.
+    Displays all selected columns as overlaid histograms with shared bin edges.
+    Bin layout and axis scale are determined by the active data mode ('bm' or
+    'cc'). The user clicks once to set a lower cutoff (red dashed line) and
+    again to set an upper cutoff (blue dashed line), with the accepted region
+    shaded green. Reset clears both lines and restarts. Accept is only enabled
+    once both cutoffs are set.
 
     Result stored in self.result as (lower, upper), or None if the window is
     closed without accepting.
     """
 
-    def __init__(self, parent: tk.Tk, selected_cols: list[str],
-                 data: dict[str, np.ndarray]):
-        self.result: tuple[float, float] | None = None
-        self._lower: float | None = None
-        self._upper: float | None = None
-        self._state: int = 0        # 0=awaiting lower, 1=awaiting upper, 2=both set
-        self._vlines: list = []
+    def __init__(self, parent: tk.Tk, selected_cols: list,
+                 data: dict, mode: str):
+        self.result = None
+        self._lower = None
+        self._upper = None
+        self._state = 0        # 0=awaiting lower, 1=awaiting upper, 2=both set
+        self._vlines = []
         self._patch = None
+        self._mode = mode
 
         self._top = tk.Toplevel(parent)
         self._top.title("Set cutoffs")
         self._top.grab_set()
 
-        # --- matplotlib figure ---
         self._fig, self._ax = plt.subplots(figsize=(14, 5))
         self._draw_histograms(selected_cols, data)
 
@@ -105,14 +188,12 @@ class CutoffWindow:
         self._canvas = canvas
         self._cid = canvas.mpl_connect('button_press_event', self._on_click)
 
-        # --- status / label row ---
         info_frame = tk.Frame(self._top)
         info_frame.pack(fill=tk.X, padx=10, pady=(4, 0))
         self._status_var = tk.StringVar(value="Click to set lower cutoff.")
         tk.Label(info_frame, textvariable=self._status_var,
                  anchor='w').pack(side=tk.LEFT)
 
-        # --- button row ---
         btn_frame = tk.Frame(self._top)
         btn_frame.pack(fill=tk.X, padx=10, pady=6)
         tk.Button(btn_frame, text="Reset",
@@ -121,20 +202,20 @@ class CutoffWindow:
                                      state=tk.DISABLED, command=self._accept)
         self._accept_btn.pack(side=tk.RIGHT)
 
-        parent.wait_window(self._top)   # block until window closed
+        parent.wait_window(self._top)
 
     # ------------------------------------------------------------------
-    def _draw_histograms(self, selected_cols: list[str],
-                         data: dict[str, np.ndarray]):
+    def _draw_histograms(self, selected_cols: list, data: dict):
         """
         Renders overlaid histograms for all selected columns onto self._ax.
-        Bin edges are shared across all columns (computed from the combined
-        range) so bars align for easy visual comparison.
+        Bin edges and axis scale are determined by _MODE[self._mode]. Bins are
+        shared across all columns so bars align for easy visual comparison.
 
         Args:
             selected_cols: column names to plot
             data: mapping of column name to value array
         """
+        cfg = _MODE[self._mode]
         ax = self._ax
         ax.clear()
 
@@ -143,19 +224,21 @@ class CutoffWindow:
         if not arrays:
             return
 
-        # Shared linear bin edges so bars align across all columns
         all_vals = np.concatenate(arrays)
-        shared_bins = np.linspace(all_vals.min(), all_vals.max(), 201)  # 200 bins
+        shared_bins = cfg['bins'](all_vals)
 
         for col, vals in zip(selected_cols, arrays):
             ax.hist(vals, bins=shared_bins, alpha=0.5, edgecolor='black',
                     linewidth=0.3, label=col)
-        ax.set_xlabel('mass (pg)')
+        ax.set_xscale(cfg['scale'])
+        if cfg['xlim']:
+            ax.set_xlim(*cfg['xlim'])
+        ax.set_xlabel(cfg['xlabel'])
         ax.set_ylabel('count')
         ax.legend(fontsize=7, loc='upper right')
         self._fig.tight_layout()
 
-    def _on_click(self, event: object):
+    def _on_click(self, event):
         """
         Handles matplotlib mouse click events.
         State 0 → first click sets lower cutoff (red dashed line).
@@ -223,30 +306,30 @@ class CutoffWindow:
 class MainWindow:
     """
     Primary application window. Shows all column names from the input CSV in a
-    scrollable multi-select listbox. The user repeatedly selects groups of columns,
-    sets cutoffs via CutoffWindow, and repeats until all columns are assigned.
-    "Done" is only enabled once every column has been processed, at which point
-    output files are written and the application exits.
+    scrollable multi-select listbox. The user repeatedly selects groups of
+    columns, sets cutoffs via CutoffWindow, and repeats until all columns are
+    assigned. "Done" is only enabled once every column has been processed, at
+    which point output files are written and the application exits.
     """
 
     def __init__(self, root: tk.Tk, csv_path: Path,
-                 columns: list[str], data: dict[str, np.ndarray]):
+                 columns: list, data: dict, mode: str):
         self._root = root
         self._csv_path = csv_path
-        self._columns = columns          # all column names
+        self._columns = columns
         self._data = data
-        self._cutoffs: dict[str, tuple[float, float]] = {}
-        self._groups: list[tuple[float, float, list[str]]] = []
-        self._remaining: list[str] = list(columns)
+        self._mode = mode
+        self._cutoffs: dict = {}
+        self._groups: list = []
+        self._remaining: list = list(columns)
 
-        root.title("apply_bm_cutoffs")
+        root.title(f"apply_bm_cutoffs  [{_MODE[mode]['label']}]")
 
         self._header_var = tk.StringVar()
         tk.Label(root, textvariable=self._header_var,
                  font=('TkDefaultFont', 11, 'bold'),
                  anchor='w').pack(fill=tk.X, padx=10, pady=(10, 4))
 
-        # listbox + scrollbar
         list_frame = tk.Frame(root)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10)
         scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
@@ -258,7 +341,6 @@ class MainWindow:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self._listbox.bind('<<ListboxSelect>>', self._on_select)
 
-        # buttons
         btn_frame = tk.Frame(root)
         btn_frame.pack(fill=tk.X, padx=10, pady=8)
         self._set_btn = tk.Button(
@@ -299,7 +381,7 @@ class MainWindow:
         if not indices:
             return
         selected = [self._remaining[i] for i in indices]
-        win = CutoffWindow(self._root, selected, self._data)
+        win = CutoffWindow(self._root, selected, self._data, self._mode)
         if win.result is None:
             return
         lower, upper = win.result
@@ -312,7 +394,7 @@ class MainWindow:
     def _finish(self):
         """Writes all output files and closes the application."""
         out_dir = _write_output(self._csv_path, self._columns, self._data,
-                                self._cutoffs, self._groups)
+                                self._cutoffs, self._groups, self._mode)
         messagebox.showinfo("Done", f"Output written to:\n{out_dir}")
         self._root.destroy()
 
@@ -321,20 +403,19 @@ class MainWindow:
 # Output
 # ---------------------------------------------------------------------------
 
-def _write_output(csv_path: Path, columns: list[str],
-                  data: dict[str, np.ndarray],
-                  cutoffs: dict[str, tuple[float, float]],
-                  groups: list[tuple[float, float, list[str]]]) -> Path:
+def _write_output(csv_path: Path, columns: list, data: dict,
+                  cutoffs: dict, groups: list, mode: str) -> Path:
     """
     Creates a timestamped output directory and writes all output files.
 
     Output structure:
-        <YYYYMMDD-HHMMSS>_gated_bm_data/
-          <stem>_cutoff.csv       gated data; values outside cutoffs removed,
-                                  columns NaN-padded to equal length
-          <stem>_cutoff_log.txt   per-column removal statistics
+        <YYYYMMDD-HHMMSS><dir_suffix>/
+          <stem>_cutoff.csv         gated data; values outside cutoffs removed,
+                                    columns NaN-padded to equal length
+          <stem>_cutoff_log.txt     per-column removal statistics (UTF-8)
+          <stem>_cutoff_stats.csv   descriptive statistics on gated data
           histograms/
-            group_01.png          overlaid histogram for each cutoff group
+            group_01.png            overlaid histogram for each cutoff group
             group_02.png
             ...
 
@@ -343,14 +424,16 @@ def _write_output(csv_path: Path, columns: list[str],
         columns:  all column names in original order
         data:     mapping of column name to full (ungated) value array
         cutoffs:  mapping of column name to (lower, upper) cutoff pair
-        groups:   ordered list of (lower, upper, [col_names]) as set by the user
+        groups:   ordered list of (lower, upper, [col_names]) as set by user
+        mode:     'bm' or 'cc'
 
     Returns:
         Path: the created output directory
     """
     from datetime import datetime
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    out_dir = csv_path.parent / f'{timestamp}_gated_bm_data'
+    suffix = _MODE[mode]['dir_suffix']
+    out_dir = csv_path.parent / f'{timestamp}{suffix}'
     out_dir.mkdir()
 
     # Gated CSV
@@ -368,16 +451,19 @@ def _write_output(csv_path: Path, columns: list[str],
     # Histograms
     hist_dir = out_dir / 'histograms'
     hist_dir.mkdir()
-    _save_group_histograms(hist_dir, data, groups)
+    _save_group_histograms(hist_dir, data, groups, mode)
 
     # Log
-    _write_log(out_dir, csv_path, csv_out, data, groups, timestamp)
+    _write_log(out_dir, csv_path, csv_out, data, groups, timestamp, mode)
+
+    # Stats CSV
+    _write_stats_csv(out_dir, csv_path, data, cutoffs, groups, mode)
 
     return out_dir
 
 
-def _save_group_histograms(hist_dir: Path, data: dict[str, np.ndarray],
-                           groups: list[tuple[float, float, list[str]]]):
+def _save_group_histograms(hist_dir: Path, data: dict,
+                           groups: list, mode: str):
     """
     Saves one histogram PNG per cutoff group into hist_dir.
 
@@ -389,7 +475,9 @@ def _save_group_histograms(hist_dir: Path, data: dict[str, np.ndarray],
         hist_dir: directory to write PNG files into
         data:     mapping of column name to full (ungated) value array
         groups:   ordered list of (lower, upper, [col_names])
+        mode:     'bm' or 'cc'
     """
+    cfg = _MODE[mode]
     for i, (lo, hi, cols) in enumerate(groups, 1):
         arrays = [data[col][~np.isnan(data[col])] for col in cols]
         arrays = [a for a in arrays if len(a) > 0]
@@ -397,7 +485,7 @@ def _save_group_histograms(hist_dir: Path, data: dict[str, np.ndarray],
             continue
 
         all_vals = np.concatenate(arrays)
-        shared_bins = np.linspace(all_vals.min(), all_vals.max(), 201)
+        shared_bins = cfg['bins'](all_vals)
 
         fig, ax = plt.subplots(figsize=(14, 5))
         for col, vals in zip(cols, arrays):
@@ -408,29 +496,32 @@ def _save_group_histograms(hist_dir: Path, data: dict[str, np.ndarray],
         ax.axvline(hi, color='steelblue', linestyle='--', linewidth=1.2,
                    label=f'upper = {hi:.4g}')
         ax.axvspan(lo, hi, alpha=0.08, color='green')
-        ax.set_xlabel('mass (pg)')
+        ax.set_xscale(cfg['scale'])
+        if cfg['xlim']:
+            ax.set_xlim(*cfg['xlim'])
+        ax.set_xlabel(cfg['xlabel'])
         ax.set_ylabel('count')
-        ax.set_title(f'Group {i}   lower = {lo:.4g} pg   upper = {hi:.4g} pg',
-                     fontsize=9)
+        ax.set_title(
+            f'Group {i}   lower = {lo:.4g} {cfg["unit"]}   '
+            f'upper = {hi:.4g} {cfg["unit"]}', fontsize=9)
         ax.legend(fontsize=7, loc='upper right')
         fig.tight_layout()
-        fig.savefig(hist_dir / f'group_{i:02d}.png', dpi=150)
+        out_path = hist_dir / f'group_{i:02d}.png'
+        fig.savefig(out_path, dpi=150)
         plt.close(fig)
-        print(f"Written: {hist_dir / f'group_{i:02d}.png'}")
+        print(f"Written: {out_path}")
 
 
 def _write_log(out_dir: Path, csv_path: Path, csv_out: Path,
-               data: dict[str, np.ndarray],
-               groups: list[tuple[float, float, list[str]]],
-               timestamp: str):
+               data: dict, groups: list, timestamp: str, mode: str):
     """
     Writes a plain-text log file documenting the cutoffs applied and the number
     of values removed per column.
 
     Log contents:
+        - Data type (Buoyant Mass or Coulter Counter Volume)
         - Input/output file paths and run timestamp
-        - Per-group cutoff bounds
-        - Per-column: original N, post-cutoff N, count and % removed
+        - Per-group cutoff bounds with per-column before/after counts
         - Total summary across all columns
 
     Written as UTF-8 to support the → character used in per-column lines.
@@ -442,24 +533,29 @@ def _write_log(out_dir: Path, csv_path: Path, csv_out: Path,
         data:      mapping of column name to full (ungated) value array
         groups:    ordered list of (lower, upper, [col_names])
         timestamp: YYYYMMDD-HHMMSS string used to format the run time
+        mode:      'bm' or 'cc'
     """
+    cfg = _MODE[mode]
     log_path = out_dir / f'{csv_path.stem}_cutoff_log.txt'
 
     total_before = total_after = 0
     lines = []
 
-    lines.append("apply_bm_cutoffs — Cutoff Log")
+    lines.append(f"apply_bm_cutoffs — {cfg['label']} Cutoff Log")
     lines.append("=" * 60)
     lines.append(f"Input:   {csv_path}")
     lines.append(f"Output:  {csv_out.name}")
-    lines.append(f"Run:     {timestamp[:8][:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
-                 f" {timestamp[9:11]}:{timestamp[11:13]}:{timestamp[13:15]}")
+    ts = timestamp
+    lines.append(f"Run:     {ts[:4]}-{ts[4:6]}-{ts[6:8]} "
+                 f"{ts[9:11]}:{ts[11:13]}:{ts[13:15]}")
     lines.append("")
     lines.append("Cutoff groups")
     lines.append("-" * 60)
 
     for i, (lo, hi, cols) in enumerate(groups, 1):
-        lines.append(f"Group {i}   lower = {lo:.4g} pg   upper = {hi:.4g} pg")
+        lines.append(
+            f"Group {i}   lower = {lo:.4g} {cfg['unit']}   "
+            f"upper = {hi:.4g} {cfg['unit']}")
         for col in cols:
             n_before = len(data[col])
             n_after = len(data[col][(data[col] >= lo) & (data[col] <= hi)])
@@ -485,6 +581,69 @@ def _write_log(out_dir: Path, csv_path: Path, csv_out: Path,
     print(f"Written: {log_path}")
 
 
+def _write_stats_csv(out_dir: Path, csv_path: Path, data: dict,
+                     cutoffs: dict, groups: list, mode: str):
+    """
+    Writes a CSV of descriptive statistics on the gated data, one row per column.
+
+    Metrics: sample name, n (gated count), mean, median, mode (midpoint of the
+    highest-count bin using the same shared bins as the histogram), standard
+    deviation, CV (std/mean × 100), lower cutoff, upper cutoff.
+
+    Args:
+        out_dir:  output directory
+        csv_path: path to the original input CSV (used for output filename)
+        data:     mapping of column name to full (ungated) value array
+        cutoffs:  mapping of column name to (lower, upper)
+        groups:   ordered list of (lower, upper, [col_names])
+        mode:     'bm' or 'cc'
+    """
+    cfg = _MODE[mode]
+    rows = []
+
+    for _, _, cols in groups:
+        all_vals = np.concatenate([
+            data[col][~np.isnan(data[col])] for col in cols
+            if len(data[col][~np.isnan(data[col])]) > 0
+        ])
+        shared_bins = cfg['bins'](all_vals)
+
+        for col in cols:
+            lo_col, hi_col = cutoffs[col]
+            raw = data[col]
+            gated = raw[(raw >= lo_col) & (raw <= hi_col)]
+            gated = gated[~np.isnan(gated)]
+
+            if len(gated) == 0:
+                rows.append({'sample': col, 'n': 0, 'mean': np.nan,
+                             'median': np.nan, 'mode': np.nan, 'std': np.nan,
+                             'cv_pct': np.nan,
+                             'lower_cutoff': lo_col, 'upper_cutoff': hi_col})
+                continue
+
+            counts, edges = np.histogram(gated, bins=shared_bins)
+            peak_idx = counts.argmax()
+            mode_val = (edges[peak_idx] + edges[peak_idx + 1]) / 2
+
+            mean = gated.mean()
+            std = gated.std()
+            rows.append({
+                'sample':       col,
+                'n':            len(gated),
+                'mean':         mean,
+                'median':       np.median(gated),
+                'mode':         mode_val,
+                'std':          std,
+                'cv_pct':       100 * std / mean if mean != 0 else np.nan,
+                'lower_cutoff': lo_col,
+                'upper_cutoff': hi_col,
+            })
+
+    stats_path = out_dir / f'{csv_path.stem}_cutoff_stats.csv'
+    pd.DataFrame(rows).to_csv(stats_path, index=False)
+    print(f"Written: {stats_path}")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -500,7 +659,10 @@ def main():
         sys.exit(1)
 
     root = tk.Tk()
-    MainWindow(root, csv_path, columns, data)
+    root.withdraw()          # hide root until mode is chosen
+    mode = _ask_data_type(root)
+    root.deiconify()
+    MainWindow(root, csv_path, columns, data, mode)
     root.mainloop()
 
 
