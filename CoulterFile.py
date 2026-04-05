@@ -43,8 +43,7 @@ class CoulterFile():
         Returns:
             dict: dictionary {stat name:value}
         """
-        relevant_lines = self._get_file_section(lines, '[SizeStats]', 
-                                                '[SizePctX]')
+        relevant_lines = self._get_file_section(lines, '[SizeStats]')
         
         # Extract numbers after the equals sign
         stat_dict = {}
@@ -61,13 +60,11 @@ class CoulterFile():
         Args:
             lines (list(str)): list of strings from coulter counter file
         """
-        edges_diameter = self._get_file_section(lines, '[#Bindiam]', 
-                                                '[Binunits]')
+        edges_diameter = self._get_file_section(lines, '[#Bindiam]')
         edges_diameter = [float(dm) for dm in edges_diameter]
         edges_volume = [4/3 * np.pi * (dm/2)**3 for dm in edges_diameter]
 
-        bin_counts = self._get_file_section(lines, '[#Binheight]', 
-                                            '[SizeStats]')
+        bin_counts = self._get_file_section(lines, '[#Binheight]')
         bin_counts = [int(ct) for ct in bin_counts]
 
         return (np.array(edges_diameter), np.array(edges_volume), 
@@ -75,13 +72,13 @@ class CoulterFile():
 
     def _get_single_cell(self, lines) -> np.array:
         counts_per_volt = 1 / (4 * 298.02e-9)
-        kd_lst = self._get_file_section(lines, '[KDsave0]', '[sample]')
+        kd_lst = self._get_file_section(lines, '[KDsave0]')
         kd_str = [str_ for str_ in kd_lst if 'Kd= ' in str_][0]
         get_param = lambda marker, search_str: \
             float(re.match(f'^{marker}' + r'([-\d\.]+)', search_str).groups()[0])
         kd = get_param('Kd= ', kd_str)
 
-        param_lst = self._get_file_section(lines, '[instrument]', '[M3Info]')
+        param_lst = self._get_file_section(lines, '[instrument]')
         amp_str = [str_ for str_ in param_lst if 'Current= ' in str_][0]
         current = get_param('Current= ', amp_str) / 1000
 
@@ -91,8 +88,7 @@ class CoulterFile():
         mxht_str = [str_ for str_ in param_lst if 'MaxHtCorr= ' in str_][0]
         max_ht_corr = get_param('MaxHtCorr= ', mxht_str)
 
-        pulse_strs = self._get_file_section(lines, '[#Pulses5hex]', 
-                                            '[#TSms]')
+        pulse_strs = self._get_file_section(lines, '[#Pulses5hex]')
         get_first_hex = lambda str_: \
             re.match(r'^([A-Z\d]+),[A-Z\d,]+$', str_).groups()[0]
         hex_convert = [int(get_first_hex(str_), 16) for str_ in pulse_strs]
@@ -104,35 +100,38 @@ class CoulterFile():
 
         return diameter, volume
         
-    def _get_file_section(self, lines, start_marker, end_marker) -> list:
+    def _get_file_section(self, lines, start_marker) -> list:
         """
-        Given bracketed section markers at beginning and end of a section in 
-        coulter counter file, extract list of strings from coulter file
+        Given a bracketed section marker, extract the lines of that section
+        from the coulter counter file. The section ends at the next line that
+        looks like a section header (starts with '[' and ends with ']').
 
         Args:
             lines (list(str)): lines from coulter counter raw file
             start_marker (str): bracketed start marker of lines of interest
-            end_marker (str): bracketed start marker concluding lines of 
-                interest
+
+        Raises:
+            ValueError: start_marker was not found in the file
+
         Returns:
-            list(str): relevant lines from file
+            list(str): lines between start_marker and the next section header
         """
         start_index = None
-        end_index = None
-        
-        # Find the indices for [SizeStats] and [SizePctX]
         for i, line in enumerate(lines):
             if start_marker in line:
                 start_index = i
-            if end_marker in line:
-                end_index = i
                 break
-        
-        if start_index is None or end_index is None:
-            raise ValueError("Size stats were not found in file.")
-        
-        # Extract lines between start and end marker
-        return lines[start_index + 1:end_index]
+
+        if start_index is None:
+            raise ValueError(f"Section '{start_marker}' was not found in file.")
+
+        result = []
+        for line in lines[start_index + 1:]:
+            stripped = line.strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                break
+            result.append(line)
+        return result
 
     def get_stats(self) -> dict:
         """
