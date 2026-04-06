@@ -202,6 +202,15 @@ class CutoffWindow:
                                      state=tk.DISABLED, command=self._accept)
         self._accept_btn.pack(side=tk.RIGHT)
 
+        # Center on the same monitor as the parent window
+        self._top.update_idletasks()
+        pw = parent.winfo_width();  ph = parent.winfo_height()
+        px = parent.winfo_rootx();  py = parent.winfo_rooty()
+        tw = self._top.winfo_width(); th = self._top.winfo_height()
+        x = px + (pw - tw) // 2
+        y = py + (ph - th) // 2
+        self._top.geometry(f"+{x}+{y}")
+
         parent.wait_window(self._top)
 
     # ------------------------------------------------------------------
