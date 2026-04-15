@@ -178,7 +178,7 @@ def _find_bm_csvs(superdir: Path) -> list:
     run_dir_pattern = re.compile(r".+_mass_results$")
     found = []
 
-    for run_dir in sorted(superdir.rglob('*')):
+    for run_dir in sorted(superdir.rglob('*_mass_results')):
         if not (run_dir.is_dir() and run_dir_pattern.match(run_dir.name)):
             continue
         for file in sorted(run_dir.iterdir()):
