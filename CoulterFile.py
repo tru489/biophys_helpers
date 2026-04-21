@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 from dataclasses import dataclass, asdict
+from datetime import datetime
 import numpy as np
 
 class CoulterFile():
@@ -27,6 +28,7 @@ class CoulterFile():
         self.bin_edges_diameter, self.bin_edges_volume, self.bin_counts = \
             self._get_hist(lines)
         self.diameters, self.volumes = self._get_single_cell(lines)
+        self.start_time = self._get_start_time(lines)
     
     def _get_selection_stats(self, lines) -> dict:
         """
@@ -132,6 +134,25 @@ class CoulterFile():
                 break
             result.append(line)
         return result
+
+    def _get_start_time(self, lines) -> datetime:
+        """
+        Extracts the StartTime from the [instrument] section and returns it as
+        a datetime. The field format is e.g. '1776362969  14:09:29  16 Apr 2026'.
+
+        Args:
+            lines (list(str)): lines from coulter counter raw file
+
+        Returns:
+            datetime: parsed start time
+        """
+        param_lst = self._get_file_section(lines, '[instrument]')
+        st_str = [s for s in param_lst if 'StartTime= ' in s][0]
+        match = re.search(r'(\d{1,2}:\d{2}:\d{2}\s+\d{1,2}\s+\w{3}\s+\d{4})', st_str)
+        return datetime.strptime(match.group(1), "%H:%M:%S  %d %b %Y")
+
+    def get_start_time(self) -> datetime:
+        return self.start_time
 
     def get_stats(self) -> dict:
         """

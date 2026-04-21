@@ -38,7 +38,7 @@ def main():
     dirname = dp_obj.name
 
     full_fpaths, display_names = _collect_files(dp_obj, recursive)
-    all_stems, vol_list, stats_stems, stats_list = _parse_coulter_files(
+    all_stems, vol_list, stats_stems, stats_list, time_list = _parse_coulter_files(
         full_fpaths, display_names)
 
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -49,6 +49,9 @@ def main():
         _build_sc_df(all_stems, vol_list).to_csv(
             out_dir / f'{dirname}_sc_volumes.csv', index=False)
         _plot_sc_histograms(all_stems, vol_list, out_dir)
+
+    _build_metadata_df(all_stems, time_list).to_csv(
+        out_dir / f'{dirname}_metadata.csv')
 
     if run_stats and stats_stems:
         _build_stats_df(stats_stems, stats_list).to_csv(
@@ -141,22 +144,22 @@ def _collect_files(dp_obj: Path, recursive: bool) -> tuple:
 
 def _parse_coulter_files(full_fpaths, display_names=None) -> tuple:
     """
-    Opens each .#m4 file once and extracts single-cell volumes and stats.
-    Files without a [SizeStats] section are included in volumes but excluded
-    from stats output (a warning is printed for each).
+    Opens each .#m4 file once and extracts single-cell volumes, stats, and
+    start times. Files without a [SizeStats] section are included in volumes
+    but excluded from stats output (a warning is printed for each).
 
     Args:
         full_fpaths (list(Path)): file paths to parse
         display_names (list(str) | None): column names; defaults to file stems
 
     Returns:
-        tuple(list(str), list(np.ndarray), list(str), list(dict)):
-            all_stems, vol_list, stats_stems, stats_list
+        tuple(list(str), list(np.ndarray), list(str), list(dict), list(datetime)):
+            all_stems, vol_list, stats_stems, stats_list, time_list
     """
     if display_names is None:
         display_names = [Path(fn).stem for fn in full_fpaths]
 
-    all_stems, vol_list = [], []
+    all_stems, vol_list, time_list = [], [], []
     stats_stems, stats_list = [], []
     n = len(full_fpaths)
 
@@ -165,6 +168,7 @@ def _parse_coulter_files(full_fpaths, display_names=None) -> tuple:
         coulter_file = CoulterFile(fn.resolve())
         all_stems.append(name)
         vol_list.append(coulter_file.get_volumes_ungated())
+        time_list.append(coulter_file.get_start_time())
         stats = coulter_file.get_stats()
         if stats is not None:
             stats_stems.append(name)
@@ -172,7 +176,7 @@ def _parse_coulter_files(full_fpaths, display_names=None) -> tuple:
         else:
             print(f"  Warning: no [SizeStats] in {fn.name} — excluded from stats output")
 
-    return all_stems, vol_list, stats_stems, stats_list
+    return all_stems, vol_list, stats_stems, stats_list, time_list
 
 
 def _build_sc_df(file_stems, vol_list) -> pd.DataFrame:
@@ -210,6 +214,25 @@ def _build_stats_df(file_stems, stats_list) -> pd.DataFrame:
     full_dict = {fs: [d[k] for k in keys_] for fs, d in zip(file_stems, stats_list)}
     df = pd.DataFrame.from_dict(full_dict)
     df.index = keys_
+    return df
+
+
+def _build_metadata_df(file_stems, time_list) -> pd.DataFrame:
+    """
+    Build a single-row DataFrame of per-file start times.
+
+    Args:
+        file_stems (list(str)): column names
+        time_list (list(datetime)): one start time per file
+
+    Returns:
+        pd.DataFrame: shape (1, n_files), indexed by ['StartTime']
+    """
+    df = pd.DataFrame(
+        [[dt.isoformat() for dt in time_list]],
+        index=['StartTime'],
+        columns=file_stems,
+    )
     return df
 
 
@@ -259,7 +282,7 @@ def get_sc_volume_fromdir(full_fpaths) -> pd.DataFrame:
     Returns:
         pd.DataFrame: single-cell volume data, one column per file
     """
-    all_stems, vol_list, _, _ = _parse_coulter_files(full_fpaths)
+    all_stems, vol_list, _, _, _ = _parse_coulter_files(full_fpaths)
     return _build_sc_df(all_stems, vol_list)
 
 
@@ -274,7 +297,7 @@ def get_volume_stats_fromdir(full_fpaths) -> pd.DataFrame:
     Returns:
         pd.DataFrame: volume stats, one column per file
     """
-    _, _, stats_stems, stats_list = _parse_coulter_files(full_fpaths)
+    _, _, stats_stems, stats_list, _ = _parse_coulter_files(full_fpaths)
     return _build_stats_df(stats_stems, stats_list)
 
 
