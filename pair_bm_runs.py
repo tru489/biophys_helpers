@@ -3,26 +3,31 @@ pair_bm_runs.py
 
 Interactive GUI for organizing buoyant mass runs from multiple fluid conditions
 (h2o, d2o, optiprep) into paired/triplet groups for population-level SMR
-density analysis.
+density analysis. Optionally associates Coulter Counter volume data with each
+sample group.
 
 Workflow:
     1. The script discovers all sample subdirs in the given superdir that contain
        a *_mass_results folder with a mass_pg column CSV.
     2. If a *_bm_gating folder is also present, the gate thresholds (lower/upper)
        are pre-loaded and saved to the output automatically.
-    3. A spreadsheet-like table is shown with all discovered samples. For each
-       sample, assign a run type (h2o / d2o / optiprep) and group ID. Custom
-       metadata columns (e.g. timepoint, drug) can be added and edited.
-    4. Click "Group Selected" to associate multiple runs as a single biological
+    3. If --coulter is given, column names from that CSV are available as a
+       "Coulter Col" dropdown per row. Setting a Coulter column on any run in a
+       group auto-fills the same column for all other runs in that group.
+    4. A spreadsheet-like table is shown with all discovered samples. For each
+       sample, assign a run type (h2o / d2o / optiprep), optional Coulter column,
+       and group ID. Custom metadata columns can be added and edited.
+    5. Click "Group Selected" to associate multiple runs as a single biological
        sample. Click "Done" to write output.
 
 Output (written to <superdir>/YYYYMMDD_HHMMSS_populationlevel_smr_pairing/):
     metadata.csv   one row per run; all assigned attributes + gate thresholds
     data.h5        pandas HDFStore; /metadata DataFrame + /data/{gid}/{run_type}
-                   DataFrames containing the full mass CSV contents per run
+                   DataFrames containing the full mass CSV contents per run;
+                   /data/{gid}/coulter if a Coulter column was assigned
 
 Usage:
-    python pair_bm_runs.py <superdir>
+    python pair_bm_runs.py <superdir> [--coulter <csv_path>]
 """
 import argparse
 import re
@@ -57,22 +62,35 @@ _GROUP_COLORS = [
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_cli_args() -> Path:
+def parse_cli_args() -> tuple:
+    """Returns (superdir: Path, coulter_path: Path | None)."""
     parser = argparse.ArgumentParser(
         description="Organize buoyant mass runs into paired groups for "
                     "population-level SMR density analysis."
     )
     parser.add_argument('superdir', type=str,
                         help='Path to the experiment superdir')
+    parser.add_argument('--coulter', type=str, default=None,
+                        metavar='CSV',
+                        help='Path to a Coulter Counter CSV whose columns '
+                             'are sample names (optional)')
     args = parser.parse_args()
-    p = Path(args.superdir)
-    if not p.is_dir():
-        raise FileNotFoundError(f"Directory not found: {p}")
-    return p
+
+    superdir = Path(args.superdir)
+    if not superdir.is_dir():
+        raise FileNotFoundError(f"Directory not found: {superdir}")
+
+    coulter_path = None
+    if args.coulter is not None:
+        coulter_path = Path(args.coulter)
+        if not coulter_path.is_file():
+            raise FileNotFoundError(f"Coulter file not found: {coulter_path}")
+
+    return superdir, coulter_path
 
 
 # ---------------------------------------------------------------------------
-# Data discovery
+# Data loading
 # ---------------------------------------------------------------------------
 
 def _discover_runs(superdir: Path) -> dict:
@@ -139,38 +157,67 @@ def _discover_runs(superdir: Path) -> dict:
     return result
 
 
+def _load_coulter(path: Path) -> pd.DataFrame:
+    """
+    Loads a Coulter Counter CSV where each column is a sample and each row is
+    a volume measurement. Returns the full DataFrame.
+    """
+    return pd.read_csv(path)
+
+
 # ---------------------------------------------------------------------------
 # Main GUI window
 # ---------------------------------------------------------------------------
 
 class PairingWindow:
     """
-    Spreadsheet-like tkinter window for assigning run types, custom metadata,
-    and group IDs to discovered sample runs.
+    Spreadsheet-like tkinter window for assigning run types, optional Coulter
+    column associations, custom metadata, and group IDs to discovered sample runs.
 
-    The Treeview has fixed columns [sample, run_type, group] plus any
-    user-added custom columns. Clicking a run_type cell opens an in-place
-    Combobox; clicking a custom column cell opens an in-place Entry.
+    Fixed columns: [sample, run_type, group, (coulter_col if Coulter CSV given)]
+    Plus any user-added custom columns.
+
+    Clicking a run_type or coulter_col cell opens an in-place Combobox.
+    Clicking a custom column cell opens an in-place Entry.
+    Setting a coulter_col on any run auto-fills the same value for all other
+    runs in the same group.
     """
 
-    def __init__(self, root: tk.Tk, superdir: Path, runs: dict, on_back=None):
+    def __init__(self, root: tk.Tk, superdir: Path, runs: dict,
+                 coulter_df: pd.DataFrame = None, on_back=None):
         self._root = root
         self._superdir = superdir
         self._runs = runs
+        self._coulter_df = coulter_df
+        self._coulter_cols = list(coulter_df.columns) if coulter_df is not None else []
         self._on_back = on_back
 
         self._custom_cols: list = []
         self._group_counter: int = 0
-        self._group_color_map: dict = {}   # {gid: color_index}
+        self._group_color_map: dict = {}
         self._active_editor = None
 
-        # row data keyed by sample_name
-        self._row_data: dict = {name: {'run_type': '', 'group': ''}
-                                for name in runs}
+        init_row = {'run_type': '', 'group': ''}
+        if coulter_df is not None:
+            init_row['coulter_col'] = ''
+        self._row_data: dict = {name: dict(init_row) for name in runs}
 
         root.title(f"pair_bm_runs — {superdir.name}")
         self._build_ui()
         self._populate_table()
+
+    # ------------------------------------------------------------------
+    # Column lists
+    # ------------------------------------------------------------------
+
+    def _fixed_cols(self) -> list:
+        cols = ['sample', 'run_type', 'group']
+        if self._coulter_df is not None:
+            cols.append('coulter_col')
+        return cols
+
+    def _all_cols(self) -> list:
+        return self._fixed_cols() + self._custom_cols
 
     # ------------------------------------------------------------------
     # UI construction
@@ -179,10 +226,12 @@ class PairingWindow:
     def _build_ui(self):
         n = len(self._runs)
         n_gated = sum(1 for v in self._runs.values() if v['bm_gate'])
+        coulter_info = (f"   Coulter: {len(self._coulter_cols)} columns"
+                        if self._coulter_df is not None else "")
         tk.Label(
             self._root,
             text=(f"{n} sample(s) discovered in {self._superdir.name}   "
-                  f"({n_gated} with BM gate)"),
+                  f"({n_gated} with BM gate){coulter_info}"),
             font=('TkDefaultFont', 10, 'bold'), anchor='w',
         ).pack(fill=tk.X, padx=10, pady=(8, 2))
 
@@ -237,36 +286,40 @@ class PairingWindow:
         self._done_btn.pack(side=tk.RIGHT)
 
     def _setup_columns(self):
-        cols = ['sample', 'run_type', 'group'] + self._custom_cols
+        cols = self._all_cols()
         self._tree['columns'] = cols
-        widths = {'sample': 200, 'run_type': 100, 'group': 80}
+        col_widths = {'sample': 200, 'run_type': 90, 'group': 70,
+                      'coulter_col': 220}
         for col in cols:
-            w = widths.get(col, 160)
-            self._tree.heading(col, text=col.replace('_', ' ').title())
+            w = col_widths.get(col, 160)
+            label = col.replace('_', ' ').title()
+            if col == 'coulter_col':
+                label = 'Coulter Col'
+            self._tree.heading(col, text=label)
             self._tree.column(col, width=w, minwidth=60, anchor='w',
                               stretch=tk.YES if col == 'sample' else tk.NO)
+
+    def _row_values(self, sample: str) -> list:
+        rd = self._row_data[sample]
+        base = [sample, rd.get('run_type', ''), rd.get('group', '')]
+        if self._coulter_df is not None:
+            base.append(rd.get('coulter_col', ''))
+        return base + [rd.get(c, '') for c in self._custom_cols]
 
     def _populate_table(self):
         for item in self._tree.get_children():
             self._tree.delete(item)
         for sample_name in self._runs:
-            rd = self._row_data[sample_name]
-            values = ([sample_name, rd.get('run_type', ''), rd.get('group', '')]
-                      + [rd.get(c, '') for c in self._custom_cols])
-            self._tree.insert('', tk.END, iid=sample_name, values=values)
+            self._tree.insert('', tk.END, iid=sample_name,
+                              values=self._row_values(sample_name))
         self._refresh_colors()
 
     # ------------------------------------------------------------------
-    # Row / state helpers
+    # State helpers
     # ------------------------------------------------------------------
 
     def _refresh_row(self, sample: str):
-        rd = self._row_data[sample]
-        values = ([sample, rd.get('run_type', ''), rd.get('group', '')]
-                  + [rd.get(c, '') for c in self._custom_cols])
-        self._tree.item(sample, values=values)
-        self._refresh_colors()
-        self._check_done()
+        self._tree.item(sample, values=self._row_values(sample))
 
     def _refresh_colors(self):
         for item in self._tree.get_children():
@@ -280,6 +333,12 @@ class PairingWindow:
             else:
                 tag = 'ungrouped'
             self._tree.item(item, tags=(tag,))
+
+    def _refresh_all(self):
+        for sample in self._runs:
+            self._refresh_row(sample)
+        self._refresh_colors()
+        self._check_done()
 
     def _check_done(self):
         all_typed = all(self._row_data[n].get('run_type', '') for n in self._runs)
@@ -325,8 +384,8 @@ class PairingWindow:
         current_val = self._tree.set(item, col_name)
 
         if col_name == 'run_type':
-            widget = ttk.Combobox(
-                self._tree, values=_RUN_TYPES, state='readonly', width=12)
+            widget = ttk.Combobox(self._tree, values=_RUN_TYPES,
+                                  state='readonly', width=12)
             widget.set(current_val)
             widget.bind('<<ComboboxSelected>>',
                         lambda e, i=item, c=col_name, ww=widget:
@@ -334,6 +393,18 @@ class PairingWindow:
             widget.bind('<FocusOut>',
                         lambda e, i=item, c=col_name, ww=widget:
                         self._commit_edit(i, c, ww.get(), ww))
+
+        elif col_name == 'coulter_col':
+            widget = ttk.Combobox(self._tree, values=self._coulter_cols,
+                                  state='readonly', width=30)
+            widget.set(current_val)
+            widget.bind('<<ComboboxSelected>>',
+                        lambda e, i=item, c=col_name, ww=widget:
+                        self._commit_edit(i, c, ww.get(), ww))
+            widget.bind('<FocusOut>',
+                        lambda e, i=item, c=col_name, ww=widget:
+                        self._commit_edit(i, c, ww.get(), ww))
+
         else:
             var = tk.StringVar(value=current_val)
             widget = tk.Entry(self._tree, textvariable=var)
@@ -344,11 +415,10 @@ class PairingWindow:
                         lambda e, i=item, c=col_name, v=var, ww=widget:
                         self._commit_edit(i, c, v.get(), ww))
             widget.bind('<Escape>', lambda e, ww=widget: ww.destroy())
+            widget.select_range(0, tk.END)
 
         widget.place(x=x, y=y, width=w, height=h)
         widget.focus_set()
-        if col_name != 'run_type':
-            widget.select_range(0, tk.END)
         self._active_editor = widget
 
     def _commit_edit(self, item: str, col_name: str, value: str, widget):
@@ -358,8 +428,22 @@ class PairingWindow:
             pass
         if self._active_editor is widget:
             self._active_editor = None
+
         self._row_data[item][col_name] = value
+
+        # Coulter column is a group-level attribute; propagate to all group members.
+        if col_name == 'coulter_col' and value:
+            gid = self._row_data[item].get('group', '')
+            if gid:
+                for name in self._runs:
+                    if self._row_data[name].get('group') == gid:
+                        self._row_data[name]['coulter_col'] = value
+                self._refresh_all()
+                return
+
         self._refresh_row(item)
+        self._refresh_colors()
+        self._check_done()
 
     # ------------------------------------------------------------------
     # Button actions
@@ -374,12 +458,12 @@ class PairingWindow:
         gid = f'G{self._group_counter:02d}'
         for item in selected:
             self._row_data[item]['group'] = gid
-            self._refresh_row(item)
+        self._refresh_all()
 
     def _clear_group(self):
         for item in self._tree.selection():
             self._row_data[item]['group'] = ''
-            self._refresh_row(item)
+        self._refresh_all()
 
     def _add_column(self):
         name = simpledialog.askstring(
@@ -387,8 +471,7 @@ class PairingWindow:
         if not name or not name.strip():
             return
         name = name.strip()
-        all_cols = ['sample', 'run_type', 'group'] + self._custom_cols
-        if name in all_cols:
+        if name in self._all_cols():
             messagebox.showwarning("Duplicate",
                                    f"Column '{name}' already exists.",
                                    parent=self._root)
@@ -421,8 +504,8 @@ class PairingWindow:
         ordered = [self._tree.set(item, 'sample')
                    for item in self._tree.get_children()]
         out_dir = _write_output(
-            self._superdir, self._runs, self._row_data,
-            ordered, self._custom_cols)
+            self._superdir, self._runs, self._row_data, ordered,
+            self._custom_cols, self._coulter_df)
         messagebox.showinfo("Done", f"Output written to:\n{out_dir}",
                             parent=self._root)
         self._root.destroy()
@@ -433,7 +516,8 @@ class PairingWindow:
 # ---------------------------------------------------------------------------
 
 def _write_output(superdir: Path, runs: dict, row_data: dict,
-                  ordered_samples: list, custom_cols: list) -> Path:
+                  ordered_samples: list, custom_cols: list,
+                  coulter_df: pd.DataFrame = None) -> Path:
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = superdir / f'{timestamp}_populationlevel_smr_pairing'
     out_dir.mkdir()
@@ -449,6 +533,8 @@ def _write_output(superdir: Path, runs: dict, row_data: dict,
             'bm_gate_lower':  gate[0] if gate else float('nan'),
             'bm_gate_upper':  gate[1] if gate else float('nan'),
         }
+        if coulter_df is not None:
+            row['coulter_column'] = rd.get('coulter_col', '')
         for col in custom_cols:
             row[col] = rd.get(col, '')
         meta_rows.append(row)
@@ -463,6 +549,7 @@ def _write_output(superdir: Path, runs: dict, row_data: dict,
     try:
         with pd.HDFStore(str(h5_path), mode='w') as store:
             store.put('/metadata', meta_df, format='table', data_columns=True)
+
             for sample in ordered_samples:
                 rd = row_data[sample]
                 gid = rd.get('group', '')
@@ -473,6 +560,29 @@ def _write_output(superdir: Path, runs: dict, row_data: dict,
                 key = f'/data/{gid}/{run_type}'
                 store.put(key, df, format='table', data_columns=True)
                 print(f"Written HDF5 key: {key}  ({len(df)} rows)")
+
+            # Coulter data: one entry per group, written once using the first
+            # run in the group that has a coulter_col assigned.
+            if coulter_df is not None:
+                written_groups = set()
+                for sample in ordered_samples:
+                    rd = row_data[sample]
+                    gid = rd.get('group', '')
+                    col_name = rd.get('coulter_col', '')
+                    if not gid or not col_name or gid in written_groups:
+                        continue
+                    if col_name not in coulter_df.columns:
+                        print(f"  [warn] Coulter column '{col_name}' not found — skipping")
+                        continue
+                    coulter_series = coulter_df[[col_name]].dropna()
+                    coulter_series = coulter_series.reset_index(drop=True)
+                    key = f'/data/{gid}/coulter'
+                    store.put(key, coulter_series, format='table',
+                              data_columns=True)
+                    print(f"Written HDF5 key: {key}  "
+                          f"({len(coulter_series)} rows, column='{col_name}')")
+                    written_groups.add(gid)
+
         print(f"Written: {h5_path}")
     except ImportError:
         print("[warn] 'tables' package not installed — data.h5 not written. "
@@ -487,8 +597,14 @@ def _write_output(superdir: Path, runs: dict, row_data: dict,
 # ---------------------------------------------------------------------------
 
 def main():
-    initial_superdir = parse_cli_args()
-    state = {'superdir': initial_superdir}
+    superdir, coulter_path = parse_cli_args()
+    state = {'superdir': superdir}
+
+    coulter_df = None
+    if coulter_path is not None:
+        coulter_df = _load_coulter(coulter_path)
+        print(f"Loaded Coulter CSV: {coulter_path.name}  "
+              f"({len(coulter_df.columns)} columns, {len(coulter_df)} rows)")
 
     while True:
         restart = [False]
@@ -513,7 +629,8 @@ def main():
                 restart[0] = True
                 root.destroy()
 
-        PairingWindow(root, superdir, runs, on_back=on_back)
+        PairingWindow(root, superdir, runs, coulter_df=coulter_df,
+                      on_back=on_back)
         root.mainloop()
 
         if not restart[0]:
