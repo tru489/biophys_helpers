@@ -25,8 +25,8 @@ Workflow:
                cutoff_log.txt
                cutoff_stats.csv
                histograms/group_NN.png
-    7. A "← Back" button on the main gating screen lets you re-pick a different
-       superdir without restarting the script.
+    7. A "← Back" button undoes the last group of cutoffs, restoring those
+       samples to the remaining list. Can be pressed repeatedly.
 
 Expected directory structure:
 
@@ -51,7 +51,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tkinter as tk
-from tkinter import filedialog
 import yaml
 
 from gating.common import (MainWindow, ask_data_type_dialog,
@@ -283,55 +282,38 @@ def _write_output(superdir: Path, sample_dirs: dict, columns: list,
 # ---------------------------------------------------------------------------
 
 def main():
-    initial_superdir = parse_cli_args()
-    state = {'superdir': initial_superdir}
+    superdir = parse_cli_args()
 
-    while True:
-        restart = [False]
-        superdir = state['superdir']
+    root = tk.Tk()
+    root.withdraw()
+    mode_key = ask_data_type_dialog(root, [
+        ('Buoyant Mass', 'bm'),
+        ('iFXM Volume', 'ifxm'),
+    ])
+    mode_cfg = _MODE[mode_key]
 
-        root = tk.Tk()
-        root.withdraw()
-        mode_key = ask_data_type_dialog(root, [
-            ('Buoyant Mass', 'bm'),
-            ('iFXM Volume', 'ifxm'),
-        ])
-        mode_cfg = _MODE[mode_key]
+    print(f"Discovering {mode_cfg['label']} data in {superdir.name}...")
+    if mode_key == 'bm':
+        data = _discover_bm(superdir)
+    else:
+        data = _discover_ifxm(superdir)
 
-        print(f"Discovering {mode_cfg['label']} data in {superdir.name}...")
-        if mode_key == 'bm':
-            data = _discover_bm(superdir)
-        else:
-            data = _discover_ifxm(superdir)
+    if not data:
+        print(f"No {mode_cfg['label']} data found in {superdir}")
+        sys.exit(1)
 
-        if not data:
-            print(f"No {mode_cfg['label']} data found in {superdir}")
-            sys.exit(1)
+    sample_dirs = {name: superdir / name for name in data}
+    columns = list(data.keys())
+    print(f"Found {len(columns)} sample(s): {', '.join(columns)}")
 
-        sample_dirs = {name: superdir / name for name in data}
-        columns = list(data.keys())
-        print(f"Found {len(columns)} sample(s): {', '.join(columns)}")
+    def on_finish(cutoffs, groups):
+        return _write_output(superdir, sample_dirs, columns,
+                             data, cutoffs, groups, mode_cfg)
 
-        def on_back(root=root, restart=restart):
-            new = filedialog.askdirectory(title="Select experiment superdir")
-            if new:
-                state['superdir'] = Path(new)
-                restart[0] = True
-                root.destroy()
-
-        def on_finish(cutoffs, groups, superdir=superdir,
-                      sample_dirs=sample_dirs, columns=columns,
-                      data=data, mode_cfg=mode_cfg):
-            return _write_output(superdir, sample_dirs, columns,
-                                 data, cutoffs, groups, mode_cfg)
-
-        root.deiconify()
-        MainWindow(root, columns, data, mode_cfg, on_finish, on_back,
-                   context_label=superdir.name, listbox_width=80)
-        root.mainloop()
-
-        if not restart[0]:
-            break
+    root.deiconify()
+    MainWindow(root, columns, data, mode_cfg, on_finish,
+               context_label=superdir.name, listbox_width=80)
+    root.mainloop()
 
 
 if __name__ == '__main__':

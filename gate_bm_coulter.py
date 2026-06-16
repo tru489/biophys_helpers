@@ -24,8 +24,8 @@ Workflow:
          - <stem>_cutoff_log.txt    per-column removal statistics
          - <stem>_cutoff_stats.csv  per-column descriptive statistics on gated data
          - histograms/group_NN.png  saved histogram for each group
-    6. A "← Back" button on the main gating screen lets you re-pick a different
-       CSV file without restarting the script.
+    6. A "← Back" button undoes the last group of cutoffs, restoring those
+       columns to the remaining list. Can be pressed repeatedly.
 
 Usage:
     python apply_bm_cutoffs.py <csv_file>
@@ -42,7 +42,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tkinter as tk
-from tkinter import filedialog
 
 from gating.common import (MainWindow, ask_data_type_dialog,
                            save_group_histograms, write_stats_csv, write_log)
@@ -142,50 +141,30 @@ def _write_output(csv_path: Path, columns: list, data: dict,
 # ---------------------------------------------------------------------------
 
 def main():
-    initial_path = parse_cli_args()
-    state = {'path': initial_path}
+    path = parse_cli_args()
 
-    while True:
-        restart = [False]
-        path = state['path']
+    df = pd.read_csv(path)
+    columns = list(df.columns)
+    data = {col: df[col].dropna().values for col in columns}
 
-        df = pd.read_csv(path)
-        columns = list(df.columns)
-        data = {col: df[col].dropna().values for col in columns}
+    if not columns:
+        print("No columns found in file.")
+        sys.exit(1)
 
-        if not columns:
-            print("No columns found in file.")
-            sys.exit(1)
+    root = tk.Tk()
+    root.withdraw()
+    mode_key = ask_data_type_dialog(root, [
+        ('Buoyant Mass', 'bm'),
+        ('Coulter Counter Volume', 'cc'),
+    ])
+    mode_cfg = _MODE[mode_key]
 
-        root = tk.Tk()
-        root.withdraw()
-        mode_key = ask_data_type_dialog(root, [
-            ('Buoyant Mass', 'bm'),
-            ('Coulter Counter Volume', 'cc'),
-        ])
-        mode_cfg = _MODE[mode_key]
+    def on_finish(cutoffs, groups):
+        return _write_output(path, columns, data, cutoffs, groups, mode_cfg)
 
-        def on_back(root=root, restart=restart):
-            new = filedialog.askopenfilename(
-                title="Select CSV file",
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            )
-            if new:
-                state['path'] = Path(new)
-                restart[0] = True
-                root.destroy()
-
-        def on_finish(cutoffs, groups, path=path, columns=columns,
-                      data=data, mode_cfg=mode_cfg):
-            return _write_output(path, columns, data, cutoffs, groups, mode_cfg)
-
-        root.deiconify()
-        MainWindow(root, columns, data, mode_cfg, on_finish, on_back,
-                   context_label=path.name)
-        root.mainloop()
-
-        if not restart[0]:
-            break
+    root.deiconify()
+    MainWindow(root, columns, data, mode_cfg, on_finish, context_label=path.name)
+    root.mainloop()
 
 
 if __name__ == '__main__':

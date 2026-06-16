@@ -16,7 +16,7 @@ write_log             Write plain-text cutoff log (caller provides header lines)
 
 import sys
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox
 
 import matplotlib
 matplotlib.use('TkAgg')
@@ -190,24 +190,22 @@ class MainWindow:
         mode_cfg:      entry from a _MODE dict
         on_finish:     callable(cutoffs, groups) → Path | str | None
                        Called when Done is clicked; return value shown in dialog.
-        on_back:       optional callable(); called when ← Back is clicked.
-                       Typically triggers a file/folder repick and root.destroy().
         context_label: text appended to the header, e.g. filename or superdir name
         listbox_width: character width of the listbox widget (default 120)
     """
 
     def __init__(self, root: tk.Tk, columns: list, data: dict, mode_cfg: dict,
-                 on_finish, on_back=None,
+                 on_finish,
                  context_label: str = '', listbox_width: int = 120):
         self._root = root
         self._columns = columns
         self._data = data
         self._cfg = mode_cfg
         self._on_finish = on_finish
-        self._on_back = on_back
         self._cutoffs: dict = {}
         self._groups: list = []
         self._remaining: list = list(columns)
+        self._history: list = []
 
         label = mode_cfg['label']
         ctx = f"  [{context_label}]" if context_label else ''
@@ -232,9 +230,9 @@ class MainWindow:
         btn_frame = tk.Frame(root)
         btn_frame.pack(fill=tk.X, padx=10, pady=8)
 
-        if on_back is not None:
-            tk.Button(btn_frame, text="← Back",
-                      command=self._do_back).pack(side=tk.LEFT, padx=(0, 16))
+        self._back_btn = tk.Button(btn_frame, text="← Back",
+                                   state=tk.DISABLED, command=self._do_back)
+        self._back_btn.pack(side=tk.LEFT, padx=(0, 16))
 
         self._set_btn = tk.Button(
             btn_frame, text="Set cutoffs for selection",
@@ -258,6 +256,8 @@ class MainWindow:
         self._done_btn.config(
             state=tk.NORMAL if n_done == n_total else tk.DISABLED)
         self._set_btn.config(state=tk.DISABLED)
+        self._back_btn.config(
+            state=tk.NORMAL if self._history else tk.DISABLED)
 
     def _on_select(self, _event):
         has_selection = bool(self._listbox.curselection())
@@ -271,6 +271,11 @@ class MainWindow:
         win = CutoffWindow(self._root, selected, self._data, self._cfg)
         if win.result is None:
             return
+        self._history.append((
+            self._cutoffs.copy(),
+            list(self._groups),
+            list(self._remaining),
+        ))
         lower, upper = win.result
         for col in selected:
             self._cutoffs[col] = (lower, upper)
@@ -285,8 +290,10 @@ class MainWindow:
         self._root.destroy()
 
     def _do_back(self):
-        if self._on_back is not None:
-            self._on_back()
+        if not self._history:
+            return
+        self._cutoffs, self._groups, self._remaining = self._history.pop()
+        self._refresh_list()
 
 
 # ---------------------------------------------------------------------------
