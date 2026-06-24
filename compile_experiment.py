@@ -193,12 +193,11 @@ def _pad_stack(frames: list) -> np.ndarray:
 def _save_images_for_sample(hdf5_src: Path, index_csv: Path,
                              out_grp, sample_name: str) -> int:
     """
-    Read per-transit BF/FL frames from the CELLGROUPED source and write stacks
+    Read per-transit BF frames from the CELLGROUPED source and write stacks
     into out_grp (an open h5py group for this sample).
 
     Key layout inside out_grp:
         {transit_idx:05d}/bf  — (n_frames, H, W) uint8
-        {transit_idx:05d}/fl  — (n_frames, H, W) uint16
     """
     idx_df = pd.read_csv(index_csv)
     n_transits = idx_df['TransitIndex'].nunique()
@@ -206,15 +205,9 @@ def _save_images_for_sample(hdf5_src: Path, index_csv: Path,
     with h5py.File(hdf5_src, 'r') as src:
         for transit_id, rows in idx_df.groupby('TransitIndex'):
             bf_frames = [src[p][()] for p in rows['Hdf5PathsBF']]
-            fl_frames = [src[p][()] for p in rows['Hdf5PathsFL']]
-
-            bf_stack = _pad_stack(bf_frames)
-            fl_stack = _pad_stack(fl_frames)
-
+            bf_stack  = _pad_stack(bf_frames)
             key = f'{int(transit_id):05d}'
             out_grp.create_dataset(f'{key}/bf', data=bf_stack,
-                                   compression='gzip', compression_opts=4)
-            out_grp.create_dataset(f'{key}/fl', data=fl_stack,
                                    compression='gzip', compression_opts=4)
 
     return n_transits

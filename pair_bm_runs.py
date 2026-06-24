@@ -35,9 +35,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import warnings
+warnings.filterwarnings('ignore', message='object name is not a valid Python identifier')
+
 import pandas as pd
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
 from tkinter import ttk
 import yaml
 
@@ -93,6 +96,28 @@ def parse_cli_args() -> tuple:
 # Data loading
 # ---------------------------------------------------------------------------
 
+def _collect_sample_dirs(superdir: Path, pattern: re.Pattern) -> list:
+    """
+    Return all dirs that contain at least one *_mass_results subdir,
+    searching at depth 1 then depth 2 from superdir.
+
+    Handles both flat layouts (superdir/sample/mass_results) and
+    grouped layouts (superdir/group/sample/mass_results).
+    """
+    sample_dirs = []
+    for d in sorted(superdir.iterdir()):
+        if not d.is_dir():
+            continue
+        if any(pattern.match(s.name) for s in d.iterdir() if s.is_dir()):
+            sample_dirs.append(d)
+        else:
+            for sub in sorted(d.iterdir()):
+                if sub.is_dir() and any(pattern.match(s.name)
+                                        for s in sub.iterdir() if s.is_dir()):
+                    sample_dirs.append(sub)
+    return sample_dirs
+
+
 def _discover_runs(superdir: Path) -> dict:
     """
     Finds BM run data for each sample subdir.
@@ -104,16 +129,11 @@ def _discover_runs(superdir: Path) -> dict:
     run_dir_pattern = re.compile(r'.+_mass_results$')
     result = {}
 
-    for sample_dir in sorted(superdir.iterdir()):
-        if not sample_dir.is_dir():
-            continue
-
+    for sample_dir in _collect_sample_dirs(superdir, run_dir_pattern):
         run_dirs = sorted(
             d for d in sample_dir.iterdir()
             if d.is_dir() and run_dir_pattern.match(d.name)
         )
-        if not run_dirs:
-            continue
         run_dir = run_dirs[-1]
 
         csv_path = None
@@ -193,6 +213,8 @@ class PairingWindow:
         self._on_back = on_back
 
         self._custom_cols: list = []
+        self._shared_cols: set = set()
+        self._checkbox_cols: set = set()
         self._group_counter: int = 0
         self._group_color_map: dict = {}
         self._active_editor = None
@@ -272,6 +294,8 @@ class PairingWindow:
 
         tk.Button(btn_frame, text="Add Column",
                   command=self._add_column).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_frame, text="Remove Column",
+                  command=self._remove_column).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Group Selected",
                   command=self._group_selected).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Clear Group",
@@ -292,9 +316,16 @@ class PairingWindow:
                       'coulter_col': 220}
         for col in cols:
             w = col_widths.get(col, 160)
-            label = col.replace('_', ' ').title()
             if col == 'coulter_col':
                 label = 'Coulter Col'
+            elif col in self._checkbox_cols and col in self._shared_cols:
+                label = f'★ ☑ {col}'
+            elif col in self._checkbox_cols:
+                label = f'☑ {col}'
+            elif col in self._shared_cols:
+                label = f'★ {col}'
+            else:
+                label = col.replace('_', ' ').title()
             self._tree.heading(col, text=label)
             self._tree.column(col, width=w, minwidth=60, anchor='w',
                               stretch=tk.YES if col == 'sample' else tk.NO)
@@ -304,7 +335,13 @@ class PairingWindow:
         base = [sample, rd.get('run_type', ''), rd.get('group', '')]
         if self._coulter_df is not None:
             base.append(rd.get('coulter_col', ''))
-        return base + [rd.get(c, '') for c in self._custom_cols]
+        custom = []
+        for c in self._custom_cols:
+            if c in self._checkbox_cols:
+                custom.append('✓' if rd.get(c) == 'yes' else '')
+            else:
+                custom.append(rd.get(c, ''))
+        return base + custom
 
     def _populate_table(self):
         for item in self._tree.get_children():
@@ -341,9 +378,9 @@ class PairingWindow:
         self._check_done()
 
     def _check_done(self):
-        all_typed = all(self._row_data[n].get('run_type', '') for n in self._runs)
-        any_grouped = any(self._row_data[n].get('group', '') for n in self._runs)
-        state = tk.NORMAL if (all_typed and any_grouped) else tk.DISABLED
+        all_typed   = all(self._row_data[n].get('run_type', '') for n in self._runs)
+        all_grouped = all(self._row_data[n].get('group', '')    for n in self._runs)
+        state = tk.NORMAL if (all_typed and all_grouped) else tk.DISABLED
         self._done_btn.config(state=state)
 
     # ------------------------------------------------------------------
@@ -374,6 +411,11 @@ class PairingWindow:
         col_name = cols[col_idx]
 
         if col_name in ('sample', 'group'):
+            return
+
+        if col_name in self._checkbox_cols:
+            current = self._row_data[item].get(col_name, '')
+            self._commit_edit(item, col_name, '' if current == 'yes' else 'yes', None)
             return
 
         bbox = self._tree.bbox(item, col_id)
@@ -422,22 +464,32 @@ class PairingWindow:
         self._active_editor = widget
 
     def _commit_edit(self, item: str, col_name: str, value: str, widget):
-        try:
-            widget.destroy()
-        except tk.TclError:
-            pass
-        if self._active_editor is widget:
-            self._active_editor = None
+        if widget is not None:
+            try:
+                widget.destroy()
+            except tk.TclError:
+                pass
+            if self._active_editor is widget:
+                self._active_editor = None
 
         self._row_data[item][col_name] = value
 
-        # Coulter column is a group-level attribute; propagate to all group members.
+        # Coulter column and shared custom cols are group-level; propagate to all members.
         if col_name == 'coulter_col' and value:
             gid = self._row_data[item].get('group', '')
             if gid:
                 for name in self._runs:
                     if self._row_data[name].get('group') == gid:
                         self._row_data[name]['coulter_col'] = value
+                self._refresh_all()
+                return
+
+        elif col_name in self._shared_cols and value:
+            gid = self._row_data[item].get('group', '')
+            if gid:
+                for name in self._runs:
+                    if self._row_data[name].get('group') == gid:
+                        self._row_data[name][col_name] = value
                 self._refresh_all()
                 return
 
@@ -458,6 +510,19 @@ class PairingWindow:
         gid = f'G{self._group_counter:02d}'
         for item in selected:
             self._row_data[item]['group'] = gid
+
+        for col in self._shared_cols:
+            vals = [self._row_data[it][col] for it in selected
+                    if self._row_data[it][col]]
+            distinct = list(dict.fromkeys(vals))
+            if len(distinct) > 1:
+                kept = self._resolve_shared_conflict(col, distinct)
+                for it in selected:
+                    self._row_data[it][col] = kept
+            elif len(distinct) == 1:
+                for it in selected:
+                    self._row_data[it][col] = distinct[0]
+
         self._refresh_all()
 
     def _clear_group(self):
@@ -465,20 +530,139 @@ class PairingWindow:
             self._row_data[item]['group'] = ''
         self._refresh_all()
 
+    def _resolve_shared_conflict(self, col: str, distinct_vals: list) -> str:
+        result = {'value': distinct_vals[0]}
+        top = tk.Toplevel(self._root)
+        top.title(f"Conflict in '{col}'")
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(top,
+                 text=f"Column '{col}' has conflicting values in this group:",
+                 wraplength=320).pack(padx=14, pady=(12, 4), anchor='w')
+
+        choice_var = tk.StringVar(value=distinct_vals[0])
+        tk.Radiobutton(top, text="Clear all (leave blank for all members)",
+                       variable=choice_var, value='__clear__').pack(padx=14, anchor='w')
+        for v in distinct_vals:
+            tk.Radiobutton(top, text=f'Keep "{v}" for all members',
+                           variable=choice_var, value=v).pack(padx=14, anchor='w')
+
+        def _ok():
+            chosen = choice_var.get()
+            result['value'] = '' if chosen == '__clear__' else chosen
+            top.destroy()
+
+        tk.Button(top, text="OK", command=_ok, width=10).pack(pady=(8, 12))
+        top.protocol('WM_DELETE_WINDOW', _ok)
+        self._root.wait_window(top)
+        return result['value']
+
     def _add_column(self):
-        name = simpledialog.askstring(
-            "Add Column", "Column name:", parent=self._root)
-        if not name or not name.strip():
+        result = {'name': None, 'shared': False, 'checkbox': False}
+        top = tk.Toplevel(self._root)
+        top.title("Add column")
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(top, text="Column name:").grid(
+            row=0, column=0, padx=10, pady=(10, 4), sticky='w')
+        name_var = tk.StringVar()
+        tk.Entry(top, textvariable=name_var, width=24).grid(
+            row=0, column=1, padx=10, pady=(10, 4))
+
+        shared_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(top, text="Shared within groups",
+                       variable=shared_var).grid(
+            row=1, column=0, columnspan=2, padx=10, pady=(4, 0), sticky='w')
+
+        checkbox_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(top, text="Checkbox values (yes / no)",
+                       variable=checkbox_var).grid(
+            row=2, column=0, columnspan=2, padx=10, pady=(0, 4), sticky='w')
+
+        def _ok():
+            result['name']     = name_var.get().strip()
+            result['shared']   = shared_var.get()
+            result['checkbox'] = checkbox_var.get()
+            top.destroy()
+
+        def _cancel():
+            top.destroy()
+
+        btn_frame = tk.Frame(top)
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=(4, 10))
+        tk.Button(btn_frame, text="OK",     command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
+
+        top.protocol('WM_DELETE_WINDOW', _cancel)
+        self._root.wait_window(top)
+
+        name = result['name']
+        if not name:
             return
-        name = name.strip()
         if name in self._all_cols():
             messagebox.showwarning("Duplicate",
                                    f"Column '{name}' already exists.",
                                    parent=self._root)
             return
         self._custom_cols.append(name)
+        if result['shared']:
+            self._shared_cols.add(name)
+        if result['checkbox']:
+            self._checkbox_cols.add(name)
         for rd in self._row_data.values():
             rd[name] = ''
+        self._setup_columns()
+        self._populate_table()
+
+    def _remove_column(self):
+        if not self._custom_cols:
+            messagebox.showinfo("No columns", "No custom columns to remove.",
+                                parent=self._root)
+            return
+
+        result = {'name': None}
+        top = tk.Toplevel(self._root)
+        top.title("Remove column")
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(top, text="Select column to remove:").pack(
+            padx=14, pady=(12, 4), anchor='w')
+
+        listbox = tk.Listbox(top, selectmode=tk.SINGLE, height=min(8, len(self._custom_cols)),
+                             width=30, exportselection=False)
+        for col in self._custom_cols:
+            listbox.insert(tk.END, col)
+        listbox.select_set(0)
+        listbox.pack(padx=14, pady=(0, 8))
+
+        def _ok():
+            sel = listbox.curselection()
+            if sel:
+                result['name'] = self._custom_cols[sel[0]]
+            top.destroy()
+
+        def _cancel():
+            top.destroy()
+
+        btn_frame = tk.Frame(top)
+        btn_frame.pack(pady=(0, 12))
+        tk.Button(btn_frame, text="Remove", command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
+
+        top.protocol('WM_DELETE_WINDOW', _cancel)
+        self._root.wait_window(top)
+
+        name = result['name']
+        if not name:
+            return
+        self._custom_cols.remove(name)
+        self._shared_cols.discard(name)
+        self._checkbox_cols.discard(name)
+        for rd in self._row_data.values():
+            rd.pop(name, None)
         self._setup_columns()
         self._populate_table()
 
