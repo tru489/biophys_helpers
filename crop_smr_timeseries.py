@@ -1,5 +1,5 @@
 """
-crop_smr_data.py
+crop_smr_timeseries.py
 
 Interactive GUI for cropping junk data from SMR binary run files. A directory
 containing three binary files (prefix_frequencies, prefix_valvestates,
@@ -26,7 +26,7 @@ Workflow:
        the same level as the input directory.
 
 Usage:
-    python crop_smr_data.py <directory> [--chunk-size N]
+    python crop_smr_timeseries.py <directory> [--chunk-size N]
 
     <directory>       Path containing the three SMR binary files
     --chunk-size N    Number of data points per displayed chunk (default: 100000)
@@ -203,7 +203,7 @@ class CropWindow:
         # Committed regions: list of [lower_idx, upper_idx] (inclusive)
         self._regions = []
 
-        root.title(f"crop_smr_data  —  {directory.name}")
+        root.title(f"crop_smr_timeseries  —  {directory.name}")
         self._build_ui()
         self._draw_chunk()
 

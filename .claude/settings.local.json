@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('annotate_coulter_samples.py'\\).read\\(\\)\\); print\\('parse OK'\\)\")",
+      "Bash(python annotate_coulter_samples.py --help)",
+      "Bash(python -m py_compile pair_bm_runs.py)",
+      "Bash(python -m py_compile crop_smr_timeseries.py)"
+    ]
+  }
+}

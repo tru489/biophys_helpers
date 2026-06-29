@@ -8,3 +8,5 @@ dependencies:
   - matplotlib
   - pyyaml
   - h5py
+  - pytables
+  - pillow

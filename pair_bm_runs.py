@@ -218,6 +218,7 @@ class PairingWindow:
         self._group_counter: int = 0
         self._group_color_map: dict = {}
         self._active_editor = None
+        self._last_col = None
 
         init_row = {'run_type': '', 'group': ''}
         if coulter_df is not None:
@@ -300,6 +301,8 @@ class PairingWindow:
                   command=self._group_selected).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Clear Group",
                   command=self._clear_group).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_frame, text="Set Cells…",
+                  command=self._set_cells).pack(side=tk.LEFT, padx=(0, 12))
         tk.Button(btn_frame, text="↑",
                   command=self._move_up).pack(side=tk.LEFT, padx=(0, 2))
         tk.Button(btn_frame, text="↓",
@@ -412,6 +415,7 @@ class PairingWindow:
 
         if col_name in ('sample', 'group'):
             return
+        self._last_col = col_name
 
         if col_name in self._checkbox_cols:
             current = self._row_data[item].get(col_name, '')
@@ -423,45 +427,63 @@ class PairingWindow:
             return
         x, y, w, h = bbox
 
-        current_val = self._tree.set(item, col_name)
-
         if col_name == 'run_type':
-            widget = ttk.Combobox(self._tree, values=_RUN_TYPES,
-                                  state='readonly', width=12)
-            widget.set(current_val)
-            widget.bind('<<ComboboxSelected>>',
-                        lambda e, i=item, c=col_name, ww=widget:
-                        self._commit_edit(i, c, ww.get(), ww))
-            widget.bind('<FocusOut>',
-                        lambda e, i=item, c=col_name, ww=widget:
-                        self._commit_edit(i, c, ww.get(), ww))
+            self._open_combo_editor(item, col_name, _RUN_TYPES, 12, x, y, w, h)
+            return
+        if col_name == 'coulter_col':
+            self._open_combo_editor(item, col_name, self._coulter_cols, 30,
+                                    x, y, w, h)
+            return
 
-        elif col_name == 'coulter_col':
-            widget = ttk.Combobox(self._tree, values=self._coulter_cols,
-                                  state='readonly', width=30)
-            widget.set(current_val)
-            widget.bind('<<ComboboxSelected>>',
-                        lambda e, i=item, c=col_name, ww=widget:
-                        self._commit_edit(i, c, ww.get(), ww))
-            widget.bind('<FocusOut>',
-                        lambda e, i=item, c=col_name, ww=widget:
-                        self._commit_edit(i, c, ww.get(), ww))
-
-        else:
-            var = tk.StringVar(value=current_val)
-            widget = tk.Entry(self._tree, textvariable=var)
-            widget.bind('<Return>',
-                        lambda e, i=item, c=col_name, v=var, ww=widget:
-                        self._commit_edit(i, c, v.get(), ww))
-            widget.bind('<FocusOut>',
-                        lambda e, i=item, c=col_name, v=var, ww=widget:
-                        self._commit_edit(i, c, v.get(), ww))
-            widget.bind('<Escape>', lambda e, ww=widget: ww.destroy())
-            widget.select_range(0, tk.END)
+        current_val = self._tree.set(item, col_name)
+        var = tk.StringVar(value=current_val)
+        widget = tk.Entry(self._tree, textvariable=var)
+        widget.bind('<Return>',
+                    lambda e, i=item, c=col_name, v=var, ww=widget:
+                    self._commit_edit(i, c, v.get(), ww))
+        widget.bind('<FocusOut>',
+                    lambda e, i=item, c=col_name, v=var, ww=widget:
+                    self._commit_edit(i, c, v.get(), ww))
+        widget.bind('<Escape>', lambda e, ww=widget: ww.destroy())
+        widget.select_range(0, tk.END)
 
         widget.place(x=x, y=y, width=w, height=h)
         widget.focus_set()
         self._active_editor = widget
+
+    def _open_combo_editor(self, item, col_name, values, width, x, y, w, h):
+        """
+        Open a readonly in-place Combobox on (item, col_name).
+
+        Commits on selection (<<ComboboxSelected>>) and cancels on Escape.
+        Deliberately NO <FocusOut> commit: a readonly combobox's dropdown is a
+        separate popup, so opening it makes the combobox lose focus — a
+        FocusOut-destroys-editor handler would tear the widget down just as the
+        list appears, forcing repeated clicks. Stale editors are instead cleaned
+        up by the next _on_cell_click.
+        """
+        current_val = self._tree.set(item, col_name)
+        widget = ttk.Combobox(self._tree, values=values,
+                              state='readonly', width=width)
+        widget.set(current_val)
+        widget.bind('<<ComboboxSelected>>',
+                    lambda e, ww=widget: self._commit_edit(item, col_name,
+                                                           ww.get(), ww))
+        widget.bind('<Escape>', lambda e, ww=widget: ww.destroy())
+        widget.place(x=x, y=y, width=w, height=h)
+        widget.focus_set()
+        self._active_editor = widget
+
+        # Auto-post the dropdown so the cell-opening click also reveals the
+        # list (one click instead of the extra activation click macOS/aqua
+        # otherwise requires). Deferred so the creating click finishes first;
+        # falls back silently if the private Tk proc is unavailable.
+        def _post(ww=widget):
+            try:
+                ww.tk.call('ttk::combobox::Post', ww)
+            except tk.TclError:
+                pass
+        widget.after_idle(_post)
 
     def _commit_edit(self, item: str, col_name: str, value: str, widget):
         if widget is not None:
@@ -529,6 +551,113 @@ class PairingWindow:
         for item in self._tree.selection():
             self._row_data[item]['group'] = ''
         self._refresh_all()
+
+    def _settable_cols(self) -> list:
+        """Columns the bulk 'Set Cells' dialog may target (everything editable
+        except the read-only 'sample' and the group-managed 'group')."""
+        cols = ['run_type']
+        if self._coulter_df is not None:
+            cols.append('coulter_col')
+        return cols + self._custom_cols
+
+    def _set_cells(self):
+        selected = self._tree.selection()
+        settable = self._settable_cols()
+
+        top = tk.Toplevel(self._root)
+        top.title("Set cells")
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(top, text="Column:").grid(
+            row=0, column=0, padx=10, pady=(10, 4), sticky='w')
+        default_col = (self._last_col if self._last_col in settable
+                       else settable[0])
+        col_var = tk.StringVar(value=default_col)
+        col_box = ttk.Combobox(top, values=settable, textvariable=col_var,
+                               state='readonly', width=22)
+        col_box.grid(row=0, column=1, padx=10, pady=(10, 4))
+
+        tk.Label(top, text="Value:").grid(
+            row=1, column=0, padx=10, pady=4, sticky='w')
+        value_frame = tk.Frame(top)
+        value_frame.grid(row=1, column=1, padx=10, pady=4, sticky='w')
+
+        value_var = tk.StringVar()
+
+        def _build_value_widget(*_):
+            for child in value_frame.winfo_children():
+                child.destroy()
+            col = col_var.get()
+            if col == 'run_type':
+                value_var.set('')
+                ttk.Combobox(value_frame, values=_RUN_TYPES,
+                             textvariable=value_var, state='readonly',
+                             width=20).pack()
+            elif col == 'coulter_col':
+                value_var.set('')
+                ttk.Combobox(value_frame, values=self._coulter_cols,
+                             textvariable=value_var, state='readonly',
+                             width=20).pack()
+            elif col in self._checkbox_cols:
+                value_var.set('yes')
+                ttk.Combobox(value_frame, values=['yes', 'no'],
+                             textvariable=value_var, state='readonly',
+                             width=20).pack()
+            else:
+                value_var.set('')
+                tk.Entry(value_frame, textvariable=value_var, width=23).pack()
+
+        col_box.bind('<<ComboboxSelected>>', _build_value_widget)
+        _build_value_widget()
+
+        all_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(top, text="Apply to all rows (ignore selection)",
+                       variable=all_var).grid(
+            row=2, column=0, columnspan=2, padx=10, pady=(4, 0), sticky='w')
+
+        tk.Label(top, text=f"{len(selected)} row(s) selected",
+                 fg='#555').grid(
+            row=3, column=0, columnspan=2, padx=10, pady=(0, 4), sticky='w')
+
+        result = {'ok': False}
+
+        def _ok():
+            result.update(ok=True, col=col_var.get(),
+                          value=value_var.get(), all=all_var.get())
+            top.destroy()
+
+        def _cancel():
+            top.destroy()
+
+        btn_frame = tk.Frame(top)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=(4, 10))
+        tk.Button(btn_frame, text="OK",     command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
+
+        top.protocol('WM_DELETE_WINDOW', _cancel)
+        self._root.wait_window(top)
+
+        if not result['ok']:
+            return
+
+        targets = self._tree.get_children() if result['all'] else selected
+        if not targets:
+            messagebox.showwarning(
+                "No selection",
+                "Select one or more rows, or check 'Apply to all rows'.",
+                parent=self._root)
+            return
+
+        col = result['col']
+        value = result['value']
+        if col in self._checkbox_cols:
+            value = 'yes' if value == 'yes' else ''
+
+        # Route through _commit_edit so group-level propagation (coulter_col and
+        # shared custom columns) and Done-button re-evaluation happen per cell.
+        for item in targets:
+            self._commit_edit(item, col, value, None)
 
     def _resolve_shared_conflict(self, col: str, distinct_vals: list) -> str:
         result = {'value': distinct_vals[0]}
