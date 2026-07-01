@@ -20,26 +20,39 @@ Pairing resolution (priority):
     2. ProcessedVolumes rows where matched_mass is not NaN
     3. None — no pairing key written
 
+Optional Coulter calibration (--coulter <csv>):
+    A GUI pairs each sample that has volume data with a Coulter Counter
+    column, then a per-sample calibration window finds a scaling factor
+    (vol_au → fL) by percentile-matching against the Coulter distribution.
+    Calibrated volumes are stored alongside the raw volume data.
+
 Output:
     <superdir>/YYYYMMDD_HHMMSS_compiled/
         experiment_data.h5   — DataFrames (pandas HDFStore)
-        images.h5            — per-transit BF/FL image stacks (h5py)
+        images.h5            — per-transit BF image stacks (h5py)
 
 experiment_data.h5 key layout:
-    /metadata                          — one row per sample (summary + gate values)
-    /samples/{safe_name}/mass          — full mass CSV DataFrame
-    /samples/{safe_name}/volume        — full ProcessedVolumes DataFrame
-    /samples/{safe_name}/pairing       — paired rows (if available)
+    /metadata                               — one row per sample; includes
+                                              coulter_column and
+                                              calibration_factor when --coulter
+                                              is used
+    /samples/{safe_name}/mass               — full mass CSV DataFrame
+    /samples/{safe_name}/volume             — full ProcessedVolumes DataFrame
+                                              (volume column is in vol_au)
+    /samples/{safe_name}/volume_calibrated  — same as /volume plus volume_fL
+                                              column (in fL); written only when
+                                              a calibration factor was accepted
+    /samples/{safe_name}/pairing            — paired rows (if available)
 
 images.h5 key layout:
     /{safe_name}/{transit_idx:05d}/bf  — (n_frames, H, W) uint8
-    /{safe_name}/{transit_idx:05d}/fl  — (n_frames, H, W) uint16
 
 {safe_name} replaces - and . with _ so HDF5 key rules are satisfied.
 The original sample directory name is preserved in /metadata.sample_name.
 
 Usage:
     python compile_experiment.py <superdir>
+    python compile_experiment.py <superdir> --coulter <coulter_csv>
 """
 import argparse
 import re
@@ -47,10 +60,16 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import warnings
-import h5py
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 import pandas as pd
+import tkinter as tk
+from tkinter import messagebox, ttk
+import warnings
+import h5py
 import yaml
 
 # Sample dirs that start with digits (e.g. "0h_pt1") trigger a benign
@@ -63,17 +82,26 @@ warnings.filterwarnings('ignore', message='object name is not a valid Python ide
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_cli_args() -> Path:
+def parse_cli_args() -> tuple[Path, Path | None]:
     parser = argparse.ArgumentParser(
         description="Compile per-sample experiment data into a single HDF5 file."
     )
     parser.add_argument('superdir', type=str,
                         help='Path to the experiment superdir')
+    parser.add_argument('--coulter', type=str, default=None, metavar='CSV',
+                        help='Coulter Counter CSV (columns = sample names, '
+                             'rows = per-cell volumes in fL). Triggers pairing '
+                             'and calibration GUIs.')
     args = parser.parse_args()
     p = Path(args.superdir)
     if not p.is_dir():
         raise FileNotFoundError(f"Directory not found: {p}")
-    return p
+    coulter_path = None
+    if args.coulter is not None:
+        coulter_path = Path(args.coulter)
+        if not coulter_path.is_file():
+            raise FileNotFoundError(f"Coulter file not found: {coulter_path}")
+    return p, coulter_path
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +131,8 @@ def _discover_sample(sample_dir: Path) -> dict:
     Locate the relevant file path for each known data type inside sample_dir.
 
     Returns a dict with keys:
-        mass_path, volume_path, pairing_path, bm_gate_path, ifxm_gate_path
+        mass_path, volume_path, pairing_path, bm_gate_path, ifxm_gate_path,
+        hdf5_src_path, hdf5_index_path
     Any key whose source is absent is set to None.
     """
     paths = {
@@ -227,6 +256,11 @@ def _load_gate(path: Path) -> tuple[float, float] | None:
         return None
 
 
+def _load_coulter(path: Path) -> pd.DataFrame:
+    """Load Coulter CSV: columns = sample names, rows = per-cell volumes in fL."""
+    return pd.read_csv(path)
+
+
 def _resolve_pairing(volume_df: pd.DataFrame | None,
                      pairing_path: Path | None) -> tuple[pd.DataFrame | None, str]:
     """
@@ -257,11 +291,10 @@ def _resolve_pairing(volume_df: pd.DataFrame | None,
 # Main compilation
 # ---------------------------------------------------------------------------
 
-def compile_experiment(superdir: Path) -> tuple[list[dict], list[dict]]:
+def compile_experiment(superdir: Path) -> list[dict]:
     """
-    Walk every sample subdir, discover data, and return:
-        (sample_records, meta_rows)
-    where each sample_record has the loaded DataFrames ready for writing.
+    Walk every sample subdir, discover data, and return a list of sample
+    records with loaded DataFrames ready for writing.
     """
     sample_records = []
 
@@ -302,7 +335,6 @@ def compile_experiment(superdir: Path) -> tuple[list[dict], list[dict]]:
         has_images = (paths['hdf5_src_path'] is not None
                       and paths['hdf5_index_path'] is not None)
 
-        # Console summary line
         def _tick(val, label=''):
             return f'ok({label})' if (val is not None and label) else ('ok' if val is not None else '--')
 
@@ -331,34 +363,499 @@ def compile_experiment(superdir: Path) -> tuple[list[dict], list[dict]]:
 
 
 # ---------------------------------------------------------------------------
+# Coulter pairing GUI
+# ---------------------------------------------------------------------------
+
+class CoulterPairingWindow:
+    """
+    Pairing GUI: one Treeview row per sample with iFXM volume data.
+    Each row gets an in-place Combobox to pick the corresponding Coulter column.
+    Done is enabled only when every row has been assigned.
+
+    self.result is set to {sample_name: coulter_col} on Done, or {} if the
+    window is closed without completing.
+    """
+
+    def __init__(self, root: tk.Tk, samples: list, coulter_cols: list):
+        self._root        = root
+        self._samples     = samples       # records with volume_df is not None
+        self._coulter_cols = coulter_cols
+        self._assignments: dict = {s['name']: '' for s in samples}
+        self._active_editor = None
+        self.result: dict   = {}
+
+        root.title('Coulter Pairing — assign a Coulter column to each sample')
+        self._build_ui()
+        self._populate()
+        root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    def _build_ui(self):
+        tk.Label(
+            self._root,
+            text=(f'{len(self._samples)} sample(s) with volume data — '
+                  f'assign a Coulter column to each'),
+            font=('TkDefaultFont', 10, 'bold'), anchor='w',
+        ).pack(fill=tk.X, padx=10, pady=(8, 2))
+
+        frame = tk.Frame(self._root)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
+
+        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+        self._tree = ttk.Treeview(
+            frame, columns=['sample', 'coulter_col'],
+            selectmode='browse', yscrollcommand=vsb.set,
+            show='headings', height=min(20, len(self._samples) + 2),
+        )
+        vsb.config(command=self._tree.yview)
+        self._tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        self._tree.heading('sample',      text='Sample')
+        self._tree.heading('coulter_col', text='Coulter Column')
+        self._tree.column('sample',      width=220, minwidth=120, stretch=tk.NO)
+        self._tree.column('coulter_col', width=220, minwidth=120, stretch=tk.YES)
+        self._tree.bind('<ButtonRelease-1>', self._on_click)
+
+        btn_frame = tk.Frame(self._root)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self._done_btn = tk.Button(btn_frame, text='Done', state=tk.DISABLED,
+                                   command=self._on_done)
+        self._done_btn.pack(side=tk.RIGHT)
+
+    def _populate(self):
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+        for s in self._samples:
+            self._tree.insert('', tk.END, iid=s['name'],
+                              values=[s['name'], self._assignments[s['name']]])
+        self._check_done()
+
+    def _check_done(self):
+        all_assigned = all(self._assignments[s['name']] for s in self._samples)
+        self._done_btn.config(state=tk.NORMAL if all_assigned else tk.DISABLED)
+
+    def _on_click(self, event):
+        if self._active_editor:
+            try:
+                self._active_editor.destroy()
+            except tk.TclError:
+                pass
+            self._active_editor = None
+
+        region = self._tree.identify_region(event.x, event.y)
+        if region != 'cell':
+            return
+        col_id = self._tree.identify_column(event.x)
+        item   = self._tree.identify_row(event.y)
+        if not item or col_id != '#2':
+            return
+
+        bbox = self._tree.bbox(item, col_id)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+
+        current = self._assignments[item]
+        widget  = ttk.Combobox(self._tree, values=self._coulter_cols,
+                               state='readonly', width=30)
+        widget.set(current)
+        widget.bind('<<ComboboxSelected>>',
+                    lambda e, ww=widget: self._commit(item, ww.get(), ww))
+        widget.bind('<Escape>', lambda _, ww=widget: ww.destroy())
+        widget.place(x=x, y=y, width=w, height=h)
+        widget.focus_set()
+        self._active_editor = widget
+
+        def _post(ww=widget):
+            try:
+                ww.tk.call('ttk::combobox::Post', ww)
+            except tk.TclError:
+                pass
+        widget.after_idle(_post)
+
+    def _commit(self, item: str, value: str, widget):
+        try:
+            widget.destroy()
+        except tk.TclError:
+            pass
+        self._active_editor = None
+        self._assignments[item] = value
+        self._tree.set(item, 'coulter_col', value)
+        self._check_done()
+
+    def _on_done(self):
+        self.result = dict(self._assignments)
+        self._root.destroy()
+
+    def _on_close(self):
+        self.result = {}
+        self._root.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Calibration algorithm
+# ---------------------------------------------------------------------------
+
+def _find_calibration_factor(
+        ifxm_vols_au: np.ndarray,
+        coulter_vols_fL: np.ndarray,
+        vol_low: float,
+        vol_high: float,
+) -> tuple[float, float, np.ndarray, np.ndarray]:
+    """
+    Percentile-matching calibration — Python port of coulter_counter_calibration.m.
+
+    Steps:
+      1. Filter Coulter to [vol_low, vol_high].
+      2. Compute initial factor = median(Coulter_range) / median(iFXM_all).
+      3. Sweep factor ± 3 fL/AU around initial, step 0.01.
+      4. For each candidate factor, scale iFXM and score by
+         sum(|pct(scaled_iFXM) - pct(Coulter_range)|) across pct 5–95.
+      5. Return the factor with the lowest score.
+
+    Returns (best_factor, initial_factor, sweep_factors, sweep_scores).
+    Raises ValueError if the Coulter range contains fewer than 10 points.
+    """
+    if ifxm_vols_au.size < 10:
+        raise ValueError(
+            f'Too few iFXM data points ({ifxm_vols_au.size}) for calibration. '
+            'If an iFXM gate is set, check that the bounds are not too tight.')
+
+    cc_in_range = coulter_vols_fL[
+        (coulter_vols_fL >= vol_low) & (coulter_vols_fL <= vol_high)]
+    if cc_in_range.size < 10:
+        raise ValueError(
+            f'Fewer than 10 Coulter points fall within {vol_low}–{vol_high} fL '
+            '— widen the calibration range.')
+
+    initial_factor = float(np.median(cc_in_range) / np.median(ifxm_vols_au))
+
+    if not np.isfinite(initial_factor) or initial_factor <= 0:
+        raise ValueError(
+            f'Initial calibration factor is not finite ({initial_factor:.4g}). '
+            'Check that the iFXM and Coulter distributions overlap.')
+
+    sweep_low  = max(0.001, initial_factor - 3.0)
+    sweep_high = initial_factor + 3.0 + 1e-9
+    factors    = np.arange(sweep_low, sweep_high, 0.01)
+
+    cc_pct  = np.percentile(cc_in_range, range(5, 96))
+    scores  = np.full(len(factors), np.inf)
+    pct_idx = list(range(5, 96))
+
+    for i, f in enumerate(factors):
+        scaled = ifxm_vols_au * f
+        if scaled.size < 10:
+            continue
+        scores[i] = float(np.sum(np.abs(np.percentile(scaled, pct_idx) - cc_pct)))
+
+    best_idx = int(np.argmin(scores))
+    return factors[best_idx], initial_factor, factors, scores
+
+
+# ---------------------------------------------------------------------------
+# Calibration GUI (per-sample, sequential)
+# ---------------------------------------------------------------------------
+
+class CalibrationWindow:
+    """
+    Per-sample calibration Toplevel.
+
+    Shows a Coulter histogram with a user-selectable calibration range. On
+    "Compute", runs _find_calibration_factor() and draws the score curve and
+    scaled-iFXM vs Coulter overlay.
+
+    self.result  — calibration factor (float) on Accept; None on Skip.
+    self.window  — the Toplevel; destroyed on either Accept or Skip, which
+                   unblocks the caller's cal_root.wait_window(cw.window).
+    """
+
+    def __init__(self, parent: tk.Tk, rec: dict, coulter_vols_fL: np.ndarray):
+        self.result: float | None = None
+        self._rec     = rec
+        self._cc_vols = coulter_vols_fL
+
+        # Apply iFXM gate to raw volumes before calibration
+        raw_vols = rec['volume_df']['volume'].dropna().values
+        gate     = rec.get('ifxm_gate')
+        if gate is not None:
+            lo, hi = gate
+            self._ifxm_vols = raw_vols[(raw_vols >= lo) & (raw_vols <= hi)]
+        else:
+            self._ifxm_vols = raw_vols
+
+        # Default range: 5th–95th percentile of Coulter, rounded to integers
+        default_low  = round(float(np.percentile(coulter_vols_fL, 5)))
+        default_high = round(float(np.percentile(coulter_vols_fL, 95)))
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(f"{rec['name']} — Coulter Calibration")
+        self.window.state('zoomed')   # maximise on Windows
+        self.window.protocol('WM_DELETE_WINDOW', self._on_skip)
+
+        _F = ('TkDefaultFont', 12)      # base font for all tk controls
+        _FB = ('TkDefaultFont', 12, 'bold')
+
+        # ---- Range controls ----
+        ctrl = tk.Frame(self.window)
+        ctrl.pack(fill=tk.X, padx=12, pady=(10, 4))
+        tk.Label(ctrl, text='Calibration range (fL):', font=_F).pack(side=tk.LEFT)
+        tk.Label(ctrl, text='  Low:', font=_F).pack(side=tk.LEFT)
+        self._low_var  = tk.StringVar(value=str(default_low))
+        tk.Entry(ctrl, textvariable=self._low_var,  width=8, font=_F).pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(ctrl, text='High:', font=_F).pack(side=tk.LEFT)
+        self._high_var = tk.StringVar(value=str(default_high))
+        tk.Entry(ctrl, textvariable=self._high_var, width=8, font=_F).pack(side=tk.LEFT, padx=(2, 12))
+        tk.Button(ctrl, text='Compute', font=_F, command=self._compute).pack(side=tk.LEFT)
+
+        # ---- Matplotlib 2×2 figure ----
+        self._fig, self._axs = plt.subplots(2, 2, figsize=(16, 9))
+        self._fig.subplots_adjust(hspace=0.45, wspace=0.35)
+        canvas = FigureCanvasTkAgg(self._fig, master=self.window)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        self._canvas = canvas
+
+        # Initial state: draw Coulter histogram; blank the other three panels
+        for ax in self._axs.flat:
+            ax.axis('off')
+        self._draw_coulter_hist(default_low, default_high)
+        canvas.draw()
+
+        # ---- Bottom controls ----
+        bot = tk.Frame(self.window)
+        bot.pack(fill=tk.X, padx=12, pady=(2, 10))
+        self._factor_label = tk.Label(bot, text='Calibration factor:  —  fL/AU',
+                                      font=_FB)
+        self._factor_label.pack(side=tk.LEFT)
+        tk.Button(bot, text='Skip', font=_F,
+                  command=self._on_skip).pack(side=tk.RIGHT, padx=(8, 0))
+        self._accept_btn = tk.Button(bot, text='Accept & Next', font=_FB,
+                                     state=tk.DISABLED, command=self._on_accept)
+        self._accept_btn.pack(side=tk.RIGHT)
+
+        self._best_factor: float | None = None
+
+    # ------------------------------------------------------------------
+
+    def _parse_range(self) -> tuple[float, float] | None:
+        try:
+            low  = float(self._low_var.get())
+            high = float(self._high_var.get())
+            if low >= high or low <= 0:
+                raise ValueError
+            return low, high
+        except (ValueError, tk.TclError):
+            messagebox.showerror(
+                'Invalid range',
+                'Enter positive numbers with Low < High.',
+                parent=self.window)
+            return None
+
+    def _draw_coulter_hist(self, vol_low: float, vol_high: float):
+        ax = self._axs[0, 0]
+        ax.cla()
+        ax.axis('on')
+        cc   = self._cc_vols
+        cmin = max(cc.min(), 1e-3)
+        bins = np.logspace(np.log10(cmin), np.log10(cc.max()), 60)
+        in_range = cc[(cc >= vol_low) & (cc <= vol_high)]
+        ax.hist(cc,       bins=bins, color='steelblue', alpha=0.5, label='All Coulter')
+        ax.hist(in_range, bins=bins, color='orange',    alpha=0.7, label='Cal. range')
+        ax.set_xscale('log')
+        ax.set_xlabel('Volume (fL)', fontsize=11)
+        ax.set_ylabel('Count', fontsize=11)
+        ax.set_title('Coulter distribution', fontsize=12)
+        ax.tick_params(labelsize=10)
+        ax.legend(fontsize=10)
+
+    def _compute(self):
+        rng = self._parse_range()
+        if rng is None:
+            return
+        vol_low, vol_high = rng
+
+        try:
+            best, initial, factors, scores = _find_calibration_factor(
+                self._ifxm_vols, self._cc_vols, vol_low, vol_high)
+        except ValueError as exc:
+            messagebox.showerror('Calibration error', str(exc), parent=self.window)
+            return
+
+        self._best_factor = best
+
+        # [0,0] Coulter histogram — redraw with current range
+        self._draw_coulter_hist(vol_low, vol_high)
+
+        # [0,1] Score vs calibration factor
+        ax01 = self._axs[0, 1]
+        ax01.cla()
+        ax01.axis('on')
+        ax01.plot(factors, scores, lw=1, color='steelblue')
+        ax01.axvline(initial, color='orange', lw=1.2, ls='--',
+                     label=f'Median: {initial:.3f}')
+        ax01.axvline(best,    color='red',    lw=1.2, ls='--',
+                     label=f'Best:   {best:.3f}')
+        ax01.set_xlabel('Calibration factor (fL/AU)', fontsize=11)
+        ax01.set_ylabel('Σ|percentile diff|', fontsize=11)
+        ax01.set_title('Calibration score', fontsize=12)
+        ax01.tick_params(labelsize=10)
+        ax01.legend(fontsize=10)
+
+        # [1,0] Overlay: scaled iFXM vs Coulter (density-normalised)
+        ax10 = self._axs[1, 0]
+        ax10.cla()
+        ax10.axis('on')
+        cc_rng     = self._cc_vols[(self._cc_vols >= vol_low) & (self._cc_vols <= vol_high)]
+        ifxm_scaled = self._ifxm_vols * best
+        vmin = max(vol_low,  1e-3)
+        bins = np.logspace(np.log10(vmin), np.log10(vol_high), 50)
+        ax10.hist(cc_rng,      bins=bins, density=True, alpha=0.6,
+                  color='orange',    label='Coulter')
+        ax10.hist(ifxm_scaled, bins=bins, density=True, alpha=0.6,
+                  color='steelblue', label='Scaled iFXM')
+        ax10.set_xscale('log')
+        ax10.set_xlabel('Volume (fL)', fontsize=11)
+        ax10.set_ylabel('Density', fontsize=11)
+        ax10.set_title('Overlay (calibration range)', fontsize=12)
+        ax10.tick_params(labelsize=10)
+        ax10.legend(fontsize=10)
+
+        # [1,1] Text summary
+        ax11 = self._axs[1, 1]
+        ax11.cla()
+        ax11.axis('off')
+        gate = self._rec.get('ifxm_gate')
+        gate_str = (f'{gate[0]:.3g} – {gate[1]:.3g} AU' if gate else 'none')
+        summary = (
+            f"Sample:          {self._rec['name']}\n\n"
+            f"iFXM gate:       {gate_str}\n"
+            f"iFXM N (gated):  {len(self._ifxm_vols)}\n"
+            f"Coulter N:       {len(self._cc_vols)}\n\n"
+            f"Range:           {vol_low:.4g} – {vol_high:.4g} fL\n\n"
+            f"Initial factor:  {initial:.4f} fL/AU\n"
+            f"Refined factor:  {best:.4f} fL/AU"
+        )
+        ax11.text(0.05, 0.92, summary, transform=ax11.transAxes,
+                  va='top', ha='left', fontsize=12, family='monospace')
+
+        self._canvas.draw()
+        self._factor_label.config(
+            text=f'Calibration factor:  {best:.4f} fL/AU')
+        self._accept_btn.config(state=tk.NORMAL)
+
+    def _on_accept(self):
+        self.result   = self._best_factor
+        self.vol_low  = float(self._low_var.get())
+        self.vol_high = float(self._high_var.get())
+        self.window.destroy()
+
+    def _on_skip(self):
+        self.result = None
+        self.window.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Calibration diagnostic plots
+# ---------------------------------------------------------------------------
+
+def _write_calibration_plots(out_dir: Path, cal_plot_data: dict) -> None:
+    """
+    Write calibration diagnostic plots into out_dir/calibration_plots/.
+
+    One overlay histogram PNG per sample (Coulter vs scaled iFXM, density-
+    normalised, log x-axis) plus a single bar chart of all calibration factors.
+
+    cal_plot_data: {sample_name: {'factor': float, 'ifxm_vols': ndarray,
+                                   'cc_vols': ndarray,
+                                   'vol_low': float, 'vol_high': float}}
+    """
+    plot_dir = out_dir / 'calibration_plots'
+    plot_dir.mkdir()
+
+    names   = list(cal_plot_data.keys())
+    factors = [cal_plot_data[n]['factor'] for n in names]
+
+    # Per-sample overlay histograms
+    for name, d in cal_plot_data.items():
+        factor    = d['factor']
+        cc        = d['cc_vols']
+        ifxm_sc   = d['ifxm_vols'] * factor
+        vol_low   = d['vol_low']
+        vol_high  = d['vol_high']
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        vmin = max(vol_low, 1e-3)
+        bins = np.logspace(np.log10(vmin), np.log10(vol_high), 50)
+        cc_rng = cc[(cc >= vol_low) & (cc <= vol_high)]
+        ax.hist(cc_rng,  bins=bins, density=True, alpha=0.6,
+                color='orange',    label='Coulter')
+        ax.hist(ifxm_sc, bins=bins, density=True, alpha=0.6,
+                color='steelblue', label='Scaled iFXM')
+        ax.set_xscale('log')
+        ax.set_xlabel('Volume (fL)')
+        ax.set_ylabel('Density')
+        ax.set_title(f'{name}\nfactor = {factor:.4f} fL/AU')
+        ax.legend()
+        fig.tight_layout()
+        safe = re.sub(r'[^\w\-.]', '_', name)
+        fig.savefig(plot_dir / f'{safe}_calibration.png', dpi=150)
+        plt.close(fig)
+
+    # Bar chart of all calibration factors
+    fig, ax = plt.subplots(figsize=(max(5, len(names) * 0.8 + 1.5), 4))
+    x = range(len(names))
+    ax.bar(x, factors, color='steelblue', edgecolor='white', linewidth=0.5)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(names, rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel('Calibration factor (fL/AU)')
+    ax.set_title('Calibration factors per sample')
+    fig.tight_layout()
+    fig.savefig(plot_dir / 'calibration_factors.png', dpi=150)
+    plt.close(fig)
+
+    print(f"Calibration plots written -> {plot_dir}")
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-def _write_output(superdir: Path, sample_records: list) -> Path:
+def _write_output(superdir: Path, sample_records: list,
+                  pairing: dict | None = None,
+                  calibration: dict | None = None,
+                  cal_plot_data: dict | None = None) -> Path:
+    pairing       = pairing       or {}
+    calibration   = calibration   or {}
+    cal_plot_data = cal_plot_data or {}
+
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = superdir / f'{timestamp}_compiled'
     out_dir.mkdir()
-    h5_path = out_dir / 'experiment_data.h5'
+    h5_path        = out_dir / 'experiment_data.h5'
     images_h5_path = out_dir / 'images.h5'
 
     meta_rows = []
     for rec in sample_records:
         name = rec['name']
-        bm = rec['bm_gate']
+        bm   = rec['bm_gate']
         ifxm = rec['ifxm_gate']
         meta_rows.append({
-            'sample_name':    name,
-            'hdf5_key':       _safe_key(name),
-            'has_mass':       rec['mass_df'] is not None,
-            'has_volume':     rec['volume_df'] is not None,
-            'has_pairing':    rec['pairing_df'] is not None,
-            'has_bm_gate':    bm is not None,
-            'has_ifxm_gate':  ifxm is not None,
-            'has_images':     rec['hdf5_src_path'] is not None,
-            'bm_gate_lower':  bm[0] if bm else float('nan'),
-            'bm_gate_upper':  bm[1] if bm else float('nan'),
-            'ifxm_gate_lower': ifxm[0] if ifxm else float('nan'),
-            'ifxm_gate_upper': ifxm[1] if ifxm else float('nan'),
+            'sample_name':       name,
+            'hdf5_key':          _safe_key(name),
+            'has_mass':          rec['mass_df'] is not None,
+            'has_volume':        rec['volume_df'] is not None,
+            'has_pairing':       rec['pairing_df'] is not None,
+            'has_bm_gate':       bm is not None,
+            'has_ifxm_gate':     ifxm is not None,
+            'has_images':        rec['hdf5_src_path'] is not None,
+            'bm_gate_lower':     bm[0]   if bm   else float('nan'),
+            'bm_gate_upper':     bm[1]   if bm   else float('nan'),
+            'ifxm_gate_lower':   ifxm[0] if ifxm else float('nan'),
+            'ifxm_gate_upper':   ifxm[1] if ifxm else float('nan'),
+            'coulter_column':    pairing.get(name, ''),
+            'calibration_factor': calibration.get(name) or float('nan'),
         })
 
     meta_df = pd.DataFrame(meta_rows)
@@ -367,7 +864,7 @@ def _write_output(superdir: Path, sample_records: list) -> Path:
         store.put('/metadata', meta_df, format='table', data_columns=True)
 
         for rec in sample_records:
-            name = rec['name']
+            name     = rec['name']
             key_base = f'/samples/{_safe_key(name)}'
 
             if rec['mass_df'] is not None:
@@ -378,6 +875,15 @@ def _write_output(superdir: Path, sample_records: list) -> Path:
                 store.put(f'{key_base}/volume', rec['volume_df'],
                           format='table', data_columns=True)
 
+                factor = calibration.get(name)
+                if factor is not None:
+                    cal_df = rec['volume_df'].copy()
+                    cal_df['volume_fL'] = cal_df['volume'] * factor
+                    store.put(f'{key_base}/volume_calibrated', cal_df,
+                              format='table', data_columns=True)
+                    print(f"  [{name}] volume_calibrated written "
+                          f"(factor = {factor:.4f} fL/AU)")
+
             if rec['pairing_df'] is not None:
                 store.put(f'{key_base}/pairing', rec['pairing_df'],
                           format='table', data_columns=True)
@@ -387,14 +893,18 @@ def _write_output(superdir: Path, sample_records: list) -> Path:
     image_candidates = [r for r in sample_records
                         if r['hdf5_src_path'] and r['hdf5_index_path']]
     if image_candidates:
-        print(f"Writing image stacks for {len(image_candidates)} sample(s) -> {images_h5_path}")
+        print(f"Writing image stacks for {len(image_candidates)} sample(s) "
+              f"-> {images_h5_path}")
         with h5py.File(str(images_h5_path), 'w') as img_store:
             for rec in image_candidates:
                 grp = img_store.require_group(_safe_key(rec['name']))
-                n = _save_images_for_sample(
+                n   = _save_images_for_sample(
                     rec['hdf5_src_path'], rec['hdf5_index_path'],
                     grp, rec['name'])
                 print(f"  [{rec['name']}] {n} transits")
+
+    if cal_plot_data:
+        _write_calibration_plots(out_dir, cal_plot_data)
 
     return out_dir
 
@@ -404,13 +914,67 @@ def _write_output(superdir: Path, sample_records: list) -> Path:
 # ---------------------------------------------------------------------------
 
 def main():
-    superdir = parse_cli_args()
+    superdir, coulter_path = parse_cli_args()
     print(f"Compiling {superdir.name}...")
     records = compile_experiment(superdir)
     if not records:
         print("No sample data found.")
         sys.exit(1)
-    _write_output(superdir, records)
+
+    pairing:      dict = {}
+    calibration:  dict = {}
+    cal_plot_data: dict = {}
+
+    if coulter_path is not None:
+        coulter_df = _load_coulter(coulter_path)
+        print(f"Loaded Coulter CSV: {coulter_path.name}  "
+              f"({len(coulter_df.columns)} columns, {len(coulter_df)} rows)")
+
+        samples_with_vol = [r for r in records if r['volume_df'] is not None]
+        if not samples_with_vol:
+            print("[warn] No samples with volume data found — "
+                  "skipping Coulter calibration.")
+        else:
+            # Phase 1: pairing GUI
+            pair_root = tk.Tk()
+            pw = CoulterPairingWindow(pair_root, samples_with_vol,
+                                      list(coulter_df.columns))
+            pair_root.mainloop()   # blocks until CoulterPairingWindow destroys pair_root
+            pairing = pw.result
+
+            if not pairing:
+                print("[warn] Pairing cancelled — writing output without calibration.")
+            else:
+                # Phase 2: per-sample calibration (sequential Toplevels)
+                records_by_name = {r['name']: r for r in records}
+                cal_root = tk.Tk()
+                cal_root.withdraw()
+
+                paired_items = [(n, c) for n, c in pairing.items() if c]
+                print(f"\nStarting calibration for {len(paired_items)} sample(s)...")
+                for sample_name, cc_col in paired_items:
+                    rec     = records_by_name[sample_name]
+                    cc_vols = coulter_df[cc_col].dropna().values
+                    print(f"  {sample_name} vs Coulter column '{cc_col}'  "
+                          f"(N={len(cc_vols)})")
+                    cw = CalibrationWindow(cal_root, rec, cc_vols)
+                    cal_root.wait_window(cw.window)
+                    calibration[sample_name] = cw.result
+                    if cw.result is not None:
+                        print(f"    -> accepted  factor = {cw.result:.4f} fL/AU")
+                        cal_plot_data[sample_name] = {
+                            'factor':    cw.result,
+                            'ifxm_vols': cw._ifxm_vols,
+                            'cc_vols':   cw._cc_vols,
+                            'vol_low':   cw.vol_low,
+                            'vol_high':  cw.vol_high,
+                        }
+                    else:
+                        print(f"    -> skipped")
+
+                cal_root.destroy()
+
+    _write_output(superdir, records, pairing, calibration, cal_plot_data)
 
 
 if __name__ == '__main__':
