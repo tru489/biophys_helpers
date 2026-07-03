@@ -35,7 +35,8 @@ experiment_data.h5 key layout:
     /metadata                               — one row per sample; includes
                                               coulter_column and
                                               calibration_factor when --coulter
-                                              is used
+                                              is used, plus any custom
+                                              annotation columns added in the GUI
     /samples/{safe_name}/mass               — full mass CSV DataFrame
     /samples/{safe_name}/volume             — full ProcessedVolumes DataFrame
                                               (volume column is in vol_au)
@@ -363,80 +364,242 @@ def compile_experiment(superdir: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Coulter pairing GUI
+# Annotation + Coulter pairing GUI
 # ---------------------------------------------------------------------------
 
-class CoulterPairingWindow:
+class CompileAnnotationWindow:
     """
-    Pairing GUI: one Treeview row per sample with iFXM volume data.
-    Each row gets an in-place Combobox to pick the corresponding Coulter column.
-    Done is enabled only when every row has been assigned.
+    Spreadsheet-style GUI over every discovered sample.
 
-    self.result is set to {sample_name: coulter_col} on Done, or {} if the
-    window is closed without completing.
+    Fixed columns:
+        sample       — sample directory name (read-only).
+        coulter_col  — present only when a Coulter CSV was supplied. An in-place
+                       readonly Combobox pairs each *volume* sample with a
+                       Coulter column; mass-only rows show '—' and are skipped.
+                       When present, Done stays disabled until every volume
+                       sample is assigned (the original pairing requirement).
+
+    Plus any number of user-added annotation columns (free-text or yes/no
+    checkbox), edited in place, with bulk "Set Cells", add/remove-column and
+    row reordering — mirroring annotate_coulter_samples.py.
+
+    On Done (self.completed = True):
+        self.result           {sample_name: coulter_col}  ('' if unset)
+        self.annotations      {sample_name: {col: value}}
+        self.custom_cols      ordered annotation column names
+        self.checkbox_cols    set of annotation columns that are checkboxes
+        self.ordered_samples  sample names in final (possibly reordered) order
+
+    Closing without Done leaves self.completed = False and empty defaults, so
+    compilation still proceeds (without annotations or calibration).
     """
 
-    def __init__(self, root: tk.Tk, samples: list, coulter_cols: list):
-        self._root        = root
-        self._samples     = samples       # records with volume_df is not None
-        self._coulter_cols = coulter_cols
-        self._assignments: dict = {s['name']: '' for s in samples}
+    def __init__(self, root: tk.Tk, sample_names: list,
+                 volume_names, coulter_cols: list):
+        self._root = root
+        self._samples = list(sample_names)
+        self._volume_names = set(volume_names)
+        self._coulter_cols = list(coulter_cols)
+        self._has_coulter = bool(coulter_cols)
+
+        self._custom_cols: list = []
+        self._checkbox_cols: set = set()
         self._active_editor = None
-        self.result: dict   = {}
+        self._vlines: list = []
+        self._last_col = None
 
-        root.title('Coulter Pairing — assign a Coulter column to each sample')
+        # Per-sample cell values; the Coulter assignment lives here too, under
+        # the 'coulter_col' key.
+        self._row_data: dict = {name: {} for name in self._samples}
+
+        # Outputs — these defaults hold if the window is closed without Done.
+        self.completed = False
+        self.result: dict = {}
+        self.annotations: dict = {}
+        self.custom_cols: list = []
+        self.checkbox_cols: set = set()
+        self.ordered_samples: list = list(self._samples)
+
+        root.title('Annotate & pair samples' if self._has_coulter
+                   else 'Annotate samples')
         self._build_ui()
-        self._populate()
+        self._populate_table()
         root.protocol('WM_DELETE_WINDOW', self._on_close)
 
+    # ------------------------------------------------------------------
+    # Column lists
+    # ------------------------------------------------------------------
+
+    def _fixed_cols(self) -> list:
+        return ['sample', 'coulter_col'] if self._has_coulter else ['sample']
+
+    def _all_cols(self) -> list:
+        return self._fixed_cols() + self._custom_cols
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
     def _build_ui(self):
+        n = len(self._samples)
+        header = (f"{n} sample(s) discovered — "
+                  + ("assign a Coulter column to every volume sample, "
+                     "then annotate" if self._has_coulter else "annotate"))
         tk.Label(
-            self._root,
-            text=(f'{len(self._samples)} sample(s) with volume data — '
-                  f'assign a Coulter column to each'),
+            self._root, text=header,
             font=('TkDefaultFont', 10, 'bold'), anchor='w',
         ).pack(fill=tk.X, padx=10, pady=(8, 2))
 
-        frame = tk.Frame(self._root)
-        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
+        # 'clam' renders Treeview row-tag backgrounds reliably (the macOS aqua
+        # theme ignores them), which the zebra striping below relies on.
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
 
-        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+        tree_frame = tk.Frame(self._root)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
+
+        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        self._hsb = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+
         self._tree = ttk.Treeview(
-            frame, columns=['sample', 'coulter_col'],
-            selectmode='browse', yscrollcommand=vsb.set,
-            show='headings', height=min(20, len(self._samples) + 2),
+            tree_frame, selectmode='extended',
+            yscrollcommand=vsb.set, xscrollcommand=self._on_xscroll,
+            show='headings', height=24,
         )
         vsb.config(command=self._tree.yview)
+        self._hsb.config(command=self._tree.xview)
+
         self._tree.grid(row=0, column=0, sticky='nsew')
         vsb.grid(row=0, column=1, sticky='ns')
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
+        self._hsb.grid(row=1, column=0, sticky='ew')
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
 
-        self._tree.heading('sample',      text='Sample')
-        self._tree.heading('coulter_col', text='Coulter Column')
-        self._tree.column('sample',      width=220, minwidth=120, stretch=tk.NO)
-        self._tree.column('coulter_col', width=220, minwidth=120, stretch=tk.YES)
-        self._tree.bind('<ButtonRelease-1>', self._on_click)
+        self._tree.tag_configure('evenrow', background='#ffffff')
+        self._tree.tag_configure('oddrow', background='#e8eef4')
+
+        self._tree.bind('<ButtonRelease-1>', self._on_cell_click)
+        self._tree.bind('<ButtonRelease-1>',
+                        lambda e: self._draw_gridlines(), add='+')
+        self._tree.bind('<Configure>',
+                        lambda e: self._draw_gridlines(), add='+')
+
+        self._setup_columns()
 
         btn_frame = tk.Frame(self._root)
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
-        self._done_btn = tk.Button(btn_frame, text='Done', state=tk.DISABLED,
-                                   command=self._on_done)
+
+        tk.Button(btn_frame, text="Add Column",
+                  command=self._add_column).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_frame, text="Remove Column",
+                  command=self._remove_column).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_frame, text="Set Cells…",
+                  command=self._set_cells).pack(side=tk.LEFT, padx=(0, 12))
+        tk.Button(btn_frame, text="↑",
+                  command=self._move_up).pack(side=tk.LEFT, padx=(0, 2))
+        tk.Button(btn_frame, text="↓",
+                  command=self._move_down).pack(side=tk.LEFT, padx=(0, 12))
+
+        self._done_btn = tk.Button(btn_frame, text="Done", command=self._finish)
         self._done_btn.pack(side=tk.RIGHT)
 
-    def _populate(self):
+    def _setup_columns(self):
+        cols = self._all_cols()
+        self._tree['columns'] = cols
+        for col in cols:
+            if col == 'sample':
+                label, w, stretch = 'Sample', 240, tk.YES
+            elif col == 'coulter_col':
+                label, w, stretch = 'Coulter Column', 200, tk.NO
+            elif col in self._checkbox_cols:
+                label, w, stretch = f'☑ {col}', 160, tk.NO
+            else:
+                label, w, stretch = col.replace('_', ' ').title(), 160, tk.NO
+            self._tree.heading(col, text=label)
+            self._tree.column(col, width=w, minwidth=60, anchor='w',
+                              stretch=stretch)
+
+    def _row_values(self, sample: str) -> list:
+        rd = self._row_data[sample]
+        vals = [sample]
+        if self._has_coulter:
+            vals.append(rd.get('coulter_col', '')
+                        if sample in self._volume_names else '—')
+        for c in self._custom_cols:
+            if c in self._checkbox_cols:
+                vals.append('✓' if rd.get(c) == 'yes' else '')
+            else:
+                vals.append(rd.get(c, ''))
+        return vals
+
+    def _populate_table(self):
         for item in self._tree.get_children():
             self._tree.delete(item)
-        for s in self._samples:
-            self._tree.insert('', tk.END, iid=s['name'],
-                              values=[s['name'], self._assignments[s['name']]])
+        for sample_name in self._samples:
+            self._tree.insert('', tk.END, iid=sample_name,
+                              values=self._row_values(sample_name))
+        self._restripe()
         self._check_done()
+        self._tree.after_idle(self._draw_gridlines)
+
+    # ------------------------------------------------------------------
+    # State helpers
+    # ------------------------------------------------------------------
+
+    def _restripe(self):
+        """Reapply alternating row tags by current visual position."""
+        for i, item in enumerate(self._tree.get_children()):
+            self._tree.item(item, tags=('evenrow' if i % 2 == 0 else 'oddrow',))
+
+    def _on_xscroll(self, *args):
+        self._hsb.set(*args)
+        self._draw_gridlines()
+
+    def _draw_gridlines(self):
+        """
+        Overlay thin vertical separators at each visible column boundary.
+        Uses bbox() so positions track horizontal scrolling and column widths.
+        """
+        for ln in self._vlines:
+            ln.destroy()
+        self._vlines = []
+
+        children = self._tree.get_children()
+        if not children:
+            return
+        first = children[0]
+        cols = self._tree['columns']
+        for col in cols[:-1]:
+            bbox = self._tree.bbox(first, col)
+            if not bbox:
+                continue
+            bx, _, bw, _ = bbox
+            line = tk.Frame(self._tree, width=1, bg='#b0b0b0')
+            line.place(x=bx + bw, y=0, relheight=1.0)
+            self._vlines.append(line)
+
+    def _refresh_row(self, sample: str):
+        tags = self._tree.item(sample, 'tags')
+        self._tree.item(sample, values=self._row_values(sample), tags=tags)
 
     def _check_done(self):
-        all_assigned = all(self._assignments[s['name']] for s in self._samples)
+        """Enabled unless a Coulter CSV is loaded with volume samples unpaired."""
+        if not self._has_coulter:
+            self._done_btn.config(state=tk.NORMAL)
+            return
+        all_assigned = all(
+            self._row_data[s].get('coulter_col')
+            for s in self._samples if s in self._volume_names)
         self._done_btn.config(state=tk.NORMAL if all_assigned else tk.DISABLED)
 
-    def _on_click(self, event):
+    # ------------------------------------------------------------------
+    # In-place cell editing
+    # ------------------------------------------------------------------
+
+    def _on_cell_click(self, event):
         if self._active_editor:
             try:
                 self._active_editor.destroy()
@@ -447,22 +610,47 @@ class CoulterPairingWindow:
         region = self._tree.identify_region(event.x, event.y)
         if region != 'cell':
             return
+
         col_id = self._tree.identify_column(event.x)
-        item   = self._tree.identify_row(event.y)
-        if not item or col_id != '#2':
+        item = self._tree.identify_row(event.y)
+        if not item:
             return
 
-        bbox = self._tree.bbox(item, col_id)
+        cols = self._tree['columns']
+        col_idx = int(col_id[1:]) - 1
+        if col_idx < 0 or col_idx >= len(cols):
+            return
+        col_name = cols[col_idx]
+
+        if col_name == 'sample':
+            return
+        if col_name == 'coulter_col':
+            self._open_coulter_editor(item)
+            return
+
+        self._last_col = col_name
+        if col_name in self._checkbox_cols:
+            current = self._row_data[item].get(col_name, '')
+            self._commit_edit(item, col_name, '' if current == 'yes' else 'yes', None)
+            return
+
+        self._open_editor(item, col_name)
+
+    def _open_coulter_editor(self, item: str):
+        """Readonly Combobox to pick a Coulter column (volume samples only)."""
+        if item not in self._volume_names:
+            return
+        bbox = self._tree.bbox(item, 'coulter_col')
         if not bbox:
             return
         x, y, w, h = bbox
 
-        current = self._assignments[item]
-        widget  = ttk.Combobox(self._tree, values=self._coulter_cols,
-                               state='readonly', width=30)
+        current = self._row_data[item].get('coulter_col', '')
+        widget = ttk.Combobox(self._tree, values=self._coulter_cols,
+                              state='readonly', width=30)
         widget.set(current)
         widget.bind('<<ComboboxSelected>>',
-                    lambda e, ww=widget: self._commit(item, ww.get(), ww))
+                    lambda e, ww=widget: self._commit_coulter(item, ww.get(), ww))
         widget.bind('<Escape>', lambda _, ww=widget: ww.destroy())
         widget.place(x=x, y=y, width=w, height=h)
         widget.focus_set()
@@ -475,22 +663,312 @@ class CoulterPairingWindow:
                 pass
         widget.after_idle(_post)
 
-    def _commit(self, item: str, value: str, widget):
+    def _commit_coulter(self, item: str, value: str, widget):
         try:
             widget.destroy()
         except tk.TclError:
             pass
         self._active_editor = None
-        self._assignments[item] = value
+        self._row_data[item]['coulter_col'] = value
         self._tree.set(item, 'coulter_col', value)
         self._check_done()
 
-    def _on_done(self):
-        self.result = dict(self._assignments)
+    def _open_editor(self, item: str, col_name: str):
+        """
+        Open an in-place text Entry on (item, col_name). Enter or Tab commits
+        and advances to the same column of the next row; FocusOut commits
+        without advancing; Escape cancels.
+        """
+        if self._active_editor:
+            try:
+                self._active_editor.destroy()
+            except tk.TclError:
+                pass
+            self._active_editor = None
+
+        bbox = self._tree.bbox(item, col_name)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+
+        current_val = self._tree.set(item, col_name)
+
+        var = tk.StringVar(value=current_val)
+        widget = tk.Entry(self._tree, textvariable=var)
+
+        def _commit(advance):
+            self._commit_edit(item, col_name, var.get(), widget)
+            if advance:
+                self._edit_next_row(item, col_name)
+
+        widget.bind('<Return>', lambda e: (_commit(True), 'break')[1])
+        widget.bind('<Tab>',    lambda e: (_commit(True), 'break')[1])
+        widget.bind('<FocusOut>', lambda e: _commit(False))
+        widget.bind('<Escape>', lambda e, ww=widget: ww.destroy())
+        widget.select_range(0, tk.END)
+
+        widget.place(x=x, y=y, width=w, height=h)
+        widget.focus_set()
+        self._active_editor = widget
+
+    def _edit_next_row(self, item: str, col_name: str):
+        """Open the editor on the same column of the row below `item`, if any."""
+        children = self._tree.get_children()
+        try:
+            idx = children.index(item)
+        except ValueError:
+            return
+        if idx + 1 < len(children):
+            nxt = children[idx + 1]
+            self._tree.see(nxt)
+            self._tree.update_idletasks()
+            self._open_editor(nxt, col_name)
+
+    def _commit_edit(self, item: str, col_name: str, value: str, widget):
+        if widget is not None:
+            try:
+                widget.destroy()
+            except tk.TclError:
+                pass
+            if self._active_editor is widget:
+                self._active_editor = None
+
+        self._row_data[item][col_name] = value
+        self._refresh_row(item)
+
+    # ------------------------------------------------------------------
+    # Button actions
+    # ------------------------------------------------------------------
+
+    def _add_column(self):
+        result = {'name': None, 'checkbox': False}
+        top = tk.Toplevel(self._root)
+        top.title("Add column")
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(top, text="Column name:").grid(
+            row=0, column=0, padx=10, pady=(10, 4), sticky='w')
+        name_var = tk.StringVar()
+        tk.Entry(top, textvariable=name_var, width=24).grid(
+            row=0, column=1, padx=10, pady=(10, 4))
+
+        checkbox_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(top, text="Checkbox values (yes / no)",
+                       variable=checkbox_var).grid(
+            row=1, column=0, columnspan=2, padx=10, pady=(0, 4), sticky='w')
+
+        def _ok():
+            result['name']     = name_var.get().strip()
+            result['checkbox'] = checkbox_var.get()
+            top.destroy()
+
+        def _cancel():
+            top.destroy()
+
+        btn_frame = tk.Frame(top)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=(4, 10))
+        tk.Button(btn_frame, text="OK",     command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
+
+        top.protocol('WM_DELETE_WINDOW', _cancel)
+        self._root.wait_window(top)
+
+        name = result['name']
+        if not name:
+            return
+        if name in self._all_cols():
+            messagebox.showwarning("Duplicate",
+                                   f"Column '{name}' already exists.",
+                                   parent=self._root)
+            return
+        self._custom_cols.append(name)
+        if result['checkbox']:
+            self._checkbox_cols.add(name)
+        for rd in self._row_data.values():
+            rd[name] = ''
+        self._setup_columns()
+        self._populate_table()
+
+    def _remove_column(self):
+        if not self._custom_cols:
+            messagebox.showinfo("No columns", "No custom columns to remove.",
+                                parent=self._root)
+            return
+
+        result = {'name': None}
+        top = tk.Toplevel(self._root)
+        top.title("Remove column")
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(top, text="Select column to remove:").pack(
+            padx=14, pady=(12, 4), anchor='w')
+
+        listbox = tk.Listbox(top, selectmode=tk.SINGLE, height=min(8, len(self._custom_cols)),
+                             width=30, exportselection=False)
+        for col in self._custom_cols:
+            listbox.insert(tk.END, col)
+        listbox.select_set(0)
+        listbox.pack(padx=14, pady=(0, 8))
+
+        def _ok():
+            sel = listbox.curselection()
+            if sel:
+                result['name'] = self._custom_cols[sel[0]]
+            top.destroy()
+
+        def _cancel():
+            top.destroy()
+
+        btn_frame = tk.Frame(top)
+        btn_frame.pack(pady=(0, 12))
+        tk.Button(btn_frame, text="Remove", command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
+
+        top.protocol('WM_DELETE_WINDOW', _cancel)
+        self._root.wait_window(top)
+
+        name = result['name']
+        if not name:
+            return
+        self._custom_cols.remove(name)
+        self._checkbox_cols.discard(name)
+        for rd in self._row_data.values():
+            rd.pop(name, None)
+        self._setup_columns()
+        self._populate_table()
+
+    def _set_cells(self):
+        if not self._custom_cols:
+            messagebox.showinfo("No columns", "Add a custom column first.",
+                                parent=self._root)
+            return
+
+        selected = self._tree.selection()
+
+        top = tk.Toplevel(self._root)
+        top.title("Set cells")
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(top, text="Column:").grid(
+            row=0, column=0, padx=10, pady=(10, 4), sticky='w')
+        default_col = (self._last_col if self._last_col in self._custom_cols
+                       else self._custom_cols[0])
+        col_var = tk.StringVar(value=default_col)
+        col_box = ttk.Combobox(top, values=self._custom_cols, textvariable=col_var,
+                               state='readonly', width=22)
+        col_box.grid(row=0, column=1, padx=10, pady=(10, 4))
+
+        tk.Label(top, text="Value:").grid(
+            row=1, column=0, padx=10, pady=4, sticky='w')
+        value_frame = tk.Frame(top)
+        value_frame.grid(row=1, column=1, padx=10, pady=4, sticky='w')
+
+        value_var = tk.StringVar()
+
+        def _build_value_widget(*_):
+            for child in value_frame.winfo_children():
+                child.destroy()
+            if col_var.get() in self._checkbox_cols:
+                value_var.set('yes')
+                ttk.Combobox(value_frame, values=['yes', 'no'],
+                             textvariable=value_var, state='readonly',
+                             width=20).pack()
+            else:
+                value_var.set('')
+                tk.Entry(value_frame, textvariable=value_var, width=23).pack()
+
+        col_box.bind('<<ComboboxSelected>>', _build_value_widget)
+        _build_value_widget()
+
+        all_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(top, text="Apply to all rows (ignore selection)",
+                       variable=all_var).grid(
+            row=2, column=0, columnspan=2, padx=10, pady=(4, 0), sticky='w')
+
+        tk.Label(top, text=f"{len(selected)} row(s) selected",
+                 fg='#555').grid(
+            row=3, column=0, columnspan=2, padx=10, pady=(0, 4), sticky='w')
+
+        result = {'ok': False}
+
+        def _ok():
+            result.update(ok=True, col=col_var.get(),
+                          value=value_var.get(), all=all_var.get())
+            top.destroy()
+
+        def _cancel():
+            top.destroy()
+
+        btn_frame = tk.Frame(top)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=(4, 10))
+        tk.Button(btn_frame, text="OK",     command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
+
+        top.protocol('WM_DELETE_WINDOW', _cancel)
+        self._root.wait_window(top)
+
+        if not result['ok']:
+            return
+
+        targets = self._tree.get_children() if result['all'] else selected
+        if not targets:
+            messagebox.showwarning(
+                "No selection",
+                "Select one or more rows, or check 'Apply to all rows'.",
+                parent=self._root)
+            return
+
+        col = result['col']
+        value = result['value']
+        if col in self._checkbox_cols:
+            value = 'yes' if value == 'yes' else ''
+
+        for item in targets:
+            self._row_data[item][col] = value
+            self._refresh_row(item)
+
+    def _move_up(self):
+        for item in self._tree.selection():
+            idx = self._tree.index(item)
+            if idx > 0:
+                self._tree.move(item, '', idx - 1)
+        self._restripe()
+
+    def _move_down(self):
+        children = self._tree.get_children()
+        n = len(children)
+        for item in reversed(self._tree.selection()):
+            idx = self._tree.index(item)
+            if idx < n - 1:
+                self._tree.move(item, '', idx + 1)
+        self._restripe()
+
+    # ------------------------------------------------------------------
+    # Finish / close
+    # ------------------------------------------------------------------
+
+    def _finish(self):
+        self.ordered_samples = list(self._tree.get_children())
+        self.result = {s: self._row_data[s].get('coulter_col', '')
+                       for s in self._samples}
+        self.annotations = {
+            s: {c: self._row_data[s].get(c, '') for c in self._custom_cols}
+            for s in self._samples}
+        self.custom_cols = list(self._custom_cols)
+        self.checkbox_cols = set(self._checkbox_cols)
+        self.completed = True
         self._root.destroy()
 
     def _on_close(self):
+        self.completed = False
         self.result = {}
+        self.annotations = {}
+        self.custom_cols = []
+        self.checkbox_cols = set()
+        self.ordered_samples = list(self._samples)
         self._root.destroy()
 
 
@@ -592,15 +1070,15 @@ class CalibrationWindow:
 
         self.window = tk.Toplevel(parent)
         self.window.title(f"{rec['name']} — Coulter Calibration")
-        self.window.state('zoomed')   # maximise on Windows
         self.window.protocol('WM_DELETE_WINDOW', self._on_skip)
+        self._maximise()
 
         _F = ('TkDefaultFont', 12)      # base font for all tk controls
         _FB = ('TkDefaultFont', 12, 'bold')
 
-        # ---- Range controls ----
+        # ---- Range controls (top strip) ----
         ctrl = tk.Frame(self.window)
-        ctrl.pack(fill=tk.X, padx=12, pady=(10, 4))
+        ctrl.pack(side=tk.TOP, fill=tk.X, padx=12, pady=(10, 4))
         tk.Label(ctrl, text='Calibration range (fL):', font=_F).pack(side=tk.LEFT)
         tk.Label(ctrl, text='  Low:', font=_F).pack(side=tk.LEFT)
         self._low_var  = tk.StringVar(value=str(default_low))
@@ -610,22 +1088,12 @@ class CalibrationWindow:
         tk.Entry(ctrl, textvariable=self._high_var, width=8, font=_F).pack(side=tk.LEFT, padx=(2, 12))
         tk.Button(ctrl, text='Compute', font=_F, command=self._compute).pack(side=tk.LEFT)
 
-        # ---- Matplotlib 2×2 figure ----
-        self._fig, self._axs = plt.subplots(2, 2, figsize=(16, 9))
-        self._fig.subplots_adjust(hspace=0.45, wspace=0.35)
-        canvas = FigureCanvasTkAgg(self._fig, master=self.window)
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        self._canvas = canvas
-
-        # Initial state: draw Coulter histogram; blank the other three panels
-        for ax in self._axs.flat:
-            ax.axis('off')
-        self._draw_coulter_hist(default_low, default_high)
-        canvas.draw()
-
-        # ---- Bottom controls ----
+        # ---- Bottom controls (bottom strip) ----
+        # Reserve this strip BEFORE packing the canvas so the Skip / Accept &
+        # Next buttons are never pushed off-screen by the expanding figure —
+        # that clipping is what hid them on macOS (where 'zoomed' is a no-op).
         bot = tk.Frame(self.window)
-        bot.pack(fill=tk.X, padx=12, pady=(2, 10))
+        bot.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(2, 10))
         self._factor_label = tk.Label(bot, text='Calibration factor:  —  fL/AU',
                                       font=_FB)
         self._factor_label.pack(side=tk.LEFT)
@@ -635,7 +1103,40 @@ class CalibrationWindow:
                                      state=tk.DISABLED, command=self._on_accept)
         self._accept_btn.pack(side=tk.RIGHT)
 
+        # ---- Matplotlib 2×2 figure (fills the space between the strips) ----
+        self._fig, self._axs = plt.subplots(2, 2, figsize=(16, 9))
+        self._fig.subplots_adjust(hspace=0.45, wspace=0.35)
+        canvas = FigureCanvasTkAgg(self._fig, master=self.window)
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True,
+                                    padx=8, pady=4)
+        self._canvas = canvas
+
+        # Initial state: draw Coulter histogram; blank the other three panels
+        for ax in self._axs.flat:
+            ax.axis('off')
+        self._draw_coulter_hist(default_low, default_high)
+        canvas.draw()
+
         self._best_factor: float | None = None
+
+    def _maximise(self):
+        """
+        Size the window to fill the screen on every platform.
+
+        'zoomed' only maximises on Windows; on macOS/Linux Tk it is either a
+        no-op or raises, leaving the window at the figure's natural size (taller
+        than the screen), which clips the bottom button bar. So always set an
+        explicit screen-sized geometry, leaving a margin for the menu bar/dock.
+        """
+        self.window.update_idletasks()
+        sw = self.window.winfo_screenwidth()
+        sh = self.window.winfo_screenheight()
+        self.window.geometry(f'{sw}x{sh - 120}+0+0')
+        if sys.platform.startswith('win'):
+            try:
+                self.window.state('zoomed')
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
 
@@ -825,10 +1326,23 @@ def _write_calibration_plots(out_dir: Path, cal_plot_data: dict) -> None:
 def _write_output(superdir: Path, sample_records: list,
                   pairing: dict | None = None,
                   calibration: dict | None = None,
-                  cal_plot_data: dict | None = None) -> Path:
+                  cal_plot_data: dict | None = None,
+                  annotations: dict | None = None,
+                  custom_cols: list | None = None,
+                  checkbox_cols: set | None = None,
+                  ordered_samples: list | None = None) -> Path:
     pairing       = pairing       or {}
     calibration   = calibration   or {}
     cal_plot_data = cal_plot_data or {}
+    annotations   = annotations   or {}
+    custom_cols   = custom_cols   or []
+    checkbox_cols = checkbox_cols or set()
+
+    # Honour the row order chosen in the annotation window, if provided.
+    if ordered_samples:
+        order = {name: i for i, name in enumerate(ordered_samples)}
+        sample_records = sorted(
+            sample_records, key=lambda r: order.get(r['name'], len(order)))
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = superdir / f'{timestamp}_compiled'
@@ -841,7 +1355,7 @@ def _write_output(superdir: Path, sample_records: list,
         name = rec['name']
         bm   = rec['bm_gate']
         ifxm = rec['ifxm_gate']
-        meta_rows.append({
+        entry = {
             'sample_name':       name,
             'hdf5_key':          _safe_key(name),
             'has_mass':          rec['mass_df'] is not None,
@@ -856,7 +1370,15 @@ def _write_output(superdir: Path, sample_records: list,
             'ifxm_gate_upper':   ifxm[1] if ifxm else float('nan'),
             'coulter_column':    pairing.get(name, ''),
             'calibration_factor': calibration.get(name) or float('nan'),
-        })
+        }
+        # Append custom annotation columns (checkbox cols normalised to yes/no).
+        row_ann = annotations.get(name, {})
+        for col in custom_cols:
+            val = row_ann.get(col, '')
+            if col in checkbox_cols:
+                val = 'yes' if val == 'yes' else 'no'
+            entry[col] = val
+        meta_rows.append(entry)
 
     meta_df = pd.DataFrame(meta_rows)
 
@@ -921,60 +1443,66 @@ def main():
         print("No sample data found.")
         sys.exit(1)
 
-    pairing:      dict = {}
-    calibration:  dict = {}
-    cal_plot_data: dict = {}
-
+    coulter_df = None
+    coulter_cols: list = []
     if coulter_path is not None:
         coulter_df = _load_coulter(coulter_path)
+        coulter_cols = list(coulter_df.columns)
         print(f"Loaded Coulter CSV: {coulter_path.name}  "
               f"({len(coulter_df.columns)} columns, {len(coulter_df)} rows)")
 
-        samples_with_vol = [r for r in records if r['volume_df'] is not None]
-        if not samples_with_vol:
-            print("[warn] No samples with volume data found — "
-                  "skipping Coulter calibration.")
-        else:
-            # Phase 1: pairing GUI
-            pair_root = tk.Tk()
-            pw = CoulterPairingWindow(pair_root, samples_with_vol,
-                                      list(coulter_df.columns))
-            pair_root.mainloop()   # blocks until CoulterPairingWindow destroys pair_root
-            pairing = pw.result
+    # --- Phase 1: annotation + (optional) Coulter pairing GUI ---
+    ann_root = tk.Tk()
+    volume_names = {r['name'] for r in records if r['volume_df'] is not None}
+    aw = CompileAnnotationWindow(
+        ann_root, [r['name'] for r in records], volume_names, coulter_cols)
+    ann_root.mainloop()   # blocks until the window destroys ann_root
 
-            if not pairing:
-                print("[warn] Pairing cancelled — writing output without calibration.")
+    if not aw.completed:
+        print("[warn] annotation window closed without Done — "
+              "compiling without annotations or calibration.")
+
+    pairing         = aw.result
+    annotations     = aw.annotations
+    custom_cols     = aw.custom_cols
+    checkbox_cols   = aw.checkbox_cols
+    ordered_samples = aw.ordered_samples
+
+    calibration:  dict = {}
+    cal_plot_data: dict = {}
+
+    # --- Phase 2: per-sample calibration (only with --coulter + assignments) ---
+    if coulter_path is not None and any(pairing.values()):
+        records_by_name = {r['name']: r for r in records}
+        cal_root = tk.Tk()
+        cal_root.withdraw()
+
+        paired_items = [(n, c) for n, c in pairing.items() if c]
+        print(f"\nStarting calibration for {len(paired_items)} sample(s)...")
+        for sample_name, cc_col in paired_items:
+            rec     = records_by_name[sample_name]
+            cc_vols = coulter_df[cc_col].dropna().values
+            print(f"  {sample_name} vs Coulter column '{cc_col}'  "
+                  f"(N={len(cc_vols)})")
+            cw = CalibrationWindow(cal_root, rec, cc_vols)
+            cal_root.wait_window(cw.window)
+            calibration[sample_name] = cw.result
+            if cw.result is not None:
+                print(f"    -> accepted  factor = {cw.result:.4f} fL/AU")
+                cal_plot_data[sample_name] = {
+                    'factor':    cw.result,
+                    'ifxm_vols': cw._ifxm_vols,
+                    'cc_vols':   cw._cc_vols,
+                    'vol_low':   cw.vol_low,
+                    'vol_high':  cw.vol_high,
+                }
             else:
-                # Phase 2: per-sample calibration (sequential Toplevels)
-                records_by_name = {r['name']: r for r in records}
-                cal_root = tk.Tk()
-                cal_root.withdraw()
+                print(f"    -> skipped")
 
-                paired_items = [(n, c) for n, c in pairing.items() if c]
-                print(f"\nStarting calibration for {len(paired_items)} sample(s)...")
-                for sample_name, cc_col in paired_items:
-                    rec     = records_by_name[sample_name]
-                    cc_vols = coulter_df[cc_col].dropna().values
-                    print(f"  {sample_name} vs Coulter column '{cc_col}'  "
-                          f"(N={len(cc_vols)})")
-                    cw = CalibrationWindow(cal_root, rec, cc_vols)
-                    cal_root.wait_window(cw.window)
-                    calibration[sample_name] = cw.result
-                    if cw.result is not None:
-                        print(f"    -> accepted  factor = {cw.result:.4f} fL/AU")
-                        cal_plot_data[sample_name] = {
-                            'factor':    cw.result,
-                            'ifxm_vols': cw._ifxm_vols,
-                            'cc_vols':   cw._cc_vols,
-                            'vol_low':   cw.vol_low,
-                            'vol_high':  cw.vol_high,
-                        }
-                    else:
-                        print(f"    -> skipped")
+        cal_root.destroy()
 
-                cal_root.destroy()
-
-    _write_output(superdir, records, pairing, calibration, cal_plot_data)
+    _write_output(superdir, records, pairing, calibration, cal_plot_data,
+                  annotations, custom_cols, checkbox_cols, ordered_samples)
 
 
 if __name__ == '__main__':

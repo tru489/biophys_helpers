@@ -57,6 +57,18 @@ from gating.common import (MainWindow, ask_data_type_dialog,
                            save_group_histograms, write_stats_csv, write_log)
 
 
+def _is_appledouble(p: Path) -> bool:
+    """
+    True for macOS AppleDouble sidecar files ("._<name>").
+
+    On exFAT/FAT volumes (e.g. external drives), macOS stores resource forks /
+    xattrs in these binary sidecars alongside every real file. They share the
+    real file's suffix (e.g. "._foo.csv"), so they slip past a plain ".csv"
+    filter and blow up pd.read_csv with a UnicodeDecodeError. Skip them.
+    """
+    return p.name.startswith('._')
+
+
 # ---------------------------------------------------------------------------
 # Mode configuration
 # ---------------------------------------------------------------------------
@@ -142,6 +154,7 @@ def _discover_bm(superdir: Path) -> dict:
 
         for f in sorted(run_dir.iterdir()):
             if (f.is_file() and f.suffix == '.csv'
+                    and not _is_appledouble(f)
                     and not f.name.startswith('curation_index')):
                 df = pd.read_csv(f)
                 if 'mass_pg' not in df.columns:
@@ -187,7 +200,8 @@ def _discover_ifxm(superdir: Path) -> dict:
             continue
         csv_found = False
         for f in stage2.iterdir():
-            if f.is_file() and f.name.endswith('_ProcessedVolumes.csv'):
+            if (f.is_file() and not _is_appledouble(f)
+                    and f.name.endswith('_ProcessedVolumes.csv')):
                 csv_found = True
                 df = pd.read_csv(f)
                 if 'volume' not in df.columns:

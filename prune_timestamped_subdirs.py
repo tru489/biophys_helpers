@@ -21,6 +21,22 @@ from pathlib import Path
 _TS_PATTERN = re.compile(r'^(\d{8}[._]\d{6})_(.+)$')
 
 
+def _ignore_already_gone(func, path, exc_info):
+    """
+    onexc handler for shutil.rmtree.
+
+    On exFAT/FAT volumes (e.g. external drives on macOS), the OS stores
+    resource forks / xattrs in AppleDouble sidecar files ("._<name>").
+    Deleting a real entry auto-removes its sidecar, so rmtree can hit a
+    FileNotFoundError trying to unlink a sidecar that already vanished.
+    That's benign — swallow it; re-raise anything else.
+    """
+    exc = exc_info[1] if isinstance(exc_info, tuple) else exc_info
+    if isinstance(exc, FileNotFoundError):
+        return
+    raise exc
+
+
 def main():
     superdir, dry_run = _parse_cli_args()
     _process(superdir, dry_run)
@@ -92,7 +108,7 @@ def _process(superdir: Path, dry_run: bool):
             else:
                 for _, del_path in to_delete:
                     print(f"Deleting: {del_path}")
-                    shutil.rmtree(del_path)
+                    shutil.rmtree(del_path, onexc=_ignore_already_gone)
 
     if dry_run:
         print(f"\n[dry-run] Would keep {total_kept} dirs, delete {total_deleted} dirs "
