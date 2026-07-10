@@ -140,6 +140,11 @@ class AnnotationWindow:
         self._vlines: list = []
         self._last_col = None
 
+        # Undo history: each entry is a list of (sample, col, old_value) tuples
+        # describing the cells a single action changed, so one action (a cell
+        # edit or a bulk Set Cells) is undone atomically.
+        self._undo_stack: list = []
+
         self._row_data: dict = {name: {} for name in self._samples}
 
         root.title(f"annotate_coulter_samples — {coulter_csv.name}")
@@ -216,6 +221,11 @@ class AnnotationWindow:
                   command=self._remove_column).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Set Cells…",
                   command=self._set_cells).pack(side=tk.LEFT, padx=(0, 12))
+
+        self._undo_btn = tk.Button(btn_frame, text="Undo",
+                                   command=self._undo, state=tk.DISABLED)
+        self._undo_btn.pack(side=tk.LEFT, padx=(0, 12))
+
         tk.Button(btn_frame, text="↑",
                   command=self._move_up).pack(side=tk.LEFT, padx=(0, 2))
         tk.Button(btn_frame, text="↓",
@@ -394,8 +404,44 @@ class AnnotationWindow:
             if self._active_editor is widget:
                 self._active_editor = None
 
+        old = self._row_data[item].get(col_name, '')
+        if value != old:
+            self._push_undo([(item, col_name, old)])
         self._row_data[item][col_name] = value
         self._refresh_row(item)
+
+    # ------------------------------------------------------------------
+    # Undo
+    # ------------------------------------------------------------------
+
+    def _push_undo(self, changes: list):
+        """Record a completed action's prior cell values for later undo."""
+        self._undo_stack.append(changes)
+        self._undo_btn.config(state=tk.NORMAL)
+
+    def _clear_undo(self):
+        """Drop undo history (used when columns are added/removed)."""
+        self._undo_stack.clear()
+        self._undo_btn.config(state=tk.DISABLED)
+
+    def _undo(self):
+        """Revert the most recent cell edit or bulk Set Cells action."""
+        if self._active_editor:
+            try:
+                self._active_editor.destroy()
+            except tk.TclError:
+                pass
+            self._active_editor = None
+
+        if not self._undo_stack:
+            return
+        changes = self._undo_stack.pop()
+        for sample, col, old_value in changes:
+            self._row_data[sample][col] = old_value
+            self._refresh_row(sample)
+
+        if not self._undo_stack:
+            self._undo_btn.config(state=tk.DISABLED)
 
     # ------------------------------------------------------------------
     # Button actions
@@ -448,6 +494,7 @@ class AnnotationWindow:
             self._checkbox_cols.add(name)
         for rd in self._row_data.values():
             rd[name] = ''
+        self._clear_undo()
         self._setup_columns()
         self._populate_table()
 
@@ -497,6 +544,7 @@ class AnnotationWindow:
         self._checkbox_cols.discard(name)
         for rd in self._row_data.values():
             rd.pop(name, None)
+        self._clear_undo()
         self._setup_columns()
         self._populate_table()
 
@@ -587,6 +635,11 @@ class AnnotationWindow:
         if col in self._checkbox_cols:
             value = 'yes' if value == 'yes' else ''
 
+        changes = [(item, col, self._row_data[item].get(col, ''))
+                   for item in targets
+                   if self._row_data[item].get(col, '') != value]
+        if changes:
+            self._push_undo(changes)
         for item in targets:
             self._row_data[item][col] = value
             self._refresh_row(item)

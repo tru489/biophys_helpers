@@ -6,7 +6,9 @@
       "Bash(python -m py_compile pair_bm_runs.py)",
       "Bash(python -m py_compile crop_smr_timeseries.py)",
       "Bash(python -c \"import ast, sys; ast.parse\\(open\\('browse_images.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
-      "Bash(cd *)"
+      "Bash(cd *)",
+      "Bash(python -m py_compile compile_experiment.py)",
+      "Bash(python -m py_compile annotate_coulter_samples.py compile_experiment.py)"
     ]
   }
 }

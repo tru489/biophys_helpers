@@ -92,7 +92,7 @@ def _load_samples(compiled_dir: Path) -> list:
                 vals = subset[val_col].values.astype(float)
                 return vals, tidx
 
-            vol_vals,  vol_tidx  = _extract(vol_df, 'volume')
+            vol_vals,  vol_tidx  = _extract(vol_df, 'volume_au')
             mass_vals, mass_tidx = _extract(vol_df, 'matched_mass')
             dens_vals, dens_tidx = _extract(vol_df, 'buoyant_density')
 

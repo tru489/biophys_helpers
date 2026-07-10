@@ -39,10 +39,13 @@ experiment_data.h5 key layout:
                                               annotation columns added in the GUI
     /samples/{safe_name}/mass               — full mass CSV DataFrame
     /samples/{safe_name}/volume             — full ProcessedVolumes DataFrame
-                                              (volume column is in vol_au)
+                                              (source 'volume' column relabelled
+                                              volume_au; in arbitrary units)
     /samples/{safe_name}/volume_calibrated  — same as /volume plus volume_fL
-                                              column (in fL); written only when
-                                              a calibration factor was accepted
+                                              column (in fL) and a constant
+                                              calibration_factor column (fL/AU);
+                                              written only when a calibration
+                                              factor was accepted
     /samples/{safe_name}/pairing            — paired rows (if available)
 
 images.h5 key layout:
@@ -54,6 +57,7 @@ The original sample directory name is preserved in /metadata.sample_name.
 Usage:
     python compile_experiment.py <superdir>
     python compile_experiment.py <superdir> --coulter <coulter_csv>
+    python compile_experiment.py <superdir> --no-images   # skip images.h5
 """
 import argparse
 import re
@@ -83,7 +87,7 @@ warnings.filterwarnings('ignore', message='object name is not a valid Python ide
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_cli_args() -> tuple[Path, Path | None]:
+def parse_cli_args() -> tuple[Path, Path | None, bool]:
     parser = argparse.ArgumentParser(
         description="Compile per-sample experiment data into a single HDF5 file."
     )
@@ -93,6 +97,10 @@ def parse_cli_args() -> tuple[Path, Path | None]:
                         help='Coulter Counter CSV (columns = sample names, '
                              'rows = per-cell volumes in fL). Triggers pairing '
                              'and calibration GUIs.')
+    parser.add_argument('--no-images', action='store_true',
+                        help='Skip writing images.h5 (the per-transit BF image '
+                             'stacks). Compilation is much faster and the output '
+                             'far smaller when images are not needed.')
     args = parser.parse_args()
     p = Path(args.superdir)
     if not p.is_dir():
@@ -102,7 +110,7 @@ def parse_cli_args() -> tuple[Path, Path | None]:
         coulter_path = Path(args.coulter)
         if not coulter_path.is_file():
             raise FileNotFoundError(f"Coulter file not found: {coulter_path}")
-    return p, coulter_path
+    return p, coulter_path, not args.no_images
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +416,11 @@ class CompileAnnotationWindow:
         self._vlines: list = []
         self._last_col = None
 
+        # Undo history: each entry is a list of (sample, col, old_value) tuples
+        # describing the cells a single action changed, so one action (a cell
+        # edit or a bulk Set Cells) is undone atomically.
+        self._undo_stack: list = []
+
         # Per-sample cell values; the Coulter assignment lives here too, under
         # the 'coulter_col' key.
         self._row_data: dict = {name: {} for name in self._samples}
@@ -498,10 +511,25 @@ class CompileAnnotationWindow:
                   command=self._remove_column).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Set Cells…",
                   command=self._set_cells).pack(side=tk.LEFT, padx=(0, 12))
+
+        self._undo_btn = tk.Button(btn_frame, text="Undo",
+                                   command=self._undo, state=tk.DISABLED)
+        self._undo_btn.pack(side=tk.LEFT, padx=(0, 12))
+
         tk.Button(btn_frame, text="↑",
                   command=self._move_up).pack(side=tk.LEFT, padx=(0, 2))
         tk.Button(btn_frame, text="↓",
                   command=self._move_down).pack(side=tk.LEFT, padx=(0, 12))
+
+        # When a Coulter CSV is loaded, let the user hide already-assigned
+        # columns from the per-cell picker so only unassigned ones remain.
+        if self._has_coulter:
+            self._hide_assigned_var = tk.BooleanVar(master=self._root, value=False)
+            tk.Checkbutton(
+                btn_frame, text="Only unassigned Coulter columns",
+                variable=self._hide_assigned_var).pack(side=tk.LEFT, padx=(0, 12))
+        else:
+            self._hide_assigned_var = None
 
         self._done_btn = tk.Button(btn_frame, text="Done", command=self._finish)
         self._done_btn.pack(side=tk.RIGHT)
@@ -646,7 +674,8 @@ class CompileAnnotationWindow:
         x, y, w, h = bbox
 
         current = self._row_data[item].get('coulter_col', '')
-        widget = ttk.Combobox(self._tree, values=self._coulter_cols,
+        widget = ttk.Combobox(self._tree,
+                              values=self._available_coulter_cols(current),
                               state='readonly', width=30)
         widget.set(current)
         widget.bind('<<ComboboxSelected>>',
@@ -663,12 +692,30 @@ class CompileAnnotationWindow:
                 pass
         widget.after_idle(_post)
 
+    def _available_coulter_cols(self, current: str) -> list:
+        """
+        Coulter columns to offer in the picker. With 'only unassigned' checked,
+        drop columns already assigned to another sample; always keep `current`
+        so the row's existing value still shows and can be reselected.
+        """
+        if not self._has_coulter or not self._hide_assigned_var.get():
+            return list(self._coulter_cols)
+        assigned = {
+            self._row_data[s].get('coulter_col', '')
+            for s in self._samples if s in self._volume_names}
+        assigned.discard('')
+        return [c for c in self._coulter_cols
+                if c not in assigned or c == current]
+
     def _commit_coulter(self, item: str, value: str, widget):
         try:
             widget.destroy()
         except tk.TclError:
             pass
         self._active_editor = None
+        old = self._row_data[item].get('coulter_col', '')
+        if value != old:
+            self._push_undo([(item, 'coulter_col', old)])
         self._row_data[item]['coulter_col'] = value
         self._tree.set(item, 'coulter_col', value)
         self._check_done()
@@ -733,8 +780,45 @@ class CompileAnnotationWindow:
             if self._active_editor is widget:
                 self._active_editor = None
 
+        old = self._row_data[item].get(col_name, '')
+        if value != old:
+            self._push_undo([(item, col_name, old)])
         self._row_data[item][col_name] = value
         self._refresh_row(item)
+
+    # ------------------------------------------------------------------
+    # Undo
+    # ------------------------------------------------------------------
+
+    def _push_undo(self, changes: list):
+        """Record a completed action's prior cell values for later undo."""
+        self._undo_stack.append(changes)
+        self._undo_btn.config(state=tk.NORMAL)
+
+    def _clear_undo(self):
+        """Drop undo history (used when columns are added/removed)."""
+        self._undo_stack.clear()
+        self._undo_btn.config(state=tk.DISABLED)
+
+    def _undo(self):
+        """Revert the most recent cell edit or bulk Set Cells action."""
+        if self._active_editor:
+            try:
+                self._active_editor.destroy()
+            except tk.TclError:
+                pass
+            self._active_editor = None
+
+        if not self._undo_stack:
+            return
+        changes = self._undo_stack.pop()
+        for sample, col, old_value in changes:
+            self._row_data[sample][col] = old_value
+            self._refresh_row(sample)
+
+        if not self._undo_stack:
+            self._undo_btn.config(state=tk.DISABLED)
+        self._check_done()
 
     # ------------------------------------------------------------------
     # Button actions
@@ -787,6 +871,7 @@ class CompileAnnotationWindow:
             self._checkbox_cols.add(name)
         for rd in self._row_data.values():
             rd[name] = ''
+        self._clear_undo()
         self._setup_columns()
         self._populate_table()
 
@@ -836,6 +921,7 @@ class CompileAnnotationWindow:
         self._checkbox_cols.discard(name)
         for rd in self._row_data.values():
             rd.pop(name, None)
+        self._clear_undo()
         self._setup_columns()
         self._populate_table()
 
@@ -926,6 +1012,11 @@ class CompileAnnotationWindow:
         if col in self._checkbox_cols:
             value = 'yes' if value == 'yes' else ''
 
+        changes = [(item, col, self._row_data[item].get(col, ''))
+                   for item in targets
+                   if self._row_data[item].get(col, '') != value]
+        if changes:
+            self._push_undo(changes)
         for item in targets:
             self._row_data[item][col] = value
             self._refresh_row(item)
@@ -1330,7 +1421,8 @@ def _write_output(superdir: Path, sample_records: list,
                   annotations: dict | None = None,
                   custom_cols: list | None = None,
                   checkbox_cols: set | None = None,
-                  ordered_samples: list | None = None) -> Path:
+                  ordered_samples: list | None = None,
+                  save_images: bool = True) -> Path:
     pairing       = pairing       or {}
     calibration   = calibration   or {}
     cal_plot_data = cal_plot_data or {}
@@ -1394,13 +1486,15 @@ def _write_output(superdir: Path, sample_records: list,
                           format='table', data_columns=True)
 
             if rec['volume_df'] is not None:
-                store.put(f'{key_base}/volume', rec['volume_df'],
+                vol_df = rec['volume_df'].rename(columns={'volume': 'volume_au'})
+                store.put(f'{key_base}/volume', vol_df,
                           format='table', data_columns=True)
 
                 factor = calibration.get(name)
                 if factor is not None:
-                    cal_df = rec['volume_df'].copy()
-                    cal_df['volume_fL'] = cal_df['volume'] * factor
+                    cal_df = vol_df.copy()
+                    cal_df['volume_fL'] = cal_df['volume_au'] * factor
+                    cal_df['calibration_factor'] = factor
                     store.put(f'{key_base}/volume_calibrated', cal_df,
                               format='table', data_columns=True)
                     print(f"  [{name}] volume_calibrated written "
@@ -1414,7 +1508,11 @@ def _write_output(superdir: Path, sample_records: list,
 
     image_candidates = [r for r in sample_records
                         if r['hdf5_src_path'] and r['hdf5_index_path']]
-    if image_candidates:
+    if not save_images:
+        if image_candidates:
+            print(f"Skipping image stacks for {len(image_candidates)} sample(s) "
+                  f"(--no-images)")
+    elif image_candidates:
         print(f"Writing image stacks for {len(image_candidates)} sample(s) "
               f"-> {images_h5_path}")
         with h5py.File(str(images_h5_path), 'w') as img_store:
@@ -1436,7 +1534,7 @@ def _write_output(superdir: Path, sample_records: list,
 # ---------------------------------------------------------------------------
 
 def main():
-    superdir, coulter_path = parse_cli_args()
+    superdir, coulter_path, save_images = parse_cli_args()
     print(f"Compiling {superdir.name}...")
     records = compile_experiment(superdir)
     if not records:
@@ -1502,7 +1600,8 @@ def main():
         cal_root.destroy()
 
     _write_output(superdir, records, pairing, calibration, cal_plot_data,
-                  annotations, custom_cols, checkbox_cols, ordered_samples)
+                  annotations, custom_cols, checkbox_cols, ordered_samples,
+                  save_images)
 
 
 if __name__ == '__main__':
