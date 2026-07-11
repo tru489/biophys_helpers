@@ -450,10 +450,15 @@ place, and bulk-fill with **Set Cells…**.
 **Output** (`<csv_dir>/YYYYMMDD_HHMMSS_coulter_sample_annotation/`)
 
 ```
-metadata.csv   one row per sample; sample_name + all annotation columns
-data.h5        /metadata          DataFrame (sample_name, h5_key, + annotations)
-               /data/{h5_key}      per-sample single-cell volume DataFrame
+metadata.csv       one row per sample; sample_name + all annotation columns
+<input_csv_name>   a copy of the input single-cell Coulter CSV, columns
+                   reordered to match the metadata row order
 ```
+
+The `sample_name` column of `metadata.csv` holds the exact column headers of the
+copied CSV, so the two files cross-reference by name (and, after reordering, by
+position). Both outputs are plain CSVs, so annotation mistakes can be fixed by
+editing `metadata.csv` directly.
 
 **Usage**
 
@@ -495,11 +500,19 @@ output. Most-recent is used if multiple of a type exist.
 **Output** (`<superdir>/YYYYMMDD_HHMMSS_compiled/`)
 
 ```
-experiment_data.h5   (pandas HDFStore)
-  /metadata                       one row per sample (summary + gate values)
-  /samples/{safe_name}/mass       full mass CSV DataFrame
-  /samples/{safe_name}/volume     full ProcessedVolumes DataFrame
-  /samples/{safe_name}/pairing    paired rows (if available)
+experiment_data.xlsx  (Excel workbook — shareable, no HDF5 tooling needed)
+  metadata sheet         one row per sample (summary + gate values); the
+                         sheet_name column names each sample's worksheet
+  <one sheet per sample> three side-by-side blocks, one blank spacer column
+                         between them, single header row, columns prefixed so
+                         they split back apart in code (df.filter(like='vol_')):
+                           VOLUME (vol_)   every FXM cell: volume_au, volume_fL
+                           MASS   (mass_)  every SMR cell: mass_pg
+                           PAIRED (pair_)  matched cells: mass_pg, volume_au,
+                                           volume_fL, buoyant_density
+                         buoyant_density is RELATIVE (add the experiment
+                         baseline for absolute g/mL)
+  README sheet           units, block meaning, and a pandas read recipe
 
 images.h5            (h5py)
   /{safe_name}/{transit_idx:05d}/bf   (n_frames, H, W) uint8

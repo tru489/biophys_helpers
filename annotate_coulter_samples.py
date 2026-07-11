@@ -18,22 +18,22 @@ Workflow:
     4. Click "Done" to write output.
 
 Output (written to <csv_dir>/YYYYMMDD_HHMMSS_coulter_sample_annotation/):
-    metadata.csv   one row per sample; sample_name + all annotation columns.
-    data.h5        pandas HDFStore, standalone with all relevant information:
-                   /metadata           DataFrame (sample_name, h5_key, + annotations)
-                   /data/{h5_key}      per-sample single-cell volume DataFrame
+    metadata.csv        one row per sample; sample_name + all annotation columns.
+    <input_csv_name>    a copy of the input single-cell Coulter CSV, columns
+                        reordered to match the metadata row order. The
+                        sample_name column of metadata.csv holds the exact column
+                        headers of this file, so the two cross-reference by name
+                        (and, after reordering, row i ↔ column i).
+
+Both outputs are plain CSVs, so annotation mistakes can be fixed by editing
+metadata.csv directly.
 
 Usage:
     python annotate_coulter_samples.py <coulter_csv>
 """
 import argparse
-import re
-import sys
 from datetime import datetime
 from pathlib import Path
-
-import warnings
-warnings.filterwarnings('ignore', message='object name is not a valid Python identifier')
 
 import pandas as pd
 import tkinter as tk
@@ -62,30 +62,6 @@ def parse_cli_args() -> Path:
     return coulter_csv
 
 
-def _check_dependencies():
-    """
-    Verify runtime dependencies that otherwise fail silently or late, before
-    the GUI opens. PyTables is the key one: pandas needs it to write data.h5,
-    but it is an *optional* pandas backend, so a missing install only surfaces
-    as an ImportError at write time — long after the annotation work is done.
-    (Note: h5py is NOT a substitute for pytables here.)
-    """
-    missing = []
-    try:
-        import tables  # noqa: F401
-    except ImportError:
-        missing.append(
-            "pytables (Python module 'tables') — required to write data.h5.\n"
-            "    Install with:  conda install -n biophys_helpers pytables\n"
-            "             (or:  pip install tables)"
-        )
-
-    if missing:
-        print("ERROR: missing required dependencies:\n  - "
-              + "\n  - ".join(missing), file=sys.stderr)
-        sys.exit(1)
-
-
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -96,22 +72,6 @@ def _load_coulter(path: Path) -> pd.DataFrame:
     single-cell volume measurement. Returns the full DataFrame.
     """
     return pd.read_csv(path)
-
-
-def _safe_key(name: str, used: set) -> str:
-    """
-    Convert an arbitrary sample name into a unique, HDF5-safe path component.
-    Non-alphanumeric characters become underscores; collisions get a numeric
-    suffix. `used` is mutated to record the returned key.
-    """
-    base = re.sub(r'[^0-9A-Za-z]+', '_', name).strip('_') or 'sample'
-    key = base
-    i = 1
-    while key in used:
-        i += 1
-        key = f'{base}_{i}'
-    used.add(key)
-    return key
 
 
 # ---------------------------------------------------------------------------
@@ -682,13 +642,10 @@ def _write_output(coulter_csv: Path, coulter_df: pd.DataFrame, row_data: dict,
     out_dir = coulter_csv.parent / f'{timestamp}_coulter_sample_annotation'
     out_dir.mkdir()
 
-    used_keys: set = set()
-    sample_keys = {s: _safe_key(s, used_keys) for s in ordered_samples}
-
     meta_rows = []
     for sample in ordered_samples:
         rd = row_data[sample]
-        row = {'sample_name': sample, 'h5_key': sample_keys[sample]}
+        row = {'sample_name': sample}
         for col in custom_cols:
             val = rd.get(col, '')
             if col in checkbox_cols:
@@ -702,24 +659,17 @@ def _write_output(coulter_csv: Path, coulter_df: pd.DataFrame, row_data: dict,
     meta_df.to_csv(meta_csv, index=False)
     print(f"Written: {meta_csv}")
 
-    h5_path = out_dir / 'data.h5'
-    try:
-        with pd.HDFStore(str(h5_path), mode='w') as store:
-            store.put('/metadata', meta_df, format='table', data_columns=True)
-
-            for sample in ordered_samples:
-                key = sample_keys[sample]
-                vols = coulter_df[[sample]].dropna().reset_index(drop=True)
-                vols.columns = [key]   # original sample name may be HDF5-unsafe
-                store.put(f'/data/{key}', vols, format='table',
-                          data_columns=True)
-                print(f"Written HDF5 key: /data/{key}  "
-                      f"({len(vols)} rows, sample='{sample}')")
-
-        print(f"Written: {h5_path}")
-    except ImportError:
-        print("[warn] 'tables' package not installed — data.h5 not written. "
-              "Install with: pip install tables")
+    # Copy of the input single-cell CSV, columns reordered to match the metadata
+    # row order. metadata.csv's sample_name column holds these exact headers, so
+    # the two files cross-reference by name (and, after reordering, position).
+    data_df = coulter_df[ordered_samples]
+    data_name = coulter_csv.name
+    if data_name == meta_csv.name:   # avoid clobbering metadata.csv
+        data_name = f'single_cell_{data_name}'
+    data_csv = out_dir / data_name
+    data_df.to_csv(data_csv, index=False)
+    print(f"Written: {data_csv}  "
+          f"({data_df.shape[1]} columns, {data_df.shape[0]} rows)")
 
     print(f"\n[done] Output: {out_dir}")
     return out_dir
@@ -731,7 +681,6 @@ def _write_output(coulter_csv: Path, coulter_df: pd.DataFrame, row_data: dict,
 
 def main():
     coulter_csv = parse_cli_args()
-    _check_dependencies()
 
     coulter_df = _load_coulter(coulter_csv)
     print(f"Loaded Coulter CSV: {coulter_csv.name}  "

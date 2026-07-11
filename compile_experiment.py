@@ -28,31 +28,33 @@ Optional Coulter calibration (--coulter <csv>):
 
 Output:
     <superdir>/YYYYMMDD_HHMMSS_compiled/
-        experiment_data.h5   — DataFrames (pandas HDFStore)
+        experiment_data.xlsx — shareable workbook (one sheet per sample)
         images.h5            — per-transit BF image stacks (h5py)
 
-experiment_data.h5 key layout:
-    /metadata                               — one row per sample; includes
-                                              coulter_column and
-                                              calibration_factor when --coulter
-                                              is used, plus any custom
-                                              annotation columns added in the GUI
-    /samples/{safe_name}/mass               — full mass CSV DataFrame
-    /samples/{safe_name}/volume             — full ProcessedVolumes DataFrame
-                                              (source 'volume' column relabelled
-                                              volume_au; in arbitrary units)
-    /samples/{safe_name}/volume_calibrated  — same as /volume plus volume_fL
-                                              column (in fL) and a constant
-                                              calibration_factor column (fL/AU);
-                                              written only when a calibration
-                                              factor was accepted
-    /samples/{safe_name}/pairing            — paired rows (if available)
+experiment_data.xlsx layout:
+    metadata sheet   — one row per sample; sample_name, sheet_name (the sample's
+                       worksheet name), hdf5_key, has_* flags, gate bounds,
+                       coulter_column and calibration_factor (when --coulter is
+                       used), plus any custom annotation columns from the GUI.
+    <one sheet per sample> — three independent, side-by-side blocks separated by
+                       a single blank spacer column, with a single header row.
+                       Columns are prefixed so the blocks can be split again in
+                       code (df.filter(like='vol_') etc.):
+                         VOLUME (vol_)  every FXM cell: transit_index, volume_au,
+                                        volume_fL (when calibrated)
+                         MASS   (mass_) every SMR cell: mass_pg (+ other mass cols)
+                         PAIRED (pair_) matched cells: transit_index, mass_pg,
+                                        volume_au, volume_fL, buoyant_density
+                       Blocks are independent distributions (row N of one is
+                       unrelated to row N of another). buoyant_density is RELATIVE
+                       (add the experiment baseline for absolute g/mL).
+    README sheet     — units, block meaning, and a pandas read recipe.
 
 images.h5 key layout:
     /{safe_name}/{transit_idx:05d}/bf  — (n_frames, H, W) uint8
 
 {safe_name} replaces - and . with _ so HDF5 key rules are satisfied.
-The original sample directory name is preserved in /metadata.sample_name.
+The original sample directory name is preserved in the metadata sheet.
 
 Usage:
     python compile_experiment.py <superdir>
@@ -73,14 +75,8 @@ import numpy as np
 import pandas as pd
 import tkinter as tk
 from tkinter import messagebox, ttk
-import warnings
 import h5py
 import yaml
-
-# Sample dirs that start with digits (e.g. "0h_pt1") trigger a benign
-# NaturalNameWarning from PyTables — suppress it; we always use
-# store[key] notation, not attribute-style natural naming.
-warnings.filterwarnings('ignore', message='object name is not a valid Python identifier')
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +116,32 @@ def parse_cli_args() -> tuple[Path, Path | None, bool]:
 def _safe_key(name: str) -> str:
     """Replace characters invalid in HDF5 key names (- and .) with _."""
     return re.sub(r'[-.]', '_', name)
+
+
+def _safe_sheet_name(name: str, taken: set) -> str:
+    """
+    Return an Excel-legal worksheet name for `name`, unique against `taken`.
+
+    Excel sheet names must be <=31 chars and may not contain : \\ / ? * [ ].
+    Invalid characters are replaced with '_' and the name is truncated to 31
+    chars; collisions are disambiguated with a '~N' suffix. `taken` holds the
+    lowercased names already used (Excel treats sheet names case-insensitively);
+    the chosen name's lowercase form is added to it before returning.
+    """
+    cleaned = re.sub(r'[:\\/?*\[\]]', '_', name).strip() or 'sample'
+    candidate = cleaned[:31]
+    if candidate.lower() not in taken:
+        taken.add(candidate.lower())
+        return candidate
+    # Disambiguate: append ~1, ~2, ... keeping the total <= 31 chars.
+    n = 1
+    while True:
+        suffix = f'~{n}'
+        candidate = cleaned[:31 - len(suffix)] + suffix
+        if candidate.lower() not in taken:
+            taken.add(candidate.lower())
+            return candidate
+        n += 1
 
 
 # ---------------------------------------------------------------------------
@@ -1411,6 +1433,94 @@ def _write_calibration_plots(out_dir: Path, cal_plot_data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-sample workbook blocks
+# ---------------------------------------------------------------------------
+#
+# Each sample sheet holds up to three independent, side-by-side blocks. Their
+# columns are prefixed so the blocks can be separated again in analysis code
+# with df.filter(like='vol_') etc.:
+#     VOLUME (vol_)   — every FXM cell:   transit_index, volume_au, volume_fL
+#     MASS   (mass_)  — every SMR cell:   mass_pg (+ any other mass columns)
+#     PAIRED (pair_)  — matched cells:    transit_index, mass_pg, volume_au,
+#                                          volume_fL, buoyant_density
+# The blocks are independent distributions (row N of one is unrelated to row N
+# of another), so they are never joined — only placed next to each other.
+
+def _build_volume_block(volume_df: pd.DataFrame, factor: float | None) -> pd.DataFrame:
+    """VOLUME block (vol_-prefixed) from a ProcessedVolumes DataFrame."""
+    df = volume_df.rename(columns={'volume': 'volume_au'})
+    if factor is not None and 'volume_au' in df.columns and 'volume_fL' not in df.columns:
+        df = df.copy()
+        df['volume_fL'] = df['volume_au'] * factor
+    order = ['transit_index', 'volume_au', 'volume_fL']
+    keep = [c for c in order if c in df.columns]
+    out = df[keep] if keep else df
+    out = out.reset_index(drop=True)
+    out.columns = [f'vol_{c}' for c in out.columns]
+    return out
+
+
+def _build_mass_block(mass_df: pd.DataFrame) -> pd.DataFrame:
+    """MASS block (mass_-prefixed) — the full SMR mass distribution."""
+    out = mass_df.reset_index(drop=True).copy()
+    out.columns = [f'mass_{c}' for c in out.columns]
+    return out
+
+
+def _build_paired_block(pairing_df: pd.DataFrame, factor: float | None) -> pd.DataFrame:
+    """PAIRED block (pair_-prefixed) — matched cells with mass+volume+density."""
+    df = pairing_df.rename(columns={'volume': 'volume_au', 'matched_mass': 'mass_pg'})
+    if factor is not None and 'volume_au' in df.columns and 'volume_fL' not in df.columns:
+        df = df.copy()
+        df['volume_fL'] = df['volume_au'] * factor
+    order = ['transit_index', 'mass_pg', 'volume_au', 'volume_fL', 'buoyant_density']
+    keep = [c for c in order if c in df.columns]
+    out = df[keep] if keep else df
+    out = out.reset_index(drop=True)
+    out.columns = [f'pair_{c}' for c in out.columns]
+    return out
+
+
+def _build_readme_df(timestamp: str) -> pd.DataFrame:
+    """Two-column (Field, Value) sheet documenting units and the read recipe."""
+    rows = [
+        ('Compiled',        timestamp),
+        ('Layout',          'One worksheet per sample, plus this README. Each '
+                            'sample sheet holds three independent, side-by-side '
+                            'blocks separated by one blank column.'),
+        ('VOLUME block',    'Columns vol_* — every FXM cell: vol_transit_index, '
+                            'vol_volume_au, vol_volume_fL (when calibrated).'),
+        ('MASS block',      'Columns mass_* — every SMR cell: mass_mass_pg '
+                            '(+ any other columns from the mass CSV).'),
+        ('PAIRED block',    'Columns pair_* — cells matched between SMR and FXM: '
+                            'pair_mass_pg, pair_volume_au, pair_volume_fL, '
+                            'pair_buoyant_density on one row.'),
+        ('Blocks are independent',
+                            'Row N of one block is unrelated to row N of another; '
+                            'they are separate distributions, not aligned.'),
+        ('mass_pg',         'Buoyant mass in picograms (pg).'),
+        ('volume_au',       'Cell volume in arbitrary FXM units (AU).'),
+        ('volume_fL',       'Calibrated volume in femtolitres (fL); present only '
+                            'when a Coulter calibration factor was accepted.'),
+        ('buoyant_density', 'RELATIVE buoyant density (g/mL). Absolute density = '
+                            'buoyant_density + experiment-specific baseline_density '
+                            '(NOT stored here).'),
+        ('metadata sheet',  'One row per sample; the sheet_name column gives each '
+                            'sample\'s worksheet name for programmatic lookup.'),
+        ('Read in Python',  'meta = pd.read_excel(f, sheet_name="metadata")'),
+        ('',                'for _, r in meta.iterrows():'),
+        ('',                '    s = pd.read_excel(f, sheet_name=r["sheet_name"])'),
+        ('',                '    s = s.dropna(axis=1, how="all")  # drop spacers'),
+        ('',                '    vol  = s.filter(regex="^vol_").dropna(how="all")'),
+        ('',                '    mass = s.filter(regex="^mass_").dropna(how="all")'),
+        ('',                '    pair = s.filter(regex="^pair_").dropna(how="all")'),
+        ('Note',            'Use regex="^mass_" (anchored), not like="mass_", '
+                            'since "mass_" also occurs inside "pair_mass_pg".'),
+    ]
+    return pd.DataFrame(rows, columns=['Field', 'Value'])
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -1439,8 +1549,14 @@ def _write_output(superdir: Path, sample_records: list,
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = superdir / f'{timestamp}_compiled'
     out_dir.mkdir()
-    h5_path        = out_dir / 'experiment_data.h5'
+    xlsx_path      = out_dir / 'experiment_data.xlsx'
     images_h5_path = out_dir / 'images.h5'
+
+    # Assign each sample an Excel-legal, unique worksheet name. 'metadata' and
+    # 'readme' are reserved so a sample can never collide with them.
+    taken_sheets = {'metadata', 'readme'}
+    sheet_names = {rec['name']: _safe_sheet_name(rec['name'], taken_sheets)
+                   for rec in sample_records}
 
     meta_rows = []
     for rec in sample_records:
@@ -1449,6 +1565,7 @@ def _write_output(superdir: Path, sample_records: list,
         ifxm = rec['ifxm_gate']
         entry = {
             'sample_name':       name,
+            'sheet_name':        sheet_names[name],
             'hdf5_key':          _safe_key(name),
             'has_mass':          rec['mass_df'] is not None,
             'has_volume':        rec['volume_df'] is not None,
@@ -1474,37 +1591,52 @@ def _write_output(superdir: Path, sample_records: list,
 
     meta_df = pd.DataFrame(meta_rows)
 
-    with pd.HDFStore(str(h5_path), mode='w') as store:
-        store.put('/metadata', meta_df, format='table', data_columns=True)
+    _EXCEL_MAX_ROWS = 1_048_576   # incl. the header row
+
+    with pd.ExcelWriter(str(xlsx_path), engine='openpyxl') as xw:
+        meta_df.to_excel(xw, sheet_name='metadata', index=False)
 
         for rec in sample_records:
-            name     = rec['name']
-            key_base = f'/samples/{_safe_key(name)}'
+            name   = rec['name']
+            sheet  = sheet_names[name]
+            factor = calibration.get(name)
 
-            if rec['mass_df'] is not None:
-                store.put(f'{key_base}/mass', rec['mass_df'],
-                          format='table', data_columns=True)
-
+            # Build the blocks this sample has, in VOLUME | MASS | PAIRED order.
+            blocks = []
             if rec['volume_df'] is not None:
-                vol_df = rec['volume_df'].rename(columns={'volume': 'volume_au'})
-                store.put(f'{key_base}/volume', vol_df,
-                          format='table', data_columns=True)
-
-                factor = calibration.get(name)
-                if factor is not None:
-                    cal_df = vol_df.copy()
-                    cal_df['volume_fL'] = cal_df['volume_au'] * factor
-                    cal_df['calibration_factor'] = factor
-                    store.put(f'{key_base}/volume_calibrated', cal_df,
-                              format='table', data_columns=True)
-                    print(f"  [{name}] volume_calibrated written "
-                          f"(factor = {factor:.4f} fL/AU)")
-
+                blocks.append(_build_volume_block(rec['volume_df'], factor))
+            if rec['mass_df'] is not None:
+                blocks.append(_build_mass_block(rec['mass_df']))
             if rec['pairing_df'] is not None:
-                store.put(f'{key_base}/pairing', rec['pairing_df'],
-                          format='table', data_columns=True)
+                blocks.append(_build_paired_block(rec['pairing_df'], factor))
 
-    print(f"\nCompiled {len(sample_records)} sample(s) -> {h5_path}")
+            if factor is not None and rec['volume_df'] is not None:
+                print(f"  [{name}] volume_fL written "
+                      f"(factor = {factor:.4f} fL/AU)")
+
+            if not blocks:
+                # Sample with no tabular data still gets an (empty) sheet.
+                pd.DataFrame().to_excel(xw, sheet_name=sheet, index=False)
+                continue
+
+            # A block longer than Excel allows is dumped to a sibling CSV and
+            # truncated in the sheet so the workbook still opens.
+            startcol = 0
+            for blk in blocks:
+                if len(blk) + 1 > _EXCEL_MAX_ROWS:
+                    prefix = blk.columns[0].split('_', 1)[0]
+                    csv_path = out_dir / f'{sheet}_{prefix}_overflow.csv'
+                    blk.to_csv(csv_path, index=False)
+                    print(f"  [warn] {name}: {prefix} block has {len(blk)} rows "
+                          f"(> Excel limit); full data written to {csv_path.name}")
+                    blk = blk.iloc[:_EXCEL_MAX_ROWS - 1]
+                blk.to_excel(xw, sheet_name=sheet, index=False, startcol=startcol)
+                startcol += len(blk.columns) + 1   # +1 blank spacer column
+
+        readme_df = _build_readme_df(timestamp)
+        readme_df.to_excel(xw, sheet_name='README', index=False)
+
+    print(f"\nCompiled {len(sample_records)} sample(s) -> {xlsx_path}")
 
     image_candidates = [r for r in sample_records
                         if r['hdf5_src_path'] and r['hdf5_index_path']]
