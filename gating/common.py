@@ -29,6 +29,28 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
+# Histogram binning
+# ---------------------------------------------------------------------------
+
+def _view_bins(mode_cfg: dict, all_vals: np.ndarray, view: tuple = None):
+    """
+    Bin edges for a histogram drawn over `view`.
+
+    mode_cfg['bins'] derives edges from an array's min/max, so handing it the
+    view bounds spreads the mode's bin count across just that range — a zoomed
+    view is resolved by the same number of bars as the full one. Shared by the
+    GUI and the saved PNGs so the two always bin alike.
+
+    Args:
+        mode_cfg: entry from a _MODE dict
+        all_vals: concatenated values across the group
+        view:     (lower, upper) view bounds; None bins over the full range.
+    """
+    src = np.array(view, dtype=float) if view is not None else all_vals
+    return mode_cfg['bins'](src)
+
+
+# ---------------------------------------------------------------------------
 # CutoffWindow
 # ---------------------------------------------------------------------------
 
@@ -48,7 +70,9 @@ class CutoffWindow:
         mode_cfg:     entry from a _MODE dict, e.g. _MODE['bm']
 
     Result:
-        self.result  (lower, upper) tuple, or None if closed without accepting.
+        self.result  (lower, upper, view) tuple, or None if closed without
+                     accepting. view is the (min, max) x-axis range the user
+                     gated in, or None if they used the default full view.
     """
 
     def __init__(self, parent: tk.Tk, selected_cols: list,
@@ -57,22 +81,45 @@ class CutoffWindow:
         self._lower = None
         self._upper = None
         self._state = 0         # 0=awaiting lower, 1=awaiting upper, 2=both set
-        self._vlines = []
-        self._patch = None
         self._cfg = mode_cfg
+        self._cols = selected_cols
+        self._data = data
+        self._full_xlim = None  # full data x-range, set in _draw_histograms
+        self._view = None       # current x-axis view; None = default full view
 
         self._top = tk.Toplevel(parent)
         self._top.title("Set cutoffs")
         self._top.grab_set()
 
         self._fig, self._ax = plt.subplots(figsize=(14, 5))
-        self._draw_histograms(selected_cols, data)
+        self._draw_histograms()
 
         canvas = FigureCanvasTkAgg(self._fig, master=self._top)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._canvas = canvas
         self._cid = canvas.mpl_connect('button_press_event', self._on_click)
+
+        # X-axis view controls: focus on a size population. Applying a view
+        # rebins across the visible range, so bar resolution follows the zoom.
+        view_frame = tk.Frame(self._top)
+        view_frame.pack(fill=tk.X, padx=10, pady=(6, 0))
+        tk.Label(view_frame, text="X-axis view:").pack(side=tk.LEFT)
+        tk.Label(view_frame, text="min").pack(side=tk.LEFT, padx=(8, 2))
+        self._xmin_var = tk.StringVar()
+        tk.Entry(view_frame, textvariable=self._xmin_var,
+                 width=10).pack(side=tk.LEFT)
+        tk.Label(view_frame, text="max").pack(side=tk.LEFT, padx=(8, 2))
+        self._xmax_var = tk.StringVar()
+        tk.Entry(view_frame, textvariable=self._xmax_var,
+                 width=10).pack(side=tk.LEFT)
+        tk.Button(view_frame, text="Apply",
+                  command=self._apply_xlim).pack(side=tk.LEFT, padx=(8, 4))
+        tk.Button(view_frame, text="Reset view",
+                  command=self._reset_xlim).pack(side=tk.LEFT)
+        if self._full_xlim:
+            self._xmin_var.set(f'{self._full_xlim[0]:.4g}')
+            self._xmax_var.set(f'{self._full_xlim[1]:.4g}')
 
         info_frame = tk.Frame(self._top)
         info_frame.pack(fill=tk.X, padx=10, pady=(4, 0))
@@ -96,29 +143,95 @@ class CutoffWindow:
 
         parent.wait_window(self._top)
 
-    def _draw_histograms(self, selected_cols: list, data: dict):
+    def _draw_histograms(self, xlim: tuple = None):
+        """
+        Draw the overlaid histograms, binned across the visible x-range.
+
+        Bins are laid out over xlim using the mode's bin rule, so a zoomed view
+        is resolved by the same number of bars as the full view rather than a
+        handful of wide ones. Any cutoffs already placed are redrawn afterwards,
+        since this clears the axes.
+
+        Args:
+            xlim: (lower, upper) view bounds. None draws the default full view.
+        """
         cfg = self._cfg
         ax = self._ax
         ax.clear()
 
-        arrays = [data[col][~np.isnan(data[col])] for col in selected_cols]
+        arrays = [self._data[col][~np.isnan(self._data[col])]
+                  for col in self._cols]
         arrays = [a for a in arrays if len(a) > 0]
         if not arrays:
             return
 
         all_vals = np.concatenate(arrays)
-        shared_bins = cfg['bins'](all_vals)
+        self._full_xlim = (float(all_vals.min()), float(all_vals.max()))
+        shared_bins = _view_bins(cfg, all_vals, xlim)
 
-        for col, vals in zip(selected_cols, arrays):
+        for col, vals in zip(self._cols, arrays):
             ax.hist(vals, bins=shared_bins, alpha=0.5, edgecolor='black',
                     linewidth=0.3, label=col)
         ax.set_xscale(cfg['scale'])
-        if cfg['xlim']:
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+        elif cfg['xlim']:
             ax.set_xlim(*cfg['xlim'])
         ax.set_xlabel(cfg['xlabel'])
         ax.set_ylabel('count')
         ax.legend(fontsize=7, loc='upper right')
         self._fig.tight_layout()
+
+        self._draw_cutoffs()
+
+    def _draw_cutoffs(self):
+        """Draw the cutoff lines, labels and accepted span from the current bounds."""
+        ax = self._ax
+        y_top = ax.get_ylim()[1]
+        if self._lower is not None:
+            ax.axvline(self._lower, color='red', linestyle='--', linewidth=1.2)
+            ax.text(self._lower, y_top, f'{self._lower:.3g}',
+                    color='red', fontsize=8, va='top', ha='right')
+        if self._upper is not None:
+            ax.axvline(self._upper, color='steelblue', linestyle='--',
+                       linewidth=1.2)
+            ax.text(self._upper, y_top, f'{self._upper:.3g}',
+                    color='steelblue', fontsize=8, va='top', ha='left')
+        if self._lower is not None and self._upper is not None:
+            ax.axvspan(self._lower, self._upper, alpha=0.12, color='green')
+
+    def _current_xlim(self) -> tuple:
+        """Parse the view entry boxes; returns None and sets status on bad input."""
+        try:
+            lo = float(self._xmin_var.get())
+            hi = float(self._xmax_var.get())
+        except ValueError:
+            self._status_var.set("X-axis view: min and max must be numbers.")
+            return None
+        if hi <= lo:
+            self._status_var.set("X-axis view: max must be greater than min.")
+            return None
+        return lo, hi
+
+    def _apply_xlim(self):
+        """Rebin and redraw across the x-range typed in the entry boxes."""
+        xlim = self._current_xlim()
+        if xlim is None:
+            return
+        self._view = xlim
+        self._draw_histograms(xlim=xlim)
+        self._canvas.draw()
+
+    def _reset_xlim(self):
+        """Restore the default full-range view."""
+        if self._full_xlim is None:
+            return
+        lo, hi = self._full_xlim
+        self._xmin_var.set(f'{lo:.4g}')
+        self._xmax_var.set(f'{hi:.4g}')
+        self._view = None
+        self._draw_histograms()
+        self._canvas.draw()
 
     def _on_click(self, event):
         if event.inaxes is None or event.xdata is None:
@@ -127,10 +240,6 @@ class CutoffWindow:
 
         if self._state == 0:
             self._lower = x
-            line = self._ax.axvline(x, color='red', linestyle='--', linewidth=1.2)
-            self._ax.text(x, self._ax.get_ylim()[1], f'{x:.3g}',
-                          color='red', fontsize=8, va='top', ha='right')
-            self._vlines.append(line)
             self._state = 1
             self._status_var.set(f"Lower: {x:.4g}  —  Click to set upper cutoff.")
 
@@ -139,35 +248,27 @@ class CutoffWindow:
                 self._status_var.set("Upper must be greater than lower. Click again.")
                 return
             self._upper = x
-            line = self._ax.axvline(x, color='steelblue', linestyle='--', linewidth=1.2)
-            self._ax.text(x, self._ax.get_ylim()[1], f'{x:.3g}',
-                          color='steelblue', fontsize=8, va='top', ha='left')
-            self._vlines.append(line)
-            self._patch = self._ax.axvspan(
-                self._lower, self._upper, alpha=0.12, color='green')
             self._state = 2
             self._status_var.set(
                 f"Lower: {self._lower:.4g}   Upper: {self._upper:.4g}")
             self._accept_btn.config(state=tk.NORMAL)
+        else:
+            return
 
+        self._draw_cutoffs()
         self._canvas.draw()
 
     def _reset(self):
-        for line in self._vlines:
-            line.remove()
-        self._vlines.clear()
-        if self._patch is not None:
-            self._patch.remove()
-            self._patch = None
         self._lower = None
         self._upper = None
         self._state = 0
         self._accept_btn.config(state=tk.DISABLED)
         self._status_var.set("Click to set lower cutoff.")
+        self._draw_histograms(xlim=self._view)   # keep the current view
         self._canvas.draw()
 
     def _accept(self):
-        self.result = (self._lower, self._upper)
+        self.result = (self._lower, self._upper, self._view)
         plt.close(self._fig)
         self._top.destroy()
 
@@ -276,11 +377,11 @@ class MainWindow:
             list(self._groups),
             list(self._remaining),
         ))
-        lower, upper = win.result
+        lower, upper, view = win.result
         for col in selected:
             self._cutoffs[col] = (lower, upper)
             self._remaining.remove(col)
-        self._groups.append((lower, upper, selected))
+        self._groups.append((lower, upper, selected, view))
         self._refresh_list()
 
     def _finish(self):
@@ -347,24 +448,25 @@ def save_group_histograms(hist_dir: Path, data: dict,
     """
     Save one histogram PNG per cutoff group into hist_dir.
 
-    Each plot mirrors the GUI view: overlaid histograms with shared bin edges,
+    Each plot mirrors the GUI view the group was gated in: overlaid histograms
+    with shared bin edges, the same x-axis range and binning the user saw,
     cutoff lines, and shaded accepted region. Files are named group_01.png, etc.
 
     Args:
         hist_dir: directory to write PNG files into
         data:     mapping of name → ungated value array
-        groups:   ordered list of (lower, upper, [names])
+        groups:   ordered list of (lower, upper, [names], view)
         mode_cfg: entry from a _MODE dict
     """
     cfg = mode_cfg
-    for i, (lo, hi, cols) in enumerate(groups, 1):
+    for i, (lo, hi, cols, view) in enumerate(groups, 1):
         arrays = [data[col][~np.isnan(data[col])] for col in cols]
         arrays = [a for a in arrays if len(a) > 0]
         if not arrays:
             continue
 
         all_vals = np.concatenate(arrays)
-        shared_bins = cfg['bins'](all_vals)
+        shared_bins = _view_bins(cfg, all_vals, view)
 
         fig, ax = plt.subplots(figsize=(14, 5))
         for col, vals in zip(cols, arrays):
@@ -376,7 +478,9 @@ def save_group_histograms(hist_dir: Path, data: dict,
                    label=f'upper = {hi:.4g}')
         ax.axvspan(lo, hi, alpha=0.08, color='green')
         ax.set_xscale(cfg['scale'])
-        if cfg['xlim']:
+        if view is not None:
+            ax.set_xlim(*view)
+        elif cfg['xlim']:
             ax.set_xlim(*cfg['xlim'])
         ax.set_xlabel(cfg['xlabel'])
         ax.set_ylabel('count')
@@ -403,13 +507,13 @@ def write_stats_csv(stats_path: Path, data: dict, cutoffs: dict,
         stats_path: full path of the CSV file to write
         data:       mapping of name → ungated value array
         cutoffs:    mapping of name → (lower, upper)
-        groups:     ordered list of (lower, upper, [names])
+        groups:     ordered list of (lower, upper, [names], view)
         mode_cfg:   entry from a _MODE dict
     """
     cfg = mode_cfg
     rows = []
 
-    for _, _, cols in groups:
+    for _, _, cols, _ in groups:
         all_vals = np.concatenate([
             data[col][~np.isnan(data[col])] for col in cols
             if len(data[col][~np.isnan(data[col])]) > 0
@@ -466,7 +570,7 @@ def write_log(log_path: Path, header_lines: list, data: dict,
         log_path:     full path of the log file to write
         header_lines: list of strings written verbatim before the groups section
         data:         mapping of name → ungated value array
-        groups:       ordered list of (lower, upper, [names])
+        groups:       ordered list of (lower, upper, [names], view)
         mode_cfg:     entry from a _MODE dict
     """
     cfg = mode_cfg
@@ -476,10 +580,14 @@ def write_log(log_path: Path, header_lines: list, data: dict,
     lines.append("Cutoff groups")
     lines.append("-" * 60)
 
-    for i, (lo, hi, cols) in enumerate(groups, 1):
+    for i, (lo, hi, cols, view) in enumerate(groups, 1):
         lines.append(
             f"Group {i}   lower = {lo:.4g} {cfg['unit']}   "
             f"upper = {hi:.4g} {cfg['unit']}")
+        if view is not None:
+            lines.append(
+                f"  gated in x-axis view: {view[0]:.4g} – {view[1]:.4g} "
+                f"{cfg['unit']}")
         for col in cols:
             n_before = len(data[col][~np.isnan(data[col])])
             raw = data[col]
