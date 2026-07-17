@@ -5,6 +5,7 @@ dependencies:
   - python=3.12
   - numpy
   - pandas
+  - openpyxl
   - matplotlib
   - pyyaml
   - h5py

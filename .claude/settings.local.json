@@ -11,7 +11,9 @@
       "Bash(python -m py_compile annotate_coulter_samples.py compile_experiment.py)",
       "Bash(python *)",
       "Bash(PYTHONPATH=/c/code/biophys_helpers python *)",
-      "Bash(PYTHONIOENCODING=utf-8 PYTHONPATH=/c/code/biophys_helpers python -c ' *)"
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONPATH=/c/code/biophys_helpers python -c ' *)",
+      "Bash(conda run *)",
+      "Bash(conda list *)"
     ]
   }
 }
