@@ -78,6 +78,8 @@ from tkinter import messagebox, ttk
 import h5py
 import yaml
 
+from fsutil import is_appledouble
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -152,7 +154,7 @@ def _last_matching_dir(parent: Path, pattern: re.Pattern) -> Path | None:
     """Return the lexicographically last subdir whose name matches pattern."""
     matches = sorted(
         d for d in parent.iterdir()
-        if d.is_dir() and pattern.search(d.name)
+        if d.is_dir() and not is_appledouble(d) and pattern.search(d.name)
     )
     return matches[-1] if matches else None
 
@@ -180,7 +182,7 @@ def _discover_sample(sample_dir: Path) -> dict:
     mass_dir = _last_matching_dir(sample_dir, re.compile(r'_mass_results$'))
     if mass_dir is not None:
         for f in sorted(mass_dir.iterdir()):
-            if (f.is_file() and f.suffix == '.csv'
+            if (f.is_file() and not is_appledouble(f) and f.suffix == '.csv'
                     and not f.name.startswith('curation_index')):
                 try:
                     hdr = pd.read_csv(f, nrows=0)
@@ -196,16 +198,19 @@ def _discover_sample(sample_dir: Path) -> dict:
         stage2 = fxm_dir / 'stage2_analysis'
         if stage2.is_dir():
             for f in stage2.iterdir():
-                if f.is_file() and f.name.endswith('_ProcessedVolumes.csv'):
+                if (f.is_file() and not is_appledouble(f)
+                        and f.name.endswith('_ProcessedVolumes.csv')):
                     paths['volume_path'] = f
                     break
-            idx_files = list(stage2.glob('*_Hdf5PathIndex.csv'))
+            idx_files = sorted(f for f in stage2.glob('*_Hdf5PathIndex.csv')
+                               if not is_appledouble(f))
             if idx_files:
                 paths['hdf5_index_path'] = idx_files[0]
 
         stage1 = fxm_dir / 'stage1_image_processing'
         if stage1.is_dir():
-            hdf5_files = list(stage1.glob('*.hdf5'))
+            hdf5_files = sorted(f for f in stage1.glob('*.hdf5')
+                                if not is_appledouble(f))
             if hdf5_files:
                 paths['hdf5_src_path'] = hdf5_files[0]
 
@@ -213,21 +218,24 @@ def _discover_sample(sample_dir: Path) -> dict:
     pair_dir = _last_matching_dir(sample_dir, re.compile(r'_pairing_results$'))
     if pair_dir is not None:
         for f in pair_dir.iterdir():
-            if f.is_file() and f.name.endswith('_PairedSMRVolumes.csv'):
+            if (f.is_file() and not is_appledouble(f)
+                    and f.name.endswith('_PairedSMRVolumes.csv')):
                 paths['pairing_path'] = f
                 break
 
     # --- bm_gating ---
     bm_gate_dir = _last_matching_dir(sample_dir, re.compile(r'_bm_gating$'))
     if bm_gate_dir is not None:
-        yaml_files = sorted(bm_gate_dir.glob('*.yaml'))
+        yaml_files = sorted(f for f in bm_gate_dir.glob('*.yaml')
+                            if not is_appledouble(f))
         if yaml_files:
             paths['bm_gate_path'] = yaml_files[0]
 
     # --- ifxm-vol_gating ---
     ifxm_gate_dir = _last_matching_dir(sample_dir, re.compile(r'_ifxm-vol_gating$'))
     if ifxm_gate_dir is not None:
-        yaml_files = sorted(ifxm_gate_dir.glob('*.yaml'))
+        yaml_files = sorted(f for f in ifxm_gate_dir.glob('*.yaml')
+                            if not is_appledouble(f))
         if yaml_files:
             paths['ifxm_gate_path'] = yaml_files[0]
 

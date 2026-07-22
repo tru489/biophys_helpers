@@ -21,45 +21,61 @@ conda env create -f environment.yaml
 conda activate biophys_helpers
 ```
 
-This installs Python 3.12 plus `numpy`, `pandas`, `matplotlib`, `pyyaml`, `h5py`,
-and `pytables`.
+This installs Python 3.12 plus `numpy`, `scipy`, `pandas`, `openpyxl`, `matplotlib`,
+`pyyaml`, `h5py`, `pytables`, and `pillow`.
 
 > **Notes**
-> - **PyTables** (the `tables` module) is what `pandas` uses to write the `data.h5` /
->   `experiment_data.h5` HDFStore files. It is an optional pandas backend, so a missing
->   install only surfaces as an error at write time. Install via conda (preferred on
->   Windows: `conda install -n biophys_helpers pytables`) rather than pip.
-> - **Pillow** (`PIL`) is required by `browse_experiment.py` for image display but is
->   not yet in `environment.yaml`. Install it if you use the browser:
->   `conda install -n biophys_helpers pillow`.
+> - When adding or referencing a new third-party dependency, add it to
+>   [`environment.yaml`](environment.yaml) in the same change — including backends an
+>   existing library needs (e.g. `openpyxl` for pandas `.xlsx` I/O). See
+>   [`CLAUDE.md`](CLAUDE.md) for the full policy.
+> - **openpyxl** is the backend `pandas` uses to write the `experiment_data.xlsx`
+>   workbook from `compile_experiment.py`. It is an optional pandas extra, so a missing
+>   install only surfaces at write time.
+> - **PyTables** (the `tables` module) is what `pandas` uses to write the `data.h5`
+>   HDFStore file from `pair_bm_runs.py`. Also an optional pandas backend; install via
+>   conda (preferred on Windows: `conda install -n biophys_helpers pytables`) rather than pip.
+> - **SciPy** is used by the SMR/FXM cross-correlation pairing
+>   (`pair_smr_volumes.py` / `bulk_pair_smr_volumes.py`).
+> - **Pillow** (`PIL`) is required by `browse_experiment.py` for image display.
 > - The GUI tools (`crop_smr_timeseries`, `gate_*`, `pair_bm_runs`,
 >   `annotate_coulter_samples`, `browse_experiment`) require a display. They are
 >   cross-platform (macOS / Windows / Linux); on macOS the tkinter theme is forced to
->   `clam` so table row colors render correctly.
+>   `clam` so table row colors render correctly. Scripts that scan external
+>   (exFAT/FAT) drives skip macOS AppleDouble sidecar files (`._*`) via
+>   [`fsutil.py`](fsutil.py).
 
 ---
 
 ## Typical workflow
 
 ```
-Coulter .#m4 files ──> extract_coulter_data.py ──> *_sc_volumes.csv ─┐
-                                                                     │
-SMR binaries ──> crop_smr_timeseries.py ──> (SMR software) ──> *_mass_results/  │
-                                                                     │
-                aggregate_bm_vol_files.py  <───────────────────────────┘
-                          │  (collects BM + iFXM volumes)
-                          ▼
-                    mass_pg.csv ──> gate_bm_coulter.py        (gate one CSV in a new dir)
-                                    gate_experiments_inplace.py (gate per-sample, in place)
-                                          │
-                                          ▼
-        pair_bm_runs.py / annotate_coulter_samples.py  (organize & annotate)
-                                          │
-                                          ▼
-                        compile_experiment.py ──> *_compiled/{experiment_data.h5, images.h5}
-                                          │
-                                          ▼
-                            browse_experiment.py  (interactive viewer)
+Coulter .#m4 files ──> extract_coulter_data.py ──> *_sc_volumes.csv ──> annotate_coulter_samples.py
+
+SMR binaries ──> crop_smr_timeseries.py ──> (SMR software) ──> *_mass_results/       (buoyant mass)
+iFXM images  ──> (FXM software) ─────────────────────────────> *_imaging_fxm_results/ (volume)
+        │                                                            │
+        │        pair_smr_volumes.py / bulk_pair_smr_volumes.py  <───┘
+        │        (per-cell mass↔volume cross-correlation pairing)
+        │                              │
+        │                              ▼
+        │                *_pairing_results/*_PairedSMRVolumes.csv
+        │                              │
+        ├─> aggregate_bm_vol_files.py ─┤  (collect BM + iFXM volumes ──> mass_pg.csv)
+        │        │                     │
+        │        ▼                     │
+        │   gate_bm_coulter.py         │  (gate one CSV into a new dir)
+        │   gate_experiments_inplace.py│  (gate per-sample, in place ──> gate YAMLs)
+        │        │                     │
+        │   pair_bm_runs.py            │  (population-level multi-fluid density grouping)
+        │                              │
+        └─> calculate_baseline_density.py ──> *_baseline_density.csv  (absolute-density offset)
+                                       │
+                                       ▼
+                        compile_experiment.py ──> *_compiled/{experiment_data.xlsx, images.h5}
+                                       │
+                                       ▼
+                           browse_experiment.py  (interactive viewer)
 
 Housekeeping: prune_timestamped_subdirs.py
 ```
@@ -246,6 +262,149 @@ E:/data/control_run
 
 ---
 
+### `pair_smr_volumes.py`  · _batch_
+
+Pairs individual SMR **buoyant-mass** measurements with individual iFXM **volume**
+measurements for the same cells, by cross-correlating the mass-vs-time and
+calibrated-volume-vs-time signals to recover the time lag between the two
+instruments, then matching peaks within a tolerance window. Reads a volume-only
+`*_ProcessedVolumes.csv` and a `*_mass_results` mass CSV from a single experiment
+(analysis) directory and writes a fully-populated ProcessedVolumes-format CSV plus
+diagnostic figures.
+
+The output `*_PairedSMRVolumes.csv` is exactly the `*_pairing_results` file that
+`compile_experiment.py` (and `gate_experiments_inplace.py` for iFXM) discover
+automatically, so pairing feeds straight into compilation.
+
+**Output** (`<analysis_dir>/<YYYYMMDD_HHMMSS>_pairing_results/`)
+
+```
+<prefix>_PairedSMRVolumes.csv         paired per-cell mass + volume rows
+<prefix>_PairingStats_fig.png         pairing summary
+<prefix>_PairingLags_fig.png          cross-correlation lag diagnostics
+<prefix>_PairingHistograms_fig.png    matched-population histograms
+```
+
+**Usage**
+
+```
+python pair_smr_volumes.py <analysis_dir> [options]
+```
+
+| Argument | Description |
+|---|---|
+| `analysis_dir` | Experiment folder containing both a `*_imaging_fxm_results` and a `*_mass_results` subdir |
+| `--vol-dir DIRNAME` | Name of the imaging results dir (auto-detected — most recent — if omitted) |
+| `--mass-dir DIRNAME` | Name of the mass results dir (auto-detected — most recent — if omitted) |
+| `--timebase FLOAT` | Time-axis resolution in seconds (default: `1e-3`) |
+| `--peak-tolerance INT` | Index window around each mass peak for matching (default: `11`) |
+| `--gaussian-width INT` | Gaussian blur sigma in samples (default: `15`) |
+
+**Example**
+
+```bash
+python pair_smr_volumes.py "E:/data/2026-06-03_drugtreat/zota_24h_samp05"
+```
+
+---
+
+### `bulk_pair_smr_volumes.py`  · _batch_
+
+Batch driver for `pair_smr_volumes.py`: discovers experiment folders under a root
+directory and runs the same pairing on each. By default it searches recursively for
+any folder containing both a `*_imaging_fxm_results` and a `*_mass_results` subdir;
+`--no-recursive` restricts to a fixed depth-2 layout (`<root>/<date-superfolder>/<experiment>/`).
+Depth-1 superfolders beginning with `YYYY-MM-DD` can be filtered by date.
+
+**Usage**
+
+```
+python bulk_pair_smr_volumes.py <root_dir> [folder-selection] [pairing-options]
+```
+
+**Folder selection**
+
+| Argument | Description |
+|---|---|
+| `root_dir` | Root directory containing date-named experiment superfolders |
+| `--from YYYY-MM-DD` | Only process superfolders dated on or after this date |
+| `--to YYYY-MM-DD` | Only process superfolders dated on or before this date |
+| `--last N` | Only process the N most recently dated superfolders |
+| `--from-file FILE` | Text file of experiment folder paths (one per line; `#` comments allowed) |
+| `--skip-paired` | Skip folders that already contain a `*_PairedSMRVolumes.csv` |
+| `--no-recursive` | Restrict discovery to fixed depth-2 instead of recursive search |
+| `--dry-run` | Print discovered folders without running any pairing |
+
+**Pairing options** (passed through to each pairing run)
+
+| Argument | Description |
+|---|---|
+| `--timebase FLOAT` | Time-axis resolution in seconds (default: `1e-3`) |
+| `--peak-tolerance INT` | Index window around each mass peak (default: `11`) |
+| `--gaussian-width INT` | Gaussian blur sigma in samples (default: `15`) |
+| `--utc-offset HOURS` | Hours added to mass `real_time_s` timestamps to align with FXM frame times (e.g. `-4` for EDT when LabVIEW logs UTC; default: `0`) |
+
+**Examples**
+
+```bash
+# All experiments under root, last 3 dated superfolders
+python bulk_pair_smr_volumes.py "E:/experiments" --last 3
+
+# Date range, skip already-paired folders
+python bulk_pair_smr_volumes.py "E:/experiments" --from 2026-06-01 --to 2026-06-07 --skip-paired
+
+# Preview what would be processed
+python bulk_pair_smr_volumes.py "E:/experiments" --from 2026-06-03 --dry-run
+```
+
+---
+
+### `calculate_baseline_density.py`  · _batch_
+
+Computes the **fluid baseline density** for every sample in an experiment superdir
+from its buoyant-mass data, and writes a single timestamped summary CSV. For each
+sample subdir the newest `*_mass_results` CSV is read (the same discovery convention
+as `gate_experiments_inplace.py`), the mean of the per-cell `avg_baseline` column is
+taken, and it is converted to a density via a base-frequency / density calibration:
+
+```
+baseline_density = (rfreq - mean_avg_baseline - intercept) / slope
+```
+
+`slope` and `intercept` come from a calibration JSON; `rfreq` is the experiment's
+resonant frequency (Hz). This value is the absolute-density offset to add to the
+**relative** `buoyant_density` written by `compile_experiment.py`. Without a
+calibration JSON the mean baseline is still reported but `baseline_density` is `NaN`.
+
+**Output** (written inside `<superdir>`, at the same level as the sample subdirs)
+
+```
+<YYYYMMDD_HHMMSS>_baseline_density.csv
+    one row per sample: sample, n_cells, mean_avg_baseline, baseline_density,
+    rfreq, slope, intercept, source_csv
+```
+
+**Usage**
+
+```
+python calculate_baseline_density.py <superdir> --rfreq <hz> [--calib-json <path>]
+```
+
+| Argument | Description |
+|---|---|
+| `superdir` | Experiment superdir whose immediate subdirs are samples, each with a `*_mass_results` folder |
+| `--rfreq HZ` | Resonant frequency in Hz (required) |
+| `--calib-json PATH` | Calibration JSON with `slope` and `intercept` keys (optional; `baseline_density` is `NaN` if omitted) |
+
+**Example**
+
+```bash
+python calculate_baseline_density.py "E:/data/2026-05-22_tcell_act" \
+    --rfreq 1167183 --calib-json "E:/data/density_calibration.json"
+```
+
+---
+
 ## Gating
 
 Two gating tools share the histogram / cutoff UI in [`gating/common.py`](gating/common.py).
@@ -253,6 +412,11 @@ Use `gate_bm_coulter.py` to gate a **single aggregated CSV** into a new output d
 or `gate_experiments_inplace.py` to gate **per-sample data in place** (writing a YAML gate
 file into each sample subfolder, which downstream tools like `pair_bm_runs.py` and
 `compile_experiment.py` pick up automatically).
+
+Both cutoff windows include an **X-axis view** control (min/max entry boxes with
+**Apply** / **Reset**): typing a range re-bins and redraws the histograms over just
+that span, so you can zoom into a single size population before placing cutoffs
+without changing the underlying data.
 
 ### `gate_bm_coulter.py`  · _GUI_
 
@@ -519,6 +683,9 @@ images.h5            (h5py)
   /{safe_name}/{transit_idx:05d}/fl   (n_frames, H, W) uint16
 ```
 
+> The `buoyant_density` column is **relative**. Add the per-sample offset from
+> `calculate_baseline_density.py` to get absolute density in g/mL.
+
 **Usage**
 
 ```
@@ -603,12 +770,6 @@ These are imported by the scripts above and are not run directly.
 | Module | Role |
 |---|---|
 | [`CoulterFile.py`](CoulterFile.py) | `CoulterFile` class that parses a single Coulter counter `.#m4` file — selection statistics, histogram bin edges/counts, single-cell diameters/volumes, and start time. Used by `extract_coulter_data.py`. |
-| [`gating/common.py`](gating/common.py) | Shared GUI components and output utilities for the gating tools: `CutoffWindow` (click-to-set histogram), `MainWindow` (scrollable sample list), `ask_data_type_dialog`, `save_group_histograms`, `write_stats_csv`, `write_log`. Used by `gate_bm_coulter.py` and `gate_experiments_inplace.py`. |
-
----
-
-## Development helpers
-
-`_test_discovery.py`, `_test_pair.py`, and `_verify_h5.py` are ad-hoc scripts with
-hardcoded paths used during development to spot-check discovery, pairing, and HDF5 output.
-They are not general-purpose tools — edit the paths inside before running.
+| [`gating/common.py`](gating/common.py) | Shared GUI components and output utilities for the gating tools: `CutoffWindow` (click-to-set histogram with X-axis view control), `MainWindow` (scrollable sample list), `ask_data_type_dialog`, `save_group_histograms`, `write_stats_csv`, `write_log`. Used by `gate_bm_coulter.py` and `gate_experiments_inplace.py`. |
+| [`pipeline/stage2/pairing_utils.py`](pipeline/stage2/pairing_utils.py) | Cross-correlation pairing primitives (SciPy-based signal building, lag estimation, peak matching) shared by `pair_smr_volumes.py` and `bulk_pair_smr_volumes.py`. |
+| [`fsutil.py`](fsutil.py) | Stdlib-only filesystem helpers shared across scripts. `is_appledouble()` detects macOS AppleDouble sidecars (`._*`) so scans of exFAT/FAT external drives skip them. |
