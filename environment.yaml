@@ -9,6 +9,11 @@ dependencies:
   - openpyxl
   - matplotlib
   - pyyaml
-  - h5py
-  - pytables
+  # Pinned to the coherent hdf5 1.14.5 stack on the `defaults` channel.
+  # The freshly-shipped hdf5 2.0.0 build ships an h5py binary linked against a
+  # mismatched hdf5 build, causing "DLL load failed ... specified procedure
+  # could not be found" on `import h5py`. Revisit once 2.0.0 stabilizes.
+  - hdf5=1.14.5
+  - h5py=3.15.1
+  - pytables=3.10.2
   - pillow
