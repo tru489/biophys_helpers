@@ -39,7 +39,8 @@ This installs Python 3.12 plus `numpy`, `scipy`, `pandas`, `openpyxl`, `matplotl
 >   (`pair_smr_volumes.py` / `bulk_pair_smr_volumes.py`).
 > - **Pillow** (`PIL`) is required by `browse_experiment.py` for image display.
 > - The GUI tools (`crop_smr_timeseries`, `gate_*`, `pair_bm_runs`,
->   `annotate_coulter_samples`, `browse_experiment`) require a display. They are
+>   `annotate_coulter_samples`, `browse_experiment`, `browse_h5`) require a display —
+>   except `browse_h5.py --dump`, which prints to stdout. They are
 >   cross-platform (macOS / Windows / Linux); on macOS the tkinter theme is forced to
 >   `clam` so table row colors render correctly. Scripts that scan external
 >   (exFAT/FAT) drives skip macOS AppleDouble sidecar files (`._*`) via
@@ -728,6 +729,51 @@ python browse_experiment.py <compiled_dir>
 ```bash
 python browse_experiment.py "E:/data/2026-05-22_tcell_act/20260611_235527_compiled"
 ```
+
+---
+
+## Inspection
+
+### `browse_h5.py`  · _GUI_
+
+Generic structure browser for any `.h5` / `.hdf5` file. Displays the hierarchy as a
+lazily-expanded tree with the kind, shape, dtype and attributes of every node — for
+answering "what is actually inside this file?" when you no longer remember the layout.
+
+Unlike `browse_images.py` and `browse_experiment.py`, which each expect one specific
+schema, this tool assumes nothing about the contents.
+
+Objects written by pandas (`pd.HDFStore` / `DataFrame.to_hdf`) are shown **logically**:
+a stored DataFrame is one leaf with its real row/column counts, column dtypes, and a
+10-row preview, rather than the PyTables internals (`axis0`, `block0_values`, `table`)
+that back it. Tick **Show raw HDF5 nodes** to see the underlying hierarchy verbatim.
+`Copy path` puts the selected node's key on the clipboard, ready to paste into
+`store[...]`.
+
+**Usage**
+
+```
+python browse_h5.py [<h5_path>] [--raw] [--dump]
+```
+
+| Argument | Description |
+|---|---|
+| `h5_path` | Path to a `.h5` / `.hdf5` file. If omitted, a file picker opens. |
+| `--raw` | Start in raw-HDF5 mode (show pandas internals rather than grouping them) |
+| `--dump` | Print the structure to stdout and exit; no window is opened. Requires `h5_path` |
+
+**Examples**
+
+```bash
+# Browse interactively
+python browse_h5.py "E:/data/2026-05-22_tcell_act/20260611_235527_paired/data.h5"
+
+# Print the structure to the terminal (no display needed)
+python browse_h5.py --dump "E:/data/2026-05-22_tcell_act/20260611_235527_compiled/images.h5"
+```
+
+> Opens files read-only with HDF5 file locking disabled, so a file that is open
+> elsewhere or living on a network / cloud-synced volume can still be inspected.
 
 ---
 
