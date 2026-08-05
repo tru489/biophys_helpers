@@ -22,7 +22,7 @@ conda activate biophys_helpers
 ```
 
 This installs Python 3.12 plus `numpy`, `scipy`, `pandas`, `openpyxl`, `matplotlib`,
-`pyyaml`, `h5py`, `pytables`, and `pillow`.
+`pyyaml`, `h5py`, `pytables`, `pillow`, and `pyarrow`.
 
 > **Notes**
 > - When adding or referencing a new third-party dependency, add it to
@@ -38,9 +38,16 @@ This installs Python 3.12 plus `numpy`, `scipy`, `pandas`, `openpyxl`, `matplotl
 > - **SciPy** is used by the SMR/FXM cross-correlation pairing
 >   (`pair_smr_volumes.py` / `bulk_pair_smr_volumes.py`).
 > - **Pillow** (`PIL`) is required by `browse_experiment.py` for image display.
+> - **pyarrow** is the Parquet reader behind `browse_parquet.py`, and is also what
+>   `browse_pt.py` uses to read the sibling metadata parquet next to a crop cache. Like
+>   `openpyxl`, pandas treats it as an optional extra, so it must be installed explicitly.
+> - **No PyTorch is needed** to inspect `.pt` files. `browse_pt.py` parses the zip
+>   archive and stubs the pickle, recovering every tensor shape, dtype and device without
+>   a ~2 GB `torch` install and without reading any tensor data.
 > - The GUI tools (`crop_smr_timeseries`, `gate_*`, `pair_bm_runs`,
->   `annotate_coulter_samples`, `browse_experiment`, `browse_h5`) require a display —
->   except `browse_h5.py --dump`, which prints to stdout. They are
+>   `annotate_coulter_samples`, `browse_experiment`, `browse_h5`, `browse_parquet`,
+>   `browse_pt`) require a display — except `browse_h5.py`, `browse_parquet.py` and
+>   `browse_pt.py` with `--dump`, which print to stdout. They are
 >   cross-platform (macOS / Windows / Linux); on macOS the tkinter theme is forced to
 >   `clam` so table row colors render correctly. Scripts that scan external
 >   (exFAT/FAT) drives skip macOS AppleDouble sidecar files (`._*`) via
@@ -77,6 +84,11 @@ iFXM images  ──> (FXM software) ──────────────�
                                        │
                                        ▼
                            browse_experiment.py  (interactive viewer)
+
+VQ-VAE crop caches: *_imaging_fxm_results/stage2_analysis/*_vqvae_cache.pt (+ _metadata.parquet)
+                                       │
+                                       └─> concat_vqvae_caches.py ──> *_vqvae_concat/  (one merged
+                                                                       .pt + .parquet for training)
 
 Housekeeping: prune_timestamped_subdirs.py
 ```
@@ -705,6 +717,84 @@ python compile_experiment.py "E:/data/2026-05-22_tcell_act"
 
 ---
 
+### `concat_vqvae_caches.py`  · _batch_
+
+Concatenates the stage-2 VQ-VAE crop caches of many experiments into one `.pt` plus one
+`.parquet`, so a model can be trained on every experiment at once while each crop stays
+traceable to where it came from.
+
+A crop cache is a pair: `<sample>_vqvae_cache.pt` holding `bf_u8` (and `fl_u8` when
+fluorescence export is on) as `uint8 (N, 1, S, S)`, and `<sample>_vqvae_cache_metadata.parquet`
+holding one row per crop. **The two are joined by position and nothing else** — parquet row
+`i` describes tensor row `i`. This script drives both outputs from one ordered list of
+sources so they cannot drift, and adds three columns to every row:
+
+| Column | Meaning |
+|---|---|
+| `experiment` | the superdir the row came from |
+| `sample_name` | the sample subdir the row came from |
+| `cache_row` | the row's index into the concatenated tensor |
+
+`cache_row` makes the correspondence explicit rather than merely implied, so it survives any
+later sort or filter of the parquet: `bf_u8[row.cache_row]` is always that row's crop.
+
+Caches are found under the same layout the other aggregators walk —
+`<superdir>/<sample>/<YYYYMMDD_HHMMSS>_imaging_fxm_results/stage2_analysis/` — with the
+newest run directory winning when a sample has been reprocessed. Samples missing any part
+of that chain are skipped with a warning rather than failing the run.
+
+Sources whose parquet row count disagrees with their tensor `N` are **excluded**, because
+that means the pairing is already broken upstream and merging would spread mislabeled rows.
+Parquets with differing columns are merged on the union of their columns, null-filling what
+a source lacks, and the report names every column that was filled. Crop sizes that differ
+between sources are a hard error, not a silent ragged write.
+
+**No PyTorch is required, and no file is read whole.** `torch.save` writes an uncompressed
+zip whose storage blobs are 64-byte aligned, so for a contiguous tensor the blob is exactly
+the C-order buffer and concatenating along axis 0 is byte concatenation. Blobs are streamed
+from input to output a chunk at a time: merging 234 MB of caches peaks at ~130 MB of RAM
+rather than scaling with the output. Tensors that are *not* byte-concatenable — non-contiguous
+(e.g. permuted) or offset into a larger storage (e.g. sliced) — are detected and skipped
+rather than silently corrupted.
+
+**Usage**
+
+```
+python concat_vqvae_caches.py <superdir> [<superdir> ...] [--from-file FILE]
+                              [--output DIR] [--keys KEYS] [--require-fl] [--dry-run]
+```
+
+| Argument | Description |
+|---|---|
+| `superdir` | One or more experiment superdirs to scan. Mutually exclusive with `--from-file` |
+| `--from-file FILE` | Read superdirs from a file, one path per line (`#` comments and blanks skipped) |
+| `--output DIR` | Parent directory for the output folder (default: the first superdir) |
+| `--keys KEYS` | Comma-separated tensor keys to merge (default: those present in every source) |
+| `--require-fl` | Fail if any source lacks `fl_u8`, instead of dropping it |
+| `--dry-run` | Discover and validate, print the plan, write nothing |
+
+**Examples**
+
+```bash
+# Check what would be merged, and why anything is being skipped
+python concat_vqvae_caches.py --dry-run "E:/data/2026-05-22_tcell_act" "E:/data/2026-06-03_drug"
+
+# Merge two experiments into E:/training/<timestamp>_vqvae_concat/
+python concat_vqvae_caches.py --output "E:/training" \
+    "E:/data/2026-05-22_tcell_act" "E:/data/2026-06-03_drug"
+
+# Merge everything listed in a file, requiring fluorescence crops
+python concat_vqvae_caches.py --from-file experiments.txt --require-fl
+```
+
+> Output goes to `<parent>/<timestamp>_vqvae_concat/{concat_vqvae_cache.pt,
+> concat_vqvae_cache_metadata.parquet}`. Before exiting, the script reopens both and asserts
+> that every tensor's `N`, the parquet row count and `max(cache_row) + 1` all agree, so a
+> misalignment fails loudly instead of reaching training. Inspect the result with
+> `browse_pt.py` and `browse_parquet.py`.
+
+---
+
 ### `browse_experiment.py`  · _GUI_
 
 Interactive viewer for a `*_compiled/` directory produced by `compile_experiment.py`.
@@ -774,6 +864,104 @@ python browse_h5.py --dump "E:/data/2026-05-22_tcell_act/20260611_235527_compile
 
 > Opens files read-only with HDF5 file locking disabled, so a file that is open
 > elsewhere or living on a network / cloud-synced volume can still be inspected.
+
+---
+
+### `browse_parquet.py`  · _GUI_
+
+Tabular browser for any `.parquet` / `.pq` file. The top pane reports the file-level
+metadata — row and column counts, row groups and their sizes, compression codec,
+stored vs uncompressed bytes, and any key-value metadata — alongside the full column
+schema, giving each column's arrow type, the parquet physical type it was stored as, and
+whether it is nullable. The bottom pane is the data itself.
+
+Rows are shown a page at a time (100 by default, `--rows` to change it) with **Prev** /
+**Next** and a **Go to row** box for jumping straight to an absolute row number. Each row
+is labelled with its absolute index, so a paged view still tells you where you are. Only
+the row groups spanning the current page are read, and they are streamed in small batches
+rather than loaded whole — so a 2,000,000-row file pages in tens of milliseconds and
+memory stays flat regardless of file size or how the writer chose its row groups.
+
+`Copy column` puts the selected column's name on the clipboard; `Copy row` copies the
+selected row as tab-separated text, ready to paste into a spreadsheet.
+
+**Usage**
+
+```
+python browse_parquet.py [<parquet_path>] [--rows N] [--dump]
+```
+
+| Argument | Description |
+|---|---|
+| `parquet_path` | Path to a `.parquet` / `.pq` file. If omitted, a file picker opens. |
+| `--rows N` | Rows shown per page in the data view (default 100, or 10 with `--dump`) |
+| `--dump` | Print the metadata, schema and first rows to stdout and exit; no window is opened. Requires `parquet_path` |
+
+**Examples**
+
+```bash
+# Browse interactively
+python browse_parquet.py "E:/data/stage2_analysis/SAMPLE_A_vqvae_cache_metadata.parquet"
+
+# Print the schema and first 20 rows to the terminal (no display needed)
+python browse_parquet.py --dump --rows 20 "E:/data/stage2_analysis/SAMPLE_A_vqvae_cache_metadata.parquet"
+```
+
+> Reads through `pyarrow` rather than `pandas.read_parquet`, so the schema and row counts
+> come from the file footer without loading any data.
+
+---
+
+### `browse_pt.py`  · _GUI_
+
+Structure browser for PyTorch `.pt` / `.pth` files, written for the VQ-VAE crop caches
+that stage 2 of the ImageFXMAnalysis pipeline emits. Reports the dimensions, dtype, device,
+strides and contiguity of every tensor in the file, and reads 4-D and 3-D shapes as image
+stacks — spelling out frames / channels / height / width rather than leaving you to
+interpret a bare tuple.
+
+A crop cache holds **only image tensors**: `bf_u8` always, and `fl_u8` when fluorescence
+export is enabled, both `uint8` of shape `(N, 1, S, S)`. All per-crop metadata deliberately
+lives in a sibling `<stem>_metadata.parquet` with one row per crop, aligned with axis 0 of
+the tensors. This tool therefore finds that sibling and reports its row count, its
+constant-down-file columns (`crop_size`, `center_pixel`, `source_file`, …), and **whether
+its row count still matches N** — the two files are joined by position alone, so a
+mismatch is flagged loudly because it means the export is broken. `Open metadata parquet`
+launches `browse_parquet.py` on it.
+
+**No `torch` install is required.** A `.pt` is a zip archive holding one pickle plus raw
+storage blobs, and every shape and dtype lives in the pickle — so unpickling with stubbed
+classes recovers the full structure without loading a single byte of tensor data. This
+also means nothing in the file is ever resolved to real code, so opening an untrusted
+checkpoint cannot execute anything.
+
+**Usage**
+
+```
+python browse_pt.py [<pt_path>] [--no-sibling] [--dump]
+```
+
+| Argument | Description |
+|---|---|
+| `pt_path` | Path to a `.pt` / `.pth` file. If omitted, a file picker opens. |
+| `--no-sibling` | Skip the sibling metadata-parquet lookup |
+| `--dump` | Print the structure to stdout and exit; no window is opened. Requires `pt_path` |
+
+**Examples**
+
+```bash
+# Browse a crop cache interactively (finds the sibling metadata parquet)
+python browse_pt.py "E:/data/stage2_analysis/SAMPLE_A_vqvae_cache.pt"
+
+# Check a cache from the terminal — dimensions, and whether the sibling row count matches
+python browse_pt.py --dump "E:/data/stage2_analysis/SAMPLE_A_vqvae_cache.pt"
+
+# Any .pt works, not just crop caches
+python browse_pt.py --dump models/20241217_NewModelOldCrop.pt
+```
+
+> A missing `fl_u8` is part of the format, not a problem: fluorescence export is off by
+> default. Only zip-format files (torch ≥ 1.6, the default since 2020) are supported.
 
 ---
 
