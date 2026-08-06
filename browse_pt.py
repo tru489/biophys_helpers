@@ -19,11 +19,27 @@ unpickling with stubbed classes recovers the full structure without loading a
 single byte of tensor data and without a ~2 GB torch install. No class named in
 the file is ever resolved to real code, so nothing in the file can execute.
 
+An Images tab beside the details pane renders the crops themselves, one row per
+transit in the style of browse_images.py: a horizontally scrollable strip of that
+transit's frames, five transits per page. Where browse_images reads a transit's
+frames from its own HDF5 group, a crop cache is a flat stack with no such
+structure — the grouping lives in the sibling parquet's `cell_group` (or
+`transit_index`) column, and a transit's rows are NOT contiguous, because transits
+overlap in time and the exporter writes in frame order. Rows are therefore
+gathered by key and sorted by `frame_idx`, not sliced from a range.
+
+Pixels are read straight out of the zip's storage blob by seeking to the rows a
+page needs. torch.save stores each tensor's buffer as a single uncompressed entry,
+so row i sits at a known offset; a page costs one seek per crop shown rather than
+a load of the whole tensor, which keeps paging through a multi-gigabyte cache
+instant and flat in memory — still without torch.
+
 Usage:
     python browse_pt.py [<pt_path>] [--no-sibling] [--dump]
 
     <pt_path>     Path to a .pt / .pth file. If omitted, a file picker opens.
-    --no-sibling  Skip the sibling metadata-parquet lookup.
+    --no-sibling  Skip the sibling metadata-parquet lookup. Also disables the
+                  transit grouping in the Images tab, which comes from it.
     --dump        Print the structure to stdout and exit; no window is opened.
                   Requires <pt_path>.
 """
@@ -46,6 +62,18 @@ try:
     import pyarrow.parquet as pq
 except ImportError:
     pq = None
+
+# numpy and Pillow back the Images tab only. A .pt with no viewable tensor, or a
+# machine without them, must still open the structure browser.
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = ImageTk = None
 
 
 _MAX_KIDS   = 200      # children shown per container
@@ -84,6 +112,46 @@ _CONSTANT_COLUMNS = ('crop_size', 'center_pixel', 'source_file',
 _PRIMARY_KEYS = ('bf_u8', 'fl_u8')
 
 _SCALARS = (int, float, bool, str, bytes, complex, type(None))
+
+# ---- Images tab ----
+
+_ROWS_PER_PAGE = 5     # transits shown per page, as in browse_images.py
+_FRAME_HEIGHT  = 80    # display height (px) per crop; width scales to aspect
+_MAX_STRIP     = 400   # crops rendered in one row before the rest are elided
+_RAW_PER_ROW   = 24    # crops per row when there is no transit grouping
+
+# The transit key in the sibling metadata parquet, best first. cell_group is the
+# label the ImageFXMAnalysis exporter carries through from the CELLGROUPED file
+# and is what a user recognises; transit_index is the same partition numerically.
+_TRANSIT_KEYS = ('cell_group', 'transit_index')
+
+# Orders crops within a transit. frame_idx counts frames within the transit, so
+# it is the natural left-to-right order; the others are fallbacks.
+_FRAME_ORDER_KEYS = ('frame_idx', 'frame_number_bf', 'loop_index')
+
+# Per-row columns worth showing beside a transit. Only those present are used.
+_ROW_DETAIL_KEYS = ('classification', 'confidence', 'volume', 'matched_mass',
+                    'buoyant_density', 'frame_time')
+
+# Grouping columns added by concat_vqvae_caches.py. When present the tensor holds
+# several experiments, so a transit key alone is no longer unique across the file
+# and these have to join it.
+_GROUP_KEYS = ('experiment', 'sample_name')
+
+# dtypes that can be turned into a displayable image. uint8 is what the crop
+# caches hold; the float and wider int cases are normalised per crop instead.
+_VIEWABLE_DTYPES = ('uint8', 'int8', 'uint16', 'int16', 'int32', 'int64',
+                    'float16', 'float32', 'float64', 'bool', 'bfloat16')
+
+# numpy dtype per torch storage class, for reading raw blob bytes. bfloat16 has
+# no numpy equivalent, so it is absent and reported as unviewable rather than
+# silently misread as float16.
+_STORAGE_NUMPY = {
+    'ByteStorage': 'u1', 'CharStorage': 'i1', 'BoolStorage': 'u1',
+    'ShortStorage': '<i2', 'HalfStorage': '<f2', 'IntStorage': '<i4',
+    'FloatStorage': '<f4', 'LongStorage': '<i8', 'DoubleStorage': '<f8',
+}
+
 
 
 # ---------------------------------------------------------------------------
@@ -236,13 +304,26 @@ class _TensorInfo:
 
     @property
     def contiguous(self) -> bool:
-        """True when the strides are the C-contiguous ones for this shape."""
-        expected = []
-        acc = 1
-        for d in reversed(self.shape):
-            expected.append(acc)
-            acc *= int(d)
-        return tuple(reversed(expected)) == tuple(self.stride)
+        """
+        True when the buffer is the tensor's C-order contents.
+
+        Mirrors torch's own compute_contiguous: axes of size 1 are skipped,
+        because a single element can be reached by any stride, so its value says
+        nothing about the layout. Real caches hit this — a crop stack built by
+        unsqueezing a channel axis is (N, 1, S, S) with stride (S*S, 0, S, 1),
+        which is byte-identical to C-order despite the 0.
+        """
+        if self.numel == 0:
+            return True
+        expected = 1
+        for size, stride in zip(reversed(self.shape), reversed(self.stride)):
+            size = int(size)
+            if size == 1:
+                continue
+            if int(stride) != expected:
+                return False
+            expected *= size
+        return True
 
     def __repr__(self):
         return f'Tensor({tuple(self.shape)}, {self.dtype})'
@@ -525,6 +606,277 @@ def _primary_length(obj) -> tuple[str, int] | None:
 
 
 # ---------------------------------------------------------------------------
+# Crop reading
+# ---------------------------------------------------------------------------
+
+def viewable_tensors(obj) -> list[tuple[str, _TensorInfo]]:
+    """
+    (key, tensor) for every top-level tensor the Images tab can render.
+
+    Requires rank 3 or 4 — a stack of 2-D images — plus a layout whose rows can
+    be located by arithmetic: contiguous, offset 0, and exactly its own storage.
+    Anything else would need real strided indexing, which is torch's job.
+    """
+    if not isinstance(obj, dict):
+        return []
+    out = []
+    for key, node in obj.items():
+        if not isinstance(node, _TensorInfo) or node.storage is None:
+            continue
+        if len(node.shape) not in (3, 4):
+            continue
+        if node.dtype not in _VIEWABLE_DTYPES:
+            continue
+        if node.storage.storage_class not in _STORAGE_NUMPY:
+            continue
+        if not node.contiguous or node.offset:
+            continue
+        if node.storage.numel != node.numel:
+            continue
+        out.append((key, node))
+    return out
+
+
+def _frame_shape(info: _TensorInfo) -> tuple[int, int]:
+    """(H, W) of one image in the stack, collapsing a 4-D channel axis."""
+    shape = tuple(int(d) for d in info.shape)
+    return (shape[-2], shape[-1])
+
+
+class CropReader:
+    """
+    Reads individual image rows out of a .pt storage blob.
+
+    A torch.save archive stores each tensor's buffer as a single STORED (never
+    deflated) zip entry, so the bytes of row i sit at a known offset and can be
+    seeked to directly. That is what makes paging through a 300k-crop cache
+    instant: a page costs one seek and one read per crop shown, not a load of the
+    whole tensor.
+
+    The archive and the entry stay open for the reader's lifetime, since reopening
+    per crop would dominate the cost of drawing a page.
+    """
+
+    def __init__(self, pt_path: Path, info: _TensorInfo):
+        self._path = pt_path
+        self._info = info
+        self._h, self._w = _frame_shape(info)
+        shape = tuple(int(d) for d in info.shape)
+        # A 4-D (N, C, H, W) crop cache is displayed one channel at a time; C is
+        # 1 in every cache this tool targets, and channel 0 is the meaningful one.
+        self._channels = shape[1] if len(shape) == 4 else 1
+        self._n = shape[0]
+        self._np_dtype = _STORAGE_NUMPY[info.storage.storage_class]
+        self._itemsize = _STORAGE_ITEMSIZE[info.storage.storage_class]
+        self._frame_bytes = self._h * self._w * self._itemsize
+        # Stride between rows: a 4-D row holds every channel.
+        self._row_bytes = self._frame_bytes * self._channels
+
+        self._zf = zipfile.ZipFile(str(pt_path))
+        self._entry = None
+        self._fh = None
+        try:
+            self._entry = self._blob_name()
+            self._fh = self._zf.open(self._entry)
+            if not self._fh.seekable():
+                raise ValueError('storage entry is not seekable '
+                                 '(the archive is compressed)')
+        except Exception:
+            self.close()
+            raise
+
+    def _blob_name(self) -> str:
+        """The archive entry holding this tensor's storage."""
+        suffix = f'data/{self._info.storage.key}'
+        for name in self._zf.namelist():
+            if name == suffix or name.endswith(f'/{suffix}'):
+                return name
+        raise KeyError(f'no storage blob {self._info.storage.key!r} in '
+                       f'{self._path.name}')
+
+    @property
+    def n(self) -> int:
+        return self._n
+
+    @property
+    def frame_shape(self) -> tuple[int, int]:
+        return (self._h, self._w)
+
+    def read(self, row: int, channel: int = 0):
+        """
+        One image as a 2-D uint8 array ready for display.
+
+        Anything that is not already uint8 is min-max normalised per crop: the
+        alternative is a black or saturated image, since a float crop's range is
+        arbitrary and a 16-bit one uses only part of its span.
+        """
+        if not 0 <= row < self._n:
+            raise IndexError(f'row {row} out of range (N={self._n})')
+        channel = min(max(channel, 0), self._channels - 1)
+        offset = row * self._row_bytes + channel * self._frame_bytes
+        self._fh.seek(offset)
+        raw = self._fh.read(self._frame_bytes)
+        if len(raw) < self._frame_bytes:
+            raise ValueError(f'storage ended early at row {row} '
+                             f'({len(raw)} of {self._frame_bytes} bytes)')
+        flat = np.frombuffer(raw, dtype=np.dtype(self._np_dtype))
+        frame = flat.reshape(self._h, self._w)
+
+        if frame.dtype == np.uint8:
+            return frame
+        if frame.dtype == np.bool_:
+            return frame.astype(np.uint8) * 255
+        data = frame.astype(np.float64)
+        lo = float(np.nanmin(data))
+        hi = float(np.nanmax(data))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            # A constant (or all-NaN) crop has no range to stretch; mid-grey
+            # shows it exists rather than implying detail that isn't there.
+            return np.full((self._h, self._w), 128, dtype=np.uint8)
+        return np.clip((data - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+    def close(self):
+        for handle in (self._fh, self._zf):
+            try:
+                if handle is not None:
+                    handle.close()
+            except Exception:
+                pass
+        self._fh = None
+        self._zf = None
+
+
+# ---------------------------------------------------------------------------
+# Transit index
+# ---------------------------------------------------------------------------
+
+class TransitIndex:
+    """
+    Groups a cache's rows into transits, read from the sibling metadata parquet.
+
+    The .pt itself is a flat (N, C, S, S) stack with no notion of a transit; the
+    grouping lives entirely in the sibling, whose row i describes tensor row i.
+    So this reads the transit key column, gathers the rows sharing each value, and
+    hands back per-transit row lists that index straight into the tensor.
+
+    Rows of one transit are NOT contiguous in the file. Transits overlap in time,
+    and the exporter writes in frame order, so transit 533's rows interleave with
+    534's. Gathering by value rather than slicing a range is what makes the strips
+    correct.
+    """
+
+    def __init__(self, labels: list[str], rows: list[list[int]],
+                 key_column: str, detail: dict[str, list]):
+        self.labels     = labels
+        self.rows       = rows
+        self.key_column = key_column
+        self.detail     = detail
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    @classmethod
+    def build(cls, parquet_path: Path, nrows: int) -> tuple['TransitIndex | None', str]:
+        """
+        Read the sibling and group its rows. Returns (index, note).
+
+        The note explains a None, or qualifies a successful build, so the UI can
+        say why it fell back to ungrouped rows instead of showing nothing.
+        """
+        if pq is None:
+            return None, 'pyarrow is not installed, so the sibling cannot be read'
+        try:
+            pf = pq.ParquetFile(str(parquet_path))
+            names = [f.name for f in pf.schema_arrow]
+            file_rows = pf.metadata.num_rows
+        except Exception as exc:
+            return None, f'cannot read {parquet_path.name}: {exc}'
+
+        if file_rows != nrows:
+            # Position is the only join between the two files, so a length
+            # mismatch means any grouping built here would mislabel crops.
+            pf.close()
+            return None, (f'{parquet_path.name} has {file_rows:,} rows but the '
+                          f'tensor has N={nrows:,}, so rows cannot be matched')
+
+        key = next((k for k in _TRANSIT_KEYS if k in names), None)
+        if key is None:
+            pf.close()
+            return None, (f'{parquet_path.name} has no '
+                          f'{" or ".join(_TRANSIT_KEYS)} column to group by')
+
+        order_key = next((k for k in _FRAME_ORDER_KEYS if k in names), None)
+        group_keys = [k for k in _GROUP_KEYS if k in names]
+        details = [k for k in _ROW_DETAIL_KEYS if k in names]
+        wanted = [key] + group_keys + ([order_key] if order_key else []) + details
+
+        try:
+            table = pf.read(columns=wanted)
+        except Exception as exc:
+            return None, f'cannot read columns from {parquet_path.name}: {exc}'
+        finally:
+            try:
+                pf.close()
+            except Exception:
+                pass
+
+        keys = [_fmt_label(v) for v in table.column(key).to_pylist()]
+        # A concatenated cache repeats transit labels across samples, so the label
+        # alone would merge unrelated crops into one strip.
+        if group_keys:
+            parts = [[_fmt_label(v) for v in table.column(g).to_pylist()]
+                     for g in group_keys]
+            keys = ['/'.join(list(bits) + [k])
+                    for *bits, k in zip(*parts, keys)]
+
+        order = (table.column(order_key).to_pylist() if order_key
+                 else list(range(nrows)))
+
+        groups: dict[str, list[int]] = {}
+        for row, label in enumerate(keys):
+            groups.setdefault(label, []).append(row)
+
+        labels = list(groups.keys())
+        rows = []
+        for label in labels:
+            member = groups[label]
+            # Sort by the frame counter so a strip reads left-to-right in time
+            # even though the rows are interleaved on disk. Row index breaks ties.
+            member.sort(key=lambda r: (_sort_key(order[r]), r))
+            rows.append(member)
+
+        detail = {name: table.column(name).to_pylist() for name in details}
+        note = f'grouped by {key}'
+        if group_keys:
+            note += f' within {" / ".join(group_keys)}'
+        if order_key:
+            note += f', ordered by {order_key}'
+        else:
+            note += ', in file order (no frame counter column)'
+        return cls(labels, rows, key, detail), note
+
+
+def _fmt_label(value) -> str:
+    """A transit key value as display text, with None made visible."""
+    if value is None:
+        return '(none)'
+    return str(value)
+
+
+def _sort_key(value):
+    """
+    Sortable form of a frame-order value.
+
+    Mixed or missing values must not raise mid-sort, so anything non-numeric is
+    ordered after the numbers rather than compared against them. Ties are broken
+    by row index at the call site, which keeps the sort stable and predictable.
+    """
+    if isinstance(value, (int, float, bool)):
+        return (0, float(value))
+    return (1, 0.0)
+
+
+# ---------------------------------------------------------------------------
 # Sibling metadata parquet
 # ---------------------------------------------------------------------------
 
@@ -708,6 +1060,486 @@ def dump(obj, info: dict, path: Path, want_sibling: bool,
 
 
 # ---------------------------------------------------------------------------
+# Images tab
+# ---------------------------------------------------------------------------
+
+class ImagePane:
+    """
+    Paginated per-transit crop viewer, in the style of browse_images.py.
+
+    One row per transit, _ROWS_PER_PAGE rows per page, each row a horizontally
+    scrollable strip of that transit's crops in frame order. Where browse_images
+    reads a transit's frames from its own HDF5 group, here the grouping comes from
+    the sibling parquet and the pixels are seeked out of the .pt storage blob, so
+    only the crops actually on screen are ever read.
+
+    Falls back to paginating raw tensor rows when there is no usable sibling: the
+    tensor is still viewable, just without transit labels.
+    """
+
+    _ROWS       = _ROWS_PER_PAGE
+    _FH         = _FRAME_HEIGHT
+    _LABEL_FONT = ('TkDefaultFont', 10)
+    _NAV_FONT   = ('TkDefaultFont', 11)
+    _NAV_FONT_B = ('TkDefaultFont', 11, 'bold')
+    _BG         = '#f0f0f0'
+
+    def __init__(self, parent: tk.Frame):
+        self._frame = tk.Frame(parent)
+
+        self._reader: CropReader | None = None
+        self._index: TransitIndex | None = None
+        self._tensor_key = ''
+        self._channel = 0
+        self._channels = 1
+        self._note = ''
+        # Per-tensor page memory, so switching tensors and back keeps position.
+        self._pages: dict[str, int] = {}
+        # PhotoImage objects must be referenced or Tk garbage-collects them and
+        # draws blank labels.
+        self._photo_refs: list = []
+        self._tensor_keys: list[str] = []
+        self._on_pick_tensor = None
+
+        self._build_ui()
+
+    @property
+    def widget(self) -> tk.Frame:
+        return self._frame
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        top = tk.Frame(self._frame)
+        top.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Label(top, text='Tensor:', font=self._NAV_FONT).pack(side=tk.LEFT)
+        self._tensor_var = tk.StringVar()
+        self._tensor_cb = ttk.Combobox(top, textvariable=self._tensor_var,
+                                       state='readonly', width=14,
+                                       font=self._NAV_FONT)
+        self._tensor_cb.pack(side=tk.LEFT, padx=(6, 12))
+        self._tensor_cb.bind('<<ComboboxSelected>>', self._on_tensor_change)
+
+        # Only shown for a multi-channel stack; a 1-channel crop cache has no
+        # choice to offer and the control would be noise.
+        self._channel_label = tk.Label(top, text='Channel:', font=self._NAV_FONT)
+        self._channel_var = tk.StringVar(value='0')
+        self._channel_cb = ttk.Combobox(top, textvariable=self._channel_var,
+                                        state='readonly', width=4,
+                                        font=self._NAV_FONT)
+        self._channel_cb.bind('<<ComboboxSelected>>', self._on_channel_change)
+
+        self._info_label = tk.Label(top, text='', font=self._NAV_FONT, anchor='w')
+        self._info_label.pack(side=tk.LEFT)
+
+        # Rows live in a scrollable column: five strips of tall crops overflow a
+        # short pane, and the tab shares its height with the tree.
+        body = tk.Frame(self._frame, bg=self._BG)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        self._vcanvas = tk.Canvas(body, bg=self._BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(body, orient=tk.VERTICAL,
+                            command=self._vcanvas.yview)
+        self._vcanvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._vcanvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._rows_host = tk.Frame(self._vcanvas, bg=self._BG)
+        self._host_id = self._vcanvas.create_window((0, 0), window=self._rows_host,
+                                                    anchor='nw')
+        self._rows_host.bind(
+            '<Configure>',
+            lambda e: self._vcanvas.configure(
+                scrollregion=self._vcanvas.bbox('all')))
+        self._vcanvas.bind(
+            '<Configure>',
+            lambda e: self._vcanvas.itemconfig(self._host_id, width=e.width))
+
+        self._row_widgets = [self._make_row(self._rows_host)
+                             for _ in range(self._ROWS)]
+
+        # Shown instead of the rows when there is nothing to display.
+        self._empty_label = tk.Label(self._frame, text='', fg='#555',
+                                     font=self._NAV_FONT, justify=tk.LEFT,
+                                     wraplength=520)
+
+        bot = tk.Frame(self._frame)
+        bot.pack(fill=tk.X, pady=(4, 0))
+        self._nav_frame = bot
+        self._prev_btn = tk.Button(bot, text='← Prev', font=self._NAV_FONT_B,
+                                   width=9, command=self._prev)
+        self._prev_btn.pack(side=tk.LEFT)
+        self._next_btn = tk.Button(bot, text='Next →', font=self._NAV_FONT_B,
+                                   width=9, command=self._next)
+        self._next_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._nav_label = tk.Label(bot, text='', font=self._NAV_FONT)
+        self._nav_label.pack(side=tk.LEFT, padx=16)
+        # Its own full-width line: sharing the nav row clipped it, and how the
+        # rows were grouped is the caption a strip needs to be read correctly.
+        self._note_label = tk.Label(self._frame, text='', font=self._LABEL_FONT,
+                                    fg='#666', anchor='w')
+        self._note_label.pack(fill=tk.X)
+
+    def _make_row(self, parent: tk.Frame) -> dict:
+        """Build one transit row: a fixed label column plus a scrolling strip."""
+        bg = self._BG
+        row = tk.Frame(parent, bg=bg, relief=tk.GROOVE, bd=1)
+        row.pack(fill=tk.X, pady=3, padx=2)
+
+        side = tk.Frame(row, bg=bg)
+        side.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 4))
+        lbl = tk.Label(side, text='', width=18, anchor='w',
+                       font=('TkDefaultFont', 10, 'bold'), bg=bg)
+        lbl.pack(anchor='w')
+        # wraplength keeps a long experiment/sample qualifier inside the column
+        # instead of pushing the strip off the pane.
+        sub = tk.Label(side, text='', width=18, anchor='w',
+                       font=self._LABEL_FONT, fg='#555', bg=bg,
+                       justify=tk.LEFT, wraplength=130)
+        sub.pack(anchor='w')
+
+        canvas = tk.Canvas(row, height=self._FH + 20, bg=bg,
+                           highlightthickness=0)
+        scroll = tk.Scrollbar(row, orient=tk.HORIZONTAL, command=canvas.xview)
+        canvas.configure(xscrollcommand=scroll.set)
+        scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        inner = tk.Frame(canvas, bg=bg)
+        win = canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>',
+                   lambda e, c=canvas: c.configure(scrollregion=c.bbox('all')))
+        canvas.bind('<Configure>',
+                    lambda e, c=canvas, w=win: c.itemconfig(w, height=e.height))
+        # The strip scrolls horizontally under the wheel, which is what a row of
+        # frames wants; the page itself scrolls with the scrollbar.
+        for widget in (canvas, inner):
+            widget.bind('<MouseWheel>',
+                        lambda e, c=canvas: c.xview_scroll(
+                            -1 * (e.delta // 120), 'units'))
+
+        return {'row': row, 'label': lbl, 'sub': sub,
+                'canvas': canvas, 'inner': inner}
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    def set_source(self, pt_path: Path, obj, want_sibling: bool):
+        """Point the pane at a file, choosing the first viewable tensor."""
+        self.close()
+        self._pages.clear()
+        self._pt_path = pt_path
+        self._obj = obj
+        self._want_sibling = want_sibling
+        self._viewable = dict(viewable_tensors(obj))
+        self._tensor_keys = list(self._viewable)
+
+        self._tensor_cb.config(values=self._tensor_keys)
+        if not self._tensor_keys:
+            self._tensor_var.set('')
+            self._tensor_cb.config(state=tk.DISABLED)
+            self._show_empty(self._no_tensor_reason())
+            return
+        self._tensor_cb.config(state='readonly')
+        # bf_u8 is the crop cache's primary stack, so prefer it when present.
+        first = next((k for k in _PRIMARY_KEYS if k in self._viewable),
+                     self._tensor_keys[0])
+        self._tensor_var.set(first)
+        self._load_tensor(first)
+
+    def _no_tensor_reason(self) -> str:
+        """Why nothing can be shown, specific enough to act on."""
+        if np is None or Image is None:
+            missing = [n for n, m in (('numpy', np), ('Pillow', Image))
+                       if m is None]
+            return (f'The image viewer needs {" and ".join(missing)}, which '
+                    f'{"is" if len(missing) == 1 else "are"} not installed in '
+                    f'this environment.')
+        if not isinstance(self._obj, dict):
+            return (f'This file holds a {type(self._obj).__name__} at the top '
+                    f'level, not a dict of tensors, so there is no crop stack '
+                    f'to display.')
+
+        tensors = [(k, v) for k, v in self._obj.items()
+                   if isinstance(v, _TensorInfo)]
+        if not tensors:
+            return 'This file holds no top-level tensors.'
+
+        # Say which requirement each tensor failed rather than a bare "nothing to
+        # show": on a model checkpoint the answer is simply that weights are not
+        # images, and that is worth stating.
+        bits = []
+        for key, info in tensors[:8]:
+            shape = tuple(int(d) for d in info.shape)
+            if len(shape) not in (3, 4):
+                why = f'rank {len(shape)} is not an image stack'
+            elif info.dtype not in _VIEWABLE_DTYPES:
+                why = f'dtype {info.dtype} is not displayable'
+            elif info.storage is None:
+                why = 'has no storage'
+            elif info.storage.storage_class not in _STORAGE_NUMPY:
+                why = f'{info.storage.storage_class} has no numpy equivalent'
+            elif not info.contiguous or info.offset:
+                why = 'is not a contiguous, zero-offset buffer'
+            elif info.storage.numel != info.numel:
+                why = 'is a view into a larger storage'
+            else:
+                why = 'cannot be read'
+            bits.append(f'  {key}  {shape}  —  {why}')
+        more = ('\n  ...' if len(tensors) > 8 else '')
+        return ('No tensor in this file can be displayed as an image stack:\n'
+                + '\n'.join(bits) + more)
+
+    def _load_tensor(self, key: str):
+        """Open a reader for one tensor and build its transit index."""
+        self._close_reader()
+        info = self._viewable.get(key)
+        if info is None:
+            self._show_empty(self._no_tensor_reason())
+            return
+
+        self._tensor_key = key
+        try:
+            self._reader = CropReader(self._pt_path, info)
+        except Exception as exc:
+            self._show_empty(f'Cannot read {key} from {self._pt_path.name}:\n'
+                             f'  {exc}')
+            return
+
+        shape = tuple(int(d) for d in info.shape)
+        self._channels = shape[1] if len(shape) == 4 else 1
+        self._channel = 0
+        if self._channels > 1:
+            self._channel_cb.config(
+                values=[str(i) for i in range(self._channels)])
+            self._channel_var.set('0')
+            self._channel_label.pack(side=tk.LEFT, before=self._info_label)
+            self._channel_cb.pack(side=tk.LEFT, padx=(6, 12),
+                                  before=self._info_label)
+        else:
+            self._channel_label.pack_forget()
+            self._channel_cb.pack_forget()
+
+        self._index, self._note = None, ''
+        sib = sibling_path(self._pt_path) if self._want_sibling else None
+        if sib is not None:
+            self._index, self._note = TransitIndex.build(sib, self._reader.n)
+            if self._index is None:
+                self._note = f'ungrouped: {self._note}'
+        elif self._want_sibling:
+            self._note = ('ungrouped: no '
+                          f'{self._pt_path.stem}_metadata.parquet beside this file')
+        else:
+            self._note = 'ungrouped: --no-sibling was given'
+
+        self._show_page()
+
+    # ------------------------------------------------------------------
+    # Paging
+    # ------------------------------------------------------------------
+
+    @property
+    def _page(self) -> int:
+        return self._pages.get(self._tensor_key, 0)
+
+    @_page.setter
+    def _page(self, value: int):
+        self._pages[self._tensor_key] = value
+
+    def _n_units(self) -> int:
+        """Rows on the page's axis: transits when grouped, crop-chunks when not."""
+        if self._reader is None:
+            return 0
+        if self._index is not None:
+            return len(self._index)
+        return (self._reader.n + _RAW_PER_ROW - 1) // _RAW_PER_ROW
+
+    def _max_page(self) -> int:
+        return max(0, (self._n_units() - 1) // self._ROWS)
+
+    def _unit(self, i: int) -> tuple[str, str, list[int]]:
+        """
+        (label, sublabel, tensor rows) for one display row.
+
+        A concatenated cache's labels are qualified with experiment and sample, so
+        the transit goes on the bold line and its qualifier underneath — the label
+        column is too narrow to show the whole path on one line. Only the last
+        qualifier segment (the sample) is shown, because the experiment is
+        identical down the whole page and the full path is one hover away in the
+        Details tab.
+        """
+        if self._index is not None:
+            full = self._index.labels[i]
+            rows = self._index.rows[i]
+            parts = full.split('/')
+            sub = f'{len(rows)} frame(s)'
+            if len(parts) > 1:
+                sub = f'{parts[-2]}\n{sub}'
+            return parts[-1], sub, rows
+        start = i * _RAW_PER_ROW
+        end = min(start + _RAW_PER_ROW, self._reader.n)
+        return (f'rows {start:,}–', f'{end - 1:,}\n{end - start} crop(s)',
+                list(range(start, end)))
+
+    def _show_empty(self, message: str):
+        """Hide the rows and explain why, without tearing down the pane."""
+        self._photo_refs.clear()
+        self._reader = None
+        self._index = None
+        self._vcanvas.master.pack_forget()
+        # before= keeps the message above the nav row rather than below it, since
+        # the nav row was packed first.
+        self._empty_label.pack(fill=tk.BOTH, expand=True, padx=12, pady=12,
+                               before=self._nav_frame)
+        self._empty_label.config(text=message)
+        self._info_label.config(text='')
+        self._nav_label.config(text='')
+        self._note_label.config(text='')
+        self._prev_btn.config(state=tk.DISABLED)
+        self._next_btn.config(state=tk.DISABLED)
+
+    def _show_page(self):
+        if self._reader is None:
+            return
+        # Restore the row area if an earlier file had nothing to show.
+        self._empty_label.pack_forget()
+        if not self._vcanvas.master.winfo_ismapped():
+            self._vcanvas.master.pack(fill=tk.BOTH, expand=True,
+                                      before=self._nav_frame)
+
+        self._photo_refs.clear()
+        n_units = self._n_units()
+        self._page = min(self._page, self._max_page())
+        start = self._page * self._ROWS
+        end = min(start + self._ROWS, n_units)
+
+        unit_name = 'transit' if self._index is not None else 'block'
+        self._info_label.config(
+            text=f'{self._tensor_key}   {self._reader.n:,} crops   '
+                 f'{n_units:,} {unit_name}(s)   '
+                 f'{"×".join(str(d) for d in self._reader.frame_shape)}')
+        self._nav_label.config(
+            text=f'Page {self._page + 1} / {self._max_page() + 1}'
+                 f'   ({unit_name}s {start + 1:,}–{end:,})')
+        self._note_label.config(text=self._note)
+        self._prev_btn.config(
+            state=tk.NORMAL if self._page > 0 else tk.DISABLED)
+        self._next_btn.config(
+            state=tk.NORMAL if self._page < self._max_page() else tk.DISABLED)
+
+        for i, rw in enumerate(self._row_widgets):
+            for child in rw['inner'].winfo_children():
+                child.destroy()
+            if start + i >= end:
+                rw['label'].config(text='')
+                rw['sub'].config(text='')
+                rw['row'].pack_forget()
+                continue
+            rw['row'].pack(fill=tk.X, pady=3, padx=2)
+            label, sub, rows = self._unit(start + i)
+            rw['label'].config(text=label)
+            rw['sub'].config(text=sub)
+            self._fill_strip(rw['inner'], rows)
+            rw['canvas'].xview_moveto(0)
+
+    def _fill_strip(self, inner: tk.Frame, rows: list[int]):
+        """Render one transit's crops left to right."""
+        h, w = self._reader.frame_shape
+        dh = self._FH
+        dw = max(1, round(w / h * dh)) if h else dh
+
+        shown = rows[:_MAX_STRIP]
+        for row in shown:
+            cell = tk.Frame(inner, bg=self._BG)
+            cell.pack(side=tk.LEFT, padx=2, pady=(2, 0))
+            try:
+                frame = self._reader.read(row, self._channel)
+                # NEAREST keeps 32x32 crops readable as pixels; a smooth filter
+                # would invent detail that isn't in the data.
+                photo = ImageTk.PhotoImage(
+                    Image.fromarray(frame, mode='L').resize((dw, dh),
+                                                            Image.NEAREST))
+                self._photo_refs.append(photo)
+                tk.Label(cell, image=photo, bg=self._BG, relief=tk.SOLID,
+                         bd=1).pack()
+            except Exception as exc:
+                tk.Label(cell, text='(err)', fg='#b00', bg=self._BG,
+                         font=self._LABEL_FONT, width=5,
+                         relief=tk.SOLID, bd=1).pack()
+                tk.Label(cell, text=str(exc)[:12], fg='#b00', bg=self._BG,
+                         font=('TkDefaultFont', 7)).pack()
+                continue
+            tk.Label(cell, text=self._caption(row), bg=self._BG, fg='#444',
+                     font=('TkDefaultFont', 7)).pack()
+
+        if len(rows) > len(shown):
+            tk.Label(inner, text=f'+{len(rows) - len(shown):,} more',
+                     bg=self._BG, fg='#666', font=self._LABEL_FONT).pack(
+                side=tk.LEFT, padx=8)
+
+    def _caption(self, row: int) -> str:
+        """
+        The line under one crop: its tensor row, plus a per-row metadata value.
+
+        classification is the column worth surfacing per frame — it is what marks
+        a crop as a usable cell — so it is appended when the sibling has it.
+        """
+        text = str(row)
+        if self._index is not None:
+            values = self._index.detail.get('classification')
+            if values is not None and row < len(values) and values[row] is not None:
+                text += f' c{values[row]}'
+        return text
+
+    def _prev(self):
+        if self._page > 0:
+            self._page -= 1
+            self._show_page()
+
+    def _next(self):
+        if self._page < self._max_page():
+            self._page += 1
+            self._show_page()
+
+    def _on_tensor_change(self, _event=None):
+        key = self._tensor_var.get()
+        if key and key != self._tensor_key:
+            self._load_tensor(key)
+
+    def _on_channel_change(self, _event=None):
+        try:
+            channel = int(self._channel_var.get())
+        except ValueError:
+            return
+        if channel != self._channel:
+            self._channel = channel
+            self._show_page()
+
+    def select_tensor(self, key: str) -> bool:
+        """Switch to a tensor by name; False if it isn't viewable."""
+        if key not in getattr(self, '_viewable', {}):
+            return False
+        if key != self._tensor_key:
+            self._tensor_var.set(key)
+            self._load_tensor(key)
+        return True
+
+    def _close_reader(self):
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
+    def close(self):
+        """Release the archive handle. Safe to call more than once."""
+        self._close_reader()
+        self._photo_refs.clear()
+
+
+# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 
@@ -731,12 +1563,24 @@ class BrowsePtApp:
         self._nodes: dict[str, object] = {}
         # Item id -> dotted key path, for Copy key.
         self._keys: dict[str, str] = {}
+        # The Images tab opens the archive and reads the sibling, so that work is
+        # deferred until the tab is actually looked at.
+        self._images: ImagePane | None = None
+        self._images_loaded = False
 
         root.title(f'browse_pt - {path.name}')
-        root.geometry('1200x800')
+        root.geometry('1500x850')
 
         self._build_ui()
         self._populate()
+        # Releasing the archive handle on close matters on Windows, where an open
+        # handle keeps the file locked against other tools.
+        root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    def _on_close(self):
+        if self._images is not None:
+            self._images.close()
+        self._root.destroy()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -763,6 +1607,11 @@ class BrowsePtApp:
             side=tk.RIGHT, padx=(6, 0))
         tk.Button(top, text='Copy key', command=self._copy_key).pack(
             side=tk.RIGHT, padx=(6, 0))
+        self._img_btn = tk.Button(top, text='View images',
+                                  command=self._view_images)
+        self._img_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        if not viewable_tensors(self._obj) or np is None or Image is None:
+            self._img_btn.config(state=tk.DISABLED)
         self._sib_btn = tk.Button(top, text='Open metadata parquet',
                                   command=self._open_sibling)
         self._sib_btn.pack(side=tk.RIGHT, padx=(6, 0))
@@ -777,7 +1626,44 @@ class BrowsePtApp:
         split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
 
         split.add(self._build_tree_pane(split), weight=3)
-        split.add(self._build_details_pane(split), weight=2)
+        # Weighted toward the right so a strip of crops has room; the tree's
+        # columns are fixed-width and the divider is draggable either way.
+        split.add(self._build_right_pane(split), weight=5)
+
+    def _build_right_pane(self, parent) -> ttk.Notebook:
+        """
+        Details and Images as tabs.
+
+        A notebook rather than a second window: the tree stays visible, so
+        selecting a tensor and flipping to its crops is one click, and there is
+        only one window to manage.
+        """
+        book = ttk.Notebook(parent)
+        book.add(self._build_details_pane(book), text='Details')
+
+        self._images = ImagePane(book)
+        book.add(self._images.widget, text='Images')
+        self._book = book
+        book.bind('<<NotebookTabChanged>>', self._on_tab_change)
+        return book
+
+    def _on_tab_change(self, _event=None):
+        """
+        Load the Images tab the first time it is opened.
+
+        Deferred because it opens the archive and reads the sibling parquet, which
+        should not be paid by someone who only wants the structure tree.
+        """
+        if self._book.index('current') != 1 or self._images_loaded:
+            return
+        self._images_loaded = True
+        self._images.set_source(self._path, self._obj, self._want_sibling)
+        # If a tensor was already selected in the tree, show that one.
+        sel = self._tree.selection()
+        if sel:
+            key = self._keys.get(sel[0], '')
+            if key and '.' not in key:
+                self._images.select_tensor(key)
 
     def _build_tree_pane(self, parent) -> tk.Frame:
         frame = tk.Frame(parent)
@@ -962,6 +1848,15 @@ class BrowsePtApp:
         self._root.clipboard_clear()
         self._root.clipboard_append(key)
 
+    def _view_images(self):
+        """Switch to the Images tab, on the selected tensor when there is one."""
+        sel = self._tree.selection()
+        key = self._keys.get(sel[0], '') if sel else ''
+        # Tab change triggers the deferred load, so select the tab first.
+        self._book.select(1)
+        if key and '.' not in key and self._images is not None:
+            self._images.select_tensor(key)
+
     def _open_sibling(self):
         """Launch browse_parquet.py on the sibling metadata file."""
         sib = sibling_path(self._path)
@@ -992,6 +1887,11 @@ class BrowsePtApp:
 
         self._path, self._obj, self._info = path, obj, info
         self._root.title(f'browse_pt - {path.name}')
+        # Release the previous file's archive handle before its widgets go away.
+        if self._images is not None:
+            self._images.close()
+            self._images = None
+        self._images_loaded = False
         # Rebuild the whole UI so the header, sibling button and panes all match
         # the new file.
         for child in self._root.winfo_children():

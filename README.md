@@ -37,13 +37,15 @@ This installs Python 3.12 plus `numpy`, `scipy`, `pandas`, `openpyxl`, `matplotl
 >   conda (preferred on Windows: `conda install -n biophys_helpers pytables`) rather than pip.
 > - **SciPy** is used by the SMR/FXM cross-correlation pairing
 >   (`pair_smr_volumes.py` / `bulk_pair_smr_volumes.py`).
-> - **Pillow** (`PIL`) is required by `browse_experiment.py` for image display.
+> - **Pillow** (`PIL`) is required by `browse_experiment.py` for image display, and by the
+>   Images tab in `browse_pt.py`, which renders crops decoded straight from a `.pt` blob.
 > - **pyarrow** is the Parquet reader behind `browse_parquet.py`, and is also what
 >   `browse_pt.py` uses to read the sibling metadata parquet next to a crop cache. Like
 >   `openpyxl`, pandas treats it as an optional extra, so it must be installed explicitly.
 > - **No PyTorch is needed** to inspect `.pt` files. `browse_pt.py` parses the zip
 >   archive and stubs the pickle, recovering every tensor shape, dtype and device without
->   a ~2 GB `torch` install and without reading any tensor data.
+>   a ~2 GB `torch` install and without reading any tensor data. Its Images tab reads crop
+>   pixels the same way, by seeking into the raw storage blob.
 > - The GUI tools (`crop_smr_timeseries`, `gate_*`, `pair_bm_runs`,
 >   `annotate_coulter_samples`, `browse_experiment`, `browse_h5`, `browse_parquet`,
 >   `browse_pt`) require a display — except `browse_h5.py`, `browse_parquet.py` and
@@ -80,15 +82,17 @@ iFXM images  ──> (FXM software) ──────────────�
         └─> calculate_baseline_density.py ──> *_baseline_density.csv  (absolute-density offset)
                                        │
                                        ▼
-                        compile_experiment.py ──> *_compiled/{experiment_data.xlsx, images.h5}
-                                       │
+                        compile_experiment.py ──> *_compiled/{experiment_data.xlsx,
+                                       │                      concat_vqvae_cache.pt + .parquet}
                                        ▼
                            browse_experiment.py  (interactive viewer)
 
 VQ-VAE crop caches: *_imaging_fxm_results/stage2_analysis/*_vqvae_cache.pt (+ _metadata.parquet)
                                        │
-                                       └─> concat_vqvae_caches.py ──> *_vqvae_concat/  (one merged
-                                                                       .pt + .parquet for training)
+                                       ├─> concat_vqvae_caches.py ──> *_vqvae_concat/  (one merged
+                                       │                               .pt + .parquet for training)
+                                       └─> compile_experiment.py  (same merge, one experiment,
+                                                                   into its *_compiled/ dir)
 
 Housekeeping: prune_timestamped_subdirs.py
 ```
@@ -658,17 +662,24 @@ python annotate_coulter_samples.py "E:/data/coulter-processed/my_experiment_sc_v
 ### `compile_experiment.py`  · _batch_
 
 Automatically discovers and compiles **all** per-sample data for an experiment into a
-pair of HDF5 files. Given a superdir, it walks each sample subdir, finds every known data
-type (BM mass, iFXM volume, pairing, gating, images), loads them, and writes structured
-output. Most-recent is used if multiple of a type exist.
+shareable Excel workbook plus a concatenated VQ-VAE crop cache. Given a superdir, it walks
+each sample subdir, finds every known data type (BM mass, iFXM volume, pairing, gating,
+crops), loads them, and writes structured output. Most-recent is used if multiple of a
+type exist.
+
+> **Images now come from the crop cache only.** Earlier versions also wrote an `images.h5`
+> of full per-transit BF frames read from each sample's stage-1 CELLGROUPED file. That
+> output is gone, along with `--no-images`, so the field of view *outside* each crop is no
+> longer compiled and only samples with a stage-2 cache carry pixels at all. Inspect the
+> crops with [`browse_pt.py`](browse_pt.py). [`browse_images.py`](browse_images.py) reads
+> `images.h5` and so no longer has an input this script produces.
 
 **Recognised sub-subdir types** (all optional)
 
 ```
 *_mass_results          mass CSV with mass_pg column
 *_imaging_fxm_results   stage2_analysis/*_ProcessedVolumes.csv;
-                        stage1_image_processing/*_CELLGROUPED.hdf5;
-                        stage2_analysis/*_Hdf5PathIndex.csv
+                        stage2_analysis/*_vqvae_cache.pt (+ _metadata.parquet)
 *_pairing_results       *_PairedSMRVolumes.csv
 *_bm_gating             YAML with lower/upper thresholds
 *_ifxm-vol_gating       YAML with lower/upper thresholds
@@ -683,21 +694,59 @@ experiment_data.xlsx  (Excel workbook — shareable, no HDF5 tooling needed)
   <one sheet per sample> three side-by-side blocks, one blank spacer column
                          between them, single header row, columns prefixed so
                          they split back apart in code (df.filter(like='vol_')):
-                           VOLUME (vol_)   every FXM cell: volume_au, volume_fL
+                           VOLUME (vol_)   every FXM cell: volume_au
                            MASS   (mass_)  every SMR cell: mass_pg
                            PAIRED (pair_)  matched cells: mass_pg, volume_au,
-                                           volume_fL, buoyant_density
+                                           buoyant_density
                          buoyant_density is RELATIVE (add the experiment
                          baseline for absolute g/mL)
   README sheet           units, block meaning, and a pandas read recipe
 
-images.h5            (h5py)
-  /{safe_name}/{transit_idx:05d}/bf   (n_frames, H, W) uint8
-  /{safe_name}/{transit_idx:05d}/fl   (n_frames, H, W) uint16
+concat_vqvae_cache.pt                every discovered sample's stage-2 crop cache,
+concat_vqvae_cache_metadata.parquet  concatenated along axis 0 (see below)
 ```
 
 > The `buoyant_density` column is **relative**. Add the per-sample offset from
 > `calculate_baseline_density.py` to get absolute density in g/mL.
+
+**Coulter association (`--coulter`)**
+
+Passing a Coulter CSV adds a `coulter_col` picker to the annotation GUI, letting you record
+which Coulter column each sample corresponds to. Only the CSV's **column names** are read;
+the value is carried through to the metadata sheet's `coulter_column` field as a label and
+nothing is computed from it. Assignment is optional — leave rows blank and Done still works.
+
+> **No volume calibration.** Volume is written once, as `volume_au` in raw FXM arbitrary
+> units. Earlier versions followed the association with a per-sample calibration window that
+> percentile-matched against the Coulter distribution to fit a `vol_au → fL` factor, wrote a
+> second `volume_fL` column beside the raw value, recorded a `calibration_factor` in the
+> metadata sheet, and emitted a `calibration_plots/` directory. All of that is gone: there
+> is one volume column, unscaled.
+
+**VQ-VAE crop caches**
+
+Every sample that has a stage-2 `*_vqvae_cache.pt` is merged into a single `.pt` +
+`.parquet` pair beside the workbook, by importing
+[`concat_vqvae_caches.py`](concat_vqvae_caches.py) rather than shelling out to it — so the
+pair is byte-identical to what running that script over the same superdir produces, and
+carries the same `experiment` / `sample_name` / `cache_row` columns. The merge streams
+blobs a chunk at a time, so it is flat in memory no matter how large the caches are, but
+the output can still be many gigabytes; `--no-vqvae` skips it.
+
+Which samples made it in is recorded in the metadata sheet's `has_vqvae` column, and the
+README sheet gains a read recipe. Join the parquet back to the workbook on `sample_name`,
+then use `cache_row` to index axis 0 of the tensors:
+
+```python
+md   = pq.read_table('concat_vqvae_cache_metadata.parquet').to_pandas()
+bf   = torch.load('concat_vqvae_cache.pt', mmap=True)['bf_u8']
+rows = md[md.sample_name == 'sampleA'].cache_row.values
+crops = bf[rows]          # (n, 1, S, S) uint8
+```
+
+A cache whose parquet row count disagrees with its tensor `N` is excluded from the merge
+(and reported) rather than corrupting the output; the workbook is written regardless, so a
+crop-cache problem never costs you the compilation.
 
 **Usage**
 
@@ -708,11 +757,16 @@ python compile_experiment.py <superdir>
 | Argument | Description |
 |---|---|
 | `superdir` | Path to the experiment superdir containing sample subdirs |
+| `--coulter CSV` | Coulter Counter CSV; adds a per-sample Coulter-column picker to the annotation GUI (label only, no calibration) |
+| `--no-vqvae` | Skip the concatenated crop-cache pair — workbook only |
 
 **Example**
 
 ```bash
 python compile_experiment.py "E:/data/2026-05-22_tcell_act"
+
+# Workbook only — no crop caches
+python compile_experiment.py "E:/data/2026-05-22_tcell_act" --no-vqvae
 ```
 
 ---
@@ -722,6 +776,11 @@ python compile_experiment.py "E:/data/2026-05-22_tcell_act"
 Concatenates the stage-2 VQ-VAE crop caches of many experiments into one `.pt` plus one
 `.parquet`, so a model can be trained on every experiment at once while each crop stays
 traceable to where it came from.
+
+> For a **single** experiment you usually do not need to run this directly:
+> [`compile_experiment.py`](compile_experiment.py) imports this module and writes the same
+> pair into its `*_compiled/` output dir. Reach for this script when merging across
+> superdirs, or when you want the caches without a full compilation.
 
 A crop cache is a pair: `<sample>_vqvae_cache.pt` holding `bf_u8` (and `fl_u8` when
 fluorescence export is on) as `uint8 (N, 1, S, S)`, and `<sample>_vqvae_cache_metadata.parquet`
@@ -804,6 +863,11 @@ panel. Up to 3 transit panels stack at the bottom (FIFO eviction of the oldest).
 
 > Requires **Pillow** (`PIL`) for image display — see Installation notes.
 
+> **Out of sync with the current compiler.** This viewer reads `experiment_data.h5` and
+> `images.h5`; `compile_experiment.py` now writes `experiment_data.xlsx` and a crop-cache
+> `.pt`/`.parquet` pair instead, so it only opens older `*_compiled/` directories. Use
+> [`browse_pt.py`](browse_pt.py) for crops from a current compilation.
+
 **Usage**
 
 ```
@@ -812,7 +876,7 @@ python browse_experiment.py <compiled_dir>
 
 | Argument | Description |
 |---|---|
-| `compiled_dir` | Path to a `*_compiled/` directory containing `experiment_data.h5` and (optionally) `images.h5` |
+| `compiled_dir` | Path to a `*_compiled/` directory containing `experiment_data.h5` and (optionally) `images.h5` — i.e. one written before those outputs were dropped |
 
 **Example**
 
@@ -859,7 +923,7 @@ python browse_h5.py [<h5_path>] [--raw] [--dump]
 python browse_h5.py "E:/data/2026-05-22_tcell_act/20260611_235527_paired/data.h5"
 
 # Print the structure to the terminal (no display needed)
-python browse_h5.py --dump "E:/data/2026-05-22_tcell_act/20260611_235527_compiled/images.h5"
+python browse_h5.py --dump "E:/data/2026-05-22_tcell_act/sample_01/20260611_235527_imaging_fxm_results/stage1_image_processing/sample_01_CELLGROUPED.hdf5"
 ```
 
 > Opens files read-only with HDF5 file locking disabled, so a file that is open
@@ -918,7 +982,7 @@ Structure browser for PyTorch `.pt` / `.pth` files, written for the VQ-VAE crop 
 that stage 2 of the ImageFXMAnalysis pipeline emits. Reports the dimensions, dtype, device,
 strides and contiguity of every tensor in the file, and reads 4-D and 3-D shapes as image
 stacks — spelling out frames / channels / height / width rather than leaving you to
-interpret a bare tuple.
+interpret a bare tuple. An **Images** tab renders the crops themselves, one row per transit.
 
 A crop cache holds **only image tensors**: `bf_u8` always, and `fl_u8` when fluorescence
 export is enabled, both `uint8` of shape `(N, 1, S, S)`. All per-crop metadata deliberately
@@ -935,6 +999,36 @@ classes recovers the full structure without loading a single byte of tensor data
 also means nothing in the file is ever resolved to real code, so opening an untrusted
 checkpoint cannot execute anything.
 
+#### Images tab
+
+An **Images** tab beside the details pane shows the crops themselves, one row per transit
+in the style of [`browse_images.py`](browse_images.py): each row is a horizontally
+scrollable strip of that transit's frames, five transits per page, with each crop captioned
+by its tensor row and `classification`. `View images` jumps straight there on the selected
+tensor.
+
+Where `browse_images.py` reads a transit's frames from its own HDF5 group, a crop cache is
+a **flat** `(N, 1, S, S)` stack with no such structure — the grouping comes from the sibling
+parquet's `cell_group` column (or `transit_index`), and a transit's rows are **not
+contiguous**: transits overlap in time and the exporter writes in frame order, so two cells
+sharing frames interleave their rows. Rows are therefore gathered by key and sorted by
+`frame_idx`, never sliced from a range. A cache merged by
+[`concat_vqvae_caches.py`](concat_vqvae_caches.py) is additionally grouped within
+`experiment` / `sample_name`, since transit labels repeat across samples.
+
+Pixels come out of the storage blob by **seeking to the rows a page needs** — `torch.save`
+stores each tensor's buffer as one uncompressed zip entry, so row *i* sits at a known
+offset. A page costs one seek per crop shown rather than a load of the whole tensor, which
+is what keeps paging a multi-gigabyte cache instant and flat in memory, still without
+`torch`. Non-`uint8` tensors are min-max normalised per crop; a multi-channel stack gets a
+channel selector.
+
+When there is no usable transit grouping — no sibling, `--no-sibling`, a sibling whose row
+count disagrees with `N`, or one with no transit column — the tab **falls back to
+paginating raw tensor rows** and says which of those it was, so the crops stay viewable
+without transit labels. Tensors that are not image stacks (a model checkpoint's rank-2
+weights, say) are reported per tensor with the reason each cannot be displayed.
+
 **Usage**
 
 ```
@@ -944,7 +1038,7 @@ python browse_pt.py [<pt_path>] [--no-sibling] [--dump]
 | Argument | Description |
 |---|---|
 | `pt_path` | Path to a `.pt` / `.pth` file. If omitted, a file picker opens. |
-| `--no-sibling` | Skip the sibling metadata-parquet lookup |
+| `--no-sibling` | Skip the sibling metadata-parquet lookup. Also disables transit grouping in the Images tab, which comes from it |
 | `--dump` | Print the structure to stdout and exit; no window is opened. Requires `pt_path` |
 
 **Examples**

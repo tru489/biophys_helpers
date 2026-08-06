@@ -16,10 +16,14 @@ dependencies:
   - hdf5=1.14.5
   - h5py=3.15.1
   - pytables=3.10.2
+  # Pillow and numpy also back the Images tab in browse_pt.py, which decodes crop
+  # bytes straight out of a .pt storage blob and renders them through PhotoImage.
   - pillow
   # Parquet reader for browse_parquet.py, and for the sibling metadata parquet
   # that browse_pt.py reports on. pandas treats it as an optional extra, so it
-  # has to be requested explicitly.
+  # has to be requested explicitly. concat_vqvae_caches.py also writes parquet
+  # through it, which makes it a hard requirement of compile_experiment.py too
+  # (that script imports the concatenator to merge the crop caches).
   #
   # Note there is deliberately no pytorch dependency: browse_pt.py reads .pt
   # files by parsing the zip archive and stubbing the pickle, which recovers

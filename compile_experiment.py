@@ -10,7 +10,7 @@ Recognised sub-subdir types (all optional; most-recent used if multiple exist):
     *_mass_results          — mass CSV with mass_pg column
     *_imaging_fxm_results   — stage2_analysis/*_ProcessedVolumes.csv;
                                stage1_image_processing/*_CELLGROUPED.hdf5;
-                               stage2_analysis/*_Hdf5PathIndex.csv
+                               stage2_analy1sis/*_Hdf5PathIndex.csv
     *_pairing_results       — *_PairedSMRVolumes.csv
     *_bm_gating             — YAML with lower/upper thresholds
     *_ifxm-vol_gating       — YAML with lower/upper thresholds
@@ -20,46 +20,58 @@ Pairing resolution (priority):
     2. ProcessedVolumes rows where matched_mass is not NaN
     3. None — no pairing key written
 
-Optional Coulter calibration (--coulter <csv>):
-    A GUI pairs each sample that has volume data with a Coulter Counter
-    column, then a per-sample calibration window finds a scaling factor
-    (vol_au → fL) by percentile-matching against the Coulter distribution.
-    Calibrated volumes are stored alongside the raw volume data.
+Optional Coulter association (--coulter <csv>):
+    The annotation GUI gains a coulter_col column that associates each sample
+    having volume data with a Coulter Counter column, recorded verbatim in the
+    metadata sheet's coulter_column field. It is a label only: no calibration
+    factor is derived, no Coulter volume is read, and FXM volumes are never
+    rescaled. Leaving rows unassigned is fine.
 
 Output:
-    <superdir>/YYYYMMDD_HHMMSS_compiled/
+    <superdir>/YYYYMMDD.HHMMSS_compiled/
         experiment_data.xlsx — shareable workbook (one sheet per sample)
-        images.h5            — per-transit BF image stacks (h5py)
+        concat_vqvae_cache.pt                  — every discovered sample's stage-2
+        concat_vqvae_cache_metadata.parquet      VQ-VAE crop cache, concatenated
+
+Images are carried by the crop-cache pair alone. Earlier versions also wrote an
+images.h5 of full per-transit BF frames read from the stage-1 CELLGROUPED file;
+that is gone, so the field of view outside each crop is no longer compiled. The
+pair is written by concat_vqvae_caches.py, which is imported rather than shelled
+out to. Every row carries `experiment`, `sample_name` and `cache_row`, so
+`sample_name` joins the parquet back to the metadata sheet and `cache_row`
+indexes axis 0 of the tensors. Samples without a cache are simply absent;
+--no-vqvae skips the pair entirely.
 
 experiment_data.xlsx layout:
     metadata sheet   — one row per sample; sample_name, sheet_name (the sample's
                        worksheet name), hdf5_key, has_* flags, gate bounds,
-                       coulter_column and calibration_factor (when --coulter is
-                       used), plus any custom annotation columns from the GUI.
+                       coulter_column (when --coulter is used), plus any custom
+                       annotation columns from the GUI.
     <one sheet per sample> — three independent, side-by-side blocks separated by
                        a single blank spacer column, with a single header row.
                        Columns are prefixed so the blocks can be split again in
                        code (df.filter(like='vol_') etc.):
-                         VOLUME (vol_)  every FXM cell: transit_index, volume_au,
-                                        volume_fL (when calibrated)
+                         VOLUME (vol_)  every FXM cell: transit_index, volume_au
                          MASS   (mass_) every SMR cell: mass_pg (+ other mass cols)
                          PAIRED (pair_) matched cells: transit_index, mass_pg,
-                                        volume_au, volume_fL, buoyant_density
+                                        volume_au, buoyant_density
                        Blocks are independent distributions (row N of one is
                        unrelated to row N of another). buoyant_density is RELATIVE
                        (add the experiment baseline for absolute g/mL).
     README sheet     — units, block meaning, and a pandas read recipe.
 
-images.h5 key layout:
-    /{safe_name}/{transit_idx:05d}/bf  — (n_frames, H, W) uint8
+Volume is written once, in raw FXM arbitrary units (volume_au). There is no
+second calibrated column: earlier versions ran a per-sample GUI that fitted a
+vol_au -> fL factor against a Coulter distribution and wrote volume_fL beside the
+raw value, and that whole path is gone.
 
-{safe_name} replaces - and . with _ so HDF5 key rules are satisfied.
-The original sample directory name is preserved in the metadata sheet.
+hdf5_key in the metadata sheet replaces - and . with _ so HDF5 key rules are
+satisfied. The original sample directory name is preserved alongside it.
 
 Usage:
     python compile_experiment.py <superdir>
     python compile_experiment.py <superdir> --coulter <coulter_csv>
-    python compile_experiment.py <superdir> --no-images   # skip images.h5
+    python compile_experiment.py <superdir> --no-vqvae    # skip the crop caches
 """
 import argparse
 import re
@@ -67,18 +79,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib
-matplotlib.use('TkAgg')
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import numpy as np
 import pandas as pd
 import tkinter as tk
 from tkinter import messagebox, ttk
-import h5py
 import yaml
 
 from fsutil import is_appledouble
+
+# The VQ-VAE crop-cache concatenator, reused so the pair written here is
+# byte-identical to what `python concat_vqvae_caches.py <superdir>` produces.
+# It imports no torch and no GUI, so this costs nothing at import time.
+import concat_vqvae_caches as cvc
 
 
 # ---------------------------------------------------------------------------
@@ -87,18 +98,21 @@ from fsutil import is_appledouble
 
 def parse_cli_args() -> tuple[Path, Path | None, bool]:
     parser = argparse.ArgumentParser(
-        description="Compile per-sample experiment data into a single HDF5 file."
+        description="Compile per-sample experiment data into a shareable workbook."
     )
     parser.add_argument('superdir', type=str,
                         help='Path to the experiment superdir')
     parser.add_argument('--coulter', type=str, default=None, metavar='CSV',
-                        help='Coulter Counter CSV (columns = sample names, '
-                             'rows = per-cell volumes in fL). Triggers pairing '
-                             'and calibration GUIs.')
-    parser.add_argument('--no-images', action='store_true',
-                        help='Skip writing images.h5 (the per-transit BF image '
-                             'stacks). Compilation is much faster and the output '
-                             'far smaller when images are not needed.')
+                        help='Coulter Counter CSV. Only its column names are '
+                             'used: they populate a picker in the annotation '
+                             'GUI so each sample can be associated with a '
+                             'Coulter column, recorded as a label in the '
+                             'metadata sheet. Volumes are not calibrated.')
+    parser.add_argument('--no-vqvae', action='store_true',
+                        help='Skip the concatenated VQ-VAE crop cache '
+                             '(concat_vqvae_cache.pt + its metadata parquet). '
+                             'The merge streams every sample\'s stage-2 cache, '
+                             'so the output can be many gigabytes.')
     args = parser.parse_args()
     p = Path(args.superdir)
     if not p.is_dir():
@@ -108,7 +122,7 @@ def parse_cli_args() -> tuple[Path, Path | None, bool]:
         coulter_path = Path(args.coulter)
         if not coulter_path.is_file():
             raise FileNotFoundError(f"Coulter file not found: {coulter_path}")
-    return p, coulter_path, not args.no_images
+    return p, coulter_path, not args.no_vqvae
 
 
 # ---------------------------------------------------------------------------
@@ -164,9 +178,12 @@ def _discover_sample(sample_dir: Path) -> dict:
     Locate the relevant file path for each known data type inside sample_dir.
 
     Returns a dict with keys:
-        mass_path, volume_path, pairing_path, bm_gate_path, ifxm_gate_path,
-        hdf5_src_path, hdf5_index_path
+        mass_path, volume_path, pairing_path, bm_gate_path, ifxm_gate_path
     Any key whose source is absent is set to None.
+
+    The stage-1 CELLGROUPED hdf5 and its Hdf5PathIndex.csv are deliberately not
+    looked up: images now come from the stage-2 crop cache alone, which
+    concat_vqvae_caches finds for itself.
     """
     paths = {
         'mass_path':       None,
@@ -174,8 +191,6 @@ def _discover_sample(sample_dir: Path) -> dict:
         'pairing_path':    None,
         'bm_gate_path':    None,
         'ifxm_gate_path':  None,
-        'hdf5_src_path':   None,
-        'hdf5_index_path': None,
     }
 
     # --- mass_results ---
@@ -202,17 +217,6 @@ def _discover_sample(sample_dir: Path) -> dict:
                         and f.name.endswith('_ProcessedVolumes.csv')):
                     paths['volume_path'] = f
                     break
-            idx_files = sorted(f for f in stage2.glob('*_Hdf5PathIndex.csv')
-                               if not is_appledouble(f))
-            if idx_files:
-                paths['hdf5_index_path'] = idx_files[0]
-
-        stage1 = fxm_dir / 'stage1_image_processing'
-        if stage1.is_dir():
-            hdf5_files = sorted(f for f in stage1.glob('*.hdf5')
-                                if not is_appledouble(f))
-            if hdf5_files:
-                paths['hdf5_src_path'] = hdf5_files[0]
 
     # --- pairing_results ---
     pair_dir = _last_matching_dir(sample_dir, re.compile(r'_pairing_results$'))
@@ -243,45 +247,6 @@ def _discover_sample(sample_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Image stack helpers
-# ---------------------------------------------------------------------------
-
-def _pad_stack(frames: list) -> np.ndarray:
-    """Stack a list of 2D arrays; zero-pad to max shape if sizes differ."""
-    if len(set(f.shape for f in frames)) == 1:
-        return np.stack(frames)
-    max_h = max(f.shape[0] for f in frames)
-    max_w = max(f.shape[1] for f in frames)
-    out = np.zeros((len(frames), max_h, max_w), dtype=frames[0].dtype)
-    for i, f in enumerate(frames):
-        out[i, :f.shape[0], :f.shape[1]] = f
-    return out
-
-
-def _save_images_for_sample(hdf5_src: Path, index_csv: Path,
-                             out_grp, sample_name: str) -> int:
-    """
-    Read per-transit BF frames from the CELLGROUPED source and write stacks
-    into out_grp (an open h5py group for this sample).
-
-    Key layout inside out_grp:
-        {transit_idx:05d}/bf  — (n_frames, H, W) uint8
-    """
-    idx_df = pd.read_csv(index_csv)
-    n_transits = idx_df['TransitIndex'].nunique()
-
-    with h5py.File(hdf5_src, 'r') as src:
-        for transit_id, rows in idx_df.groupby('TransitIndex'):
-            bf_frames = [src[p][()] for p in rows['Hdf5PathsBF']]
-            bf_stack  = _pad_stack(bf_frames)
-            key = f'{int(transit_id):05d}'
-            out_grp.create_dataset(f'{key}/bf', data=bf_stack,
-                                   compression='gzip', compression_opts=4)
-
-    return n_transits
-
-
-# ---------------------------------------------------------------------------
 # Per-type loaders
 # ---------------------------------------------------------------------------
 
@@ -296,7 +261,13 @@ def _load_gate(path: Path) -> tuple[float, float] | None:
 
 
 def _load_coulter(path: Path) -> pd.DataFrame:
-    """Load Coulter CSV: columns = sample names, rows = per-cell volumes in fL."""
+    """
+    Load Coulter CSV: columns = sample names, rows = per-cell volumes in fL.
+
+    Only the column names are consumed — they fill the association picker in the
+    annotation GUI. The per-cell volumes are read but unused, since nothing is
+    computed from the Coulter distribution any more.
+    """
     return pd.read_csv(path)
 
 
@@ -342,8 +313,17 @@ def compile_experiment(superdir: Path) -> list[dict]:
             continue
         paths = _discover_sample(sample_dir)
 
-        # Skip dirs that look like output dirs (no recognised data)
-        if all(v is None for v in paths.values()):
+        # The stage-2 VQ-VAE crop cache, if this sample has one. Looked up
+        # through concat_vqvae_caches so the run-directory choice matches what
+        # the standalone script would make. Discovery is metadata-only; the
+        # tensors are not touched until the merge writes them.
+        vqvae_src = cvc._sample_cache(
+            superdir.name, sample_dir,
+            lambda msg: print(f"  [warn] {msg}"))
+
+        # Skip dirs that look like output dirs (no recognised data). A crop
+        # cache counts as data, so a stage-2-only sample is still compiled.
+        if all(v is None for v in paths.values()) and vqvae_src is None:
             continue
 
         name = sample_dir.name
@@ -371,9 +351,6 @@ def compile_experiment(superdir: Path) -> list[dict]:
         ifxm_gate = (_load_gate(paths['ifxm_gate_path'])
                      if paths['ifxm_gate_path'] else None)
 
-        has_images = (paths['hdf5_src_path'] is not None
-                      and paths['hdf5_index_path'] is not None)
-
         def _tick(val, label=''):
             return f'ok({label})' if (val is not None and label) else ('ok' if val is not None else '--')
 
@@ -384,25 +361,24 @@ def compile_experiment(superdir: Path) -> list[dict]:
             f"  pairing={_tick(pairing_df, pairing_src)}"
             f"  bm_gate={_tick(bm_gate)}"
             f"  ifxm_gate={_tick(ifxm_gate)}"
-            f"  images={'ok' if has_images else '--'}"
+            f"  vqvae={'ok' if vqvae_src is not None else '--'}"
         )
 
         sample_records.append({
-            'name':            name,
-            'mass_df':         mass_df,
-            'volume_df':       volume_df,
-            'pairing_df':      pairing_df,
-            'bm_gate':         bm_gate,
-            'ifxm_gate':       ifxm_gate,
-            'hdf5_src_path':   paths['hdf5_src_path'],
-            'hdf5_index_path': paths['hdf5_index_path'],
+            'name':       name,
+            'mass_df':    mass_df,
+            'volume_df':  volume_df,
+            'pairing_df': pairing_df,
+            'bm_gate':    bm_gate,
+            'ifxm_gate':  ifxm_gate,
+            'vqvae_src':  vqvae_src,
         })
 
     return sample_records
 
 
 # ---------------------------------------------------------------------------
-# Annotation + Coulter pairing GUI
+# Annotation + Coulter association GUI
 # ---------------------------------------------------------------------------
 
 class CompileAnnotationWindow:
@@ -412,10 +388,11 @@ class CompileAnnotationWindow:
     Fixed columns:
         sample       — sample directory name (read-only).
         coulter_col  — present only when a Coulter CSV was supplied. An in-place
-                       readonly Combobox pairs each *volume* sample with a
+                       readonly Combobox associates each *volume* sample with a
                        Coulter column; mass-only rows show '—' and are skipped.
-                       When present, Done stays disabled until every volume
-                       sample is assigned (the original pairing requirement).
+                       The association is recorded in the metadata sheet and
+                       nothing is computed from it, so leaving rows unassigned is
+                       fine and Done is always available.
 
     Plus any number of user-added annotation columns (free-text or yes/no
     checkbox), edited in place, with bulk "Set Cells", add/remove-column and
@@ -429,7 +406,7 @@ class CompileAnnotationWindow:
         self.ordered_samples  sample names in final (possibly reordered) order
 
     Closing without Done leaves self.completed = False and empty defaults, so
-    compilation still proceeds (without annotations or calibration).
+    compilation still proceeds (without annotations or Coulter associations).
     """
 
     def __init__(self, root: tk.Tk, sample_names: list,
@@ -463,7 +440,7 @@ class CompileAnnotationWindow:
         self.checkbox_cols: set = set()
         self.ordered_samples: list = list(self._samples)
 
-        root.title('Annotate & pair samples' if self._has_coulter
+        root.title('Annotate & associate samples' if self._has_coulter
                    else 'Annotate samples')
         self._build_ui()
         self._populate_table()
@@ -486,8 +463,8 @@ class CompileAnnotationWindow:
     def _build_ui(self):
         n = len(self._samples)
         header = (f"{n} sample(s) discovered — "
-                  + ("assign a Coulter column to every volume sample, "
-                     "then annotate" if self._has_coulter else "annotate"))
+                  + ("associate Coulter columns (optional), then annotate"
+                     if self._has_coulter else "annotate"))
         tk.Label(
             self._root, text=header,
             font=('TkDefaultFont', 10, 'bold'), anchor='w',
@@ -644,14 +621,15 @@ class CompileAnnotationWindow:
         self._tree.item(sample, values=self._row_values(sample), tags=tags)
 
     def _check_done(self):
-        """Enabled unless a Coulter CSV is loaded with volume samples unpaired."""
-        if not self._has_coulter:
-            self._done_btn.config(state=tk.NORMAL)
-            return
-        all_assigned = all(
-            self._row_data[s].get('coulter_col')
-            for s in self._samples if s in self._volume_names)
-        self._done_btn.config(state=tk.NORMAL if all_assigned else tk.DISABLED)
+        """
+        Always enabled.
+
+        Coulter assignment used to be mandatory because every volume sample
+        needed a calibration factor. Nothing is derived from the assignment now,
+        so a partial (or empty) mapping is a legitimate result and Done stays
+        available. Kept as a method because the edit handlers call it.
+        """
+        self._done_btn.config(state=tk.NORMAL)
 
     # ------------------------------------------------------------------
     # In-place cell editing
@@ -1093,352 +1071,6 @@ class CompileAnnotationWindow:
         self._root.destroy()
 
 
-# ---------------------------------------------------------------------------
-# Calibration algorithm
-# ---------------------------------------------------------------------------
-
-def _find_calibration_factor(
-        ifxm_vols_au: np.ndarray,
-        coulter_vols_fL: np.ndarray,
-        vol_low: float,
-        vol_high: float,
-) -> tuple[float, float, np.ndarray, np.ndarray]:
-    """
-    Percentile-matching calibration — Python port of coulter_counter_calibration.m.
-
-    Steps:
-      1. Filter Coulter to [vol_low, vol_high].
-      2. Compute initial factor = median(Coulter_range) / median(iFXM_all).
-      3. Sweep factor ± 3 fL/AU around initial, step 0.01.
-      4. For each candidate factor, scale iFXM and score by
-         sum(|pct(scaled_iFXM) - pct(Coulter_range)|) across pct 5–95.
-      5. Return the factor with the lowest score.
-
-    Returns (best_factor, initial_factor, sweep_factors, sweep_scores).
-    Raises ValueError if the Coulter range contains fewer than 10 points.
-    """
-    if ifxm_vols_au.size < 10:
-        raise ValueError(
-            f'Too few iFXM data points ({ifxm_vols_au.size}) for calibration. '
-            'If an iFXM gate is set, check that the bounds are not too tight.')
-
-    cc_in_range = coulter_vols_fL[
-        (coulter_vols_fL >= vol_low) & (coulter_vols_fL <= vol_high)]
-    if cc_in_range.size < 10:
-        raise ValueError(
-            f'Fewer than 10 Coulter points fall within {vol_low}–{vol_high} fL '
-            '— widen the calibration range.')
-
-    initial_factor = float(np.median(cc_in_range) / np.median(ifxm_vols_au))
-
-    if not np.isfinite(initial_factor) or initial_factor <= 0:
-        raise ValueError(
-            f'Initial calibration factor is not finite ({initial_factor:.4g}). '
-            'Check that the iFXM and Coulter distributions overlap.')
-
-    sweep_low  = max(0.001, initial_factor - 3.0)
-    sweep_high = initial_factor + 3.0 + 1e-9
-    factors    = np.arange(sweep_low, sweep_high, 0.01)
-
-    cc_pct  = np.percentile(cc_in_range, range(5, 96))
-    scores  = np.full(len(factors), np.inf)
-    pct_idx = list(range(5, 96))
-
-    for i, f in enumerate(factors):
-        scaled = ifxm_vols_au * f
-        if scaled.size < 10:
-            continue
-        scores[i] = float(np.sum(np.abs(np.percentile(scaled, pct_idx) - cc_pct)))
-
-    best_idx = int(np.argmin(scores))
-    return factors[best_idx], initial_factor, factors, scores
-
-
-# ---------------------------------------------------------------------------
-# Calibration GUI (per-sample, sequential)
-# ---------------------------------------------------------------------------
-
-class CalibrationWindow:
-    """
-    Per-sample calibration Toplevel.
-
-    Shows a Coulter histogram with a user-selectable calibration range. On
-    "Compute", runs _find_calibration_factor() and draws the score curve and
-    scaled-iFXM vs Coulter overlay.
-
-    self.result  — calibration factor (float) on Accept; None on Skip.
-    self.window  — the Toplevel; destroyed on either Accept or Skip, which
-                   unblocks the caller's cal_root.wait_window(cw.window).
-    """
-
-    def __init__(self, parent: tk.Tk, rec: dict, coulter_vols_fL: np.ndarray):
-        self.result: float | None = None
-        self._rec     = rec
-        self._cc_vols = coulter_vols_fL
-
-        # Apply iFXM gate to raw volumes before calibration
-        raw_vols = rec['volume_df']['volume'].dropna().values
-        gate     = rec.get('ifxm_gate')
-        if gate is not None:
-            lo, hi = gate
-            self._ifxm_vols = raw_vols[(raw_vols >= lo) & (raw_vols <= hi)]
-        else:
-            self._ifxm_vols = raw_vols
-
-        # Default range: 5th–95th percentile of Coulter, rounded to integers
-        default_low  = round(float(np.percentile(coulter_vols_fL, 5)))
-        default_high = round(float(np.percentile(coulter_vols_fL, 95)))
-
-        self.window = tk.Toplevel(parent)
-        self.window.title(f"{rec['name']} — Coulter Calibration")
-        self.window.protocol('WM_DELETE_WINDOW', self._on_skip)
-        self._maximise()
-
-        _F = ('TkDefaultFont', 12)      # base font for all tk controls
-        _FB = ('TkDefaultFont', 12, 'bold')
-
-        # ---- Range controls (top strip) ----
-        ctrl = tk.Frame(self.window)
-        ctrl.pack(side=tk.TOP, fill=tk.X, padx=12, pady=(10, 4))
-        tk.Label(ctrl, text='Calibration range (fL):', font=_F).pack(side=tk.LEFT)
-        tk.Label(ctrl, text='  Low:', font=_F).pack(side=tk.LEFT)
-        self._low_var  = tk.StringVar(value=str(default_low))
-        tk.Entry(ctrl, textvariable=self._low_var,  width=8, font=_F).pack(side=tk.LEFT, padx=(2, 8))
-        tk.Label(ctrl, text='High:', font=_F).pack(side=tk.LEFT)
-        self._high_var = tk.StringVar(value=str(default_high))
-        tk.Entry(ctrl, textvariable=self._high_var, width=8, font=_F).pack(side=tk.LEFT, padx=(2, 12))
-        tk.Button(ctrl, text='Compute', font=_F, command=self._compute).pack(side=tk.LEFT)
-
-        # ---- Bottom controls (bottom strip) ----
-        # Reserve this strip BEFORE packing the canvas so the Skip / Accept &
-        # Next buttons are never pushed off-screen by the expanding figure —
-        # that clipping is what hid them on macOS (where 'zoomed' is a no-op).
-        bot = tk.Frame(self.window)
-        bot.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(2, 10))
-        self._factor_label = tk.Label(bot, text='Calibration factor:  —  fL/AU',
-                                      font=_FB)
-        self._factor_label.pack(side=tk.LEFT)
-        tk.Button(bot, text='Skip', font=_F,
-                  command=self._on_skip).pack(side=tk.RIGHT, padx=(8, 0))
-        self._accept_btn = tk.Button(bot, text='Accept & Next', font=_FB,
-                                     state=tk.DISABLED, command=self._on_accept)
-        self._accept_btn.pack(side=tk.RIGHT)
-
-        # ---- Matplotlib 2×2 figure (fills the space between the strips) ----
-        self._fig, self._axs = plt.subplots(2, 2, figsize=(16, 9))
-        self._fig.subplots_adjust(hspace=0.45, wspace=0.35)
-        canvas = FigureCanvasTkAgg(self._fig, master=self.window)
-        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True,
-                                    padx=8, pady=4)
-        self._canvas = canvas
-
-        # Initial state: draw Coulter histogram; blank the other three panels
-        for ax in self._axs.flat:
-            ax.axis('off')
-        self._draw_coulter_hist(default_low, default_high)
-        canvas.draw()
-
-        self._best_factor: float | None = None
-
-    def _maximise(self):
-        """
-        Size the window to fill the screen on every platform.
-
-        'zoomed' only maximises on Windows; on macOS/Linux Tk it is either a
-        no-op or raises, leaving the window at the figure's natural size (taller
-        than the screen), which clips the bottom button bar. So always set an
-        explicit screen-sized geometry, leaving a margin for the menu bar/dock.
-        """
-        self.window.update_idletasks()
-        sw = self.window.winfo_screenwidth()
-        sh = self.window.winfo_screenheight()
-        self.window.geometry(f'{sw}x{sh - 120}+0+0')
-        if sys.platform.startswith('win'):
-            try:
-                self.window.state('zoomed')
-            except tk.TclError:
-                pass
-
-    # ------------------------------------------------------------------
-
-    def _parse_range(self) -> tuple[float, float] | None:
-        try:
-            low  = float(self._low_var.get())
-            high = float(self._high_var.get())
-            if low >= high or low <= 0:
-                raise ValueError
-            return low, high
-        except (ValueError, tk.TclError):
-            messagebox.showerror(
-                'Invalid range',
-                'Enter positive numbers with Low < High.',
-                parent=self.window)
-            return None
-
-    def _draw_coulter_hist(self, vol_low: float, vol_high: float):
-        ax = self._axs[0, 0]
-        ax.cla()
-        ax.axis('on')
-        cc   = self._cc_vols
-        cmin = max(cc.min(), 1e-3)
-        bins = np.logspace(np.log10(cmin), np.log10(cc.max()), 60)
-        in_range = cc[(cc >= vol_low) & (cc <= vol_high)]
-        ax.hist(cc,       bins=bins, color='steelblue', alpha=0.5, label='All Coulter')
-        ax.hist(in_range, bins=bins, color='orange',    alpha=0.7, label='Cal. range')
-        ax.set_xscale('log')
-        ax.set_xlabel('Volume (fL)', fontsize=11)
-        ax.set_ylabel('Count', fontsize=11)
-        ax.set_title('Coulter distribution', fontsize=12)
-        ax.tick_params(labelsize=10)
-        ax.legend(fontsize=10)
-
-    def _compute(self):
-        rng = self._parse_range()
-        if rng is None:
-            return
-        vol_low, vol_high = rng
-
-        try:
-            best, initial, factors, scores = _find_calibration_factor(
-                self._ifxm_vols, self._cc_vols, vol_low, vol_high)
-        except ValueError as exc:
-            messagebox.showerror('Calibration error', str(exc), parent=self.window)
-            return
-
-        self._best_factor = best
-
-        # [0,0] Coulter histogram — redraw with current range
-        self._draw_coulter_hist(vol_low, vol_high)
-
-        # [0,1] Score vs calibration factor
-        ax01 = self._axs[0, 1]
-        ax01.cla()
-        ax01.axis('on')
-        ax01.plot(factors, scores, lw=1, color='steelblue')
-        ax01.axvline(initial, color='orange', lw=1.2, ls='--',
-                     label=f'Median: {initial:.3f}')
-        ax01.axvline(best,    color='red',    lw=1.2, ls='--',
-                     label=f'Best:   {best:.3f}')
-        ax01.set_xlabel('Calibration factor (fL/AU)', fontsize=11)
-        ax01.set_ylabel('Σ|percentile diff|', fontsize=11)
-        ax01.set_title('Calibration score', fontsize=12)
-        ax01.tick_params(labelsize=10)
-        ax01.legend(fontsize=10)
-
-        # [1,0] Overlay: scaled iFXM vs Coulter (density-normalised)
-        ax10 = self._axs[1, 0]
-        ax10.cla()
-        ax10.axis('on')
-        cc_rng     = self._cc_vols[(self._cc_vols >= vol_low) & (self._cc_vols <= vol_high)]
-        ifxm_scaled = self._ifxm_vols * best
-        vmin = max(vol_low,  1e-3)
-        bins = np.logspace(np.log10(vmin), np.log10(vol_high), 50)
-        ax10.hist(cc_rng,      bins=bins, density=True, alpha=0.6,
-                  color='orange',    label='Coulter')
-        ax10.hist(ifxm_scaled, bins=bins, density=True, alpha=0.6,
-                  color='steelblue', label='Scaled iFXM')
-        ax10.set_xscale('log')
-        ax10.set_xlabel('Volume (fL)', fontsize=11)
-        ax10.set_ylabel('Density', fontsize=11)
-        ax10.set_title('Overlay (calibration range)', fontsize=12)
-        ax10.tick_params(labelsize=10)
-        ax10.legend(fontsize=10)
-
-        # [1,1] Text summary
-        ax11 = self._axs[1, 1]
-        ax11.cla()
-        ax11.axis('off')
-        gate = self._rec.get('ifxm_gate')
-        gate_str = (f'{gate[0]:.3g} – {gate[1]:.3g} AU' if gate else 'none')
-        summary = (
-            f"Sample:          {self._rec['name']}\n\n"
-            f"iFXM gate:       {gate_str}\n"
-            f"iFXM N (gated):  {len(self._ifxm_vols)}\n"
-            f"Coulter N:       {len(self._cc_vols)}\n\n"
-            f"Range:           {vol_low:.4g} – {vol_high:.4g} fL\n\n"
-            f"Initial factor:  {initial:.4f} fL/AU\n"
-            f"Refined factor:  {best:.4f} fL/AU"
-        )
-        ax11.text(0.05, 0.92, summary, transform=ax11.transAxes,
-                  va='top', ha='left', fontsize=12, family='monospace')
-
-        self._canvas.draw()
-        self._factor_label.config(
-            text=f'Calibration factor:  {best:.4f} fL/AU')
-        self._accept_btn.config(state=tk.NORMAL)
-
-    def _on_accept(self):
-        self.result   = self._best_factor
-        self.vol_low  = float(self._low_var.get())
-        self.vol_high = float(self._high_var.get())
-        self.window.destroy()
-
-    def _on_skip(self):
-        self.result = None
-        self.window.destroy()
-
-
-# ---------------------------------------------------------------------------
-# Calibration diagnostic plots
-# ---------------------------------------------------------------------------
-
-def _write_calibration_plots(out_dir: Path, cal_plot_data: dict) -> None:
-    """
-    Write calibration diagnostic plots into out_dir/calibration_plots/.
-
-    One overlay histogram PNG per sample (Coulter vs scaled iFXM, density-
-    normalised, log x-axis) plus a single bar chart of all calibration factors.
-
-    cal_plot_data: {sample_name: {'factor': float, 'ifxm_vols': ndarray,
-                                   'cc_vols': ndarray,
-                                   'vol_low': float, 'vol_high': float}}
-    """
-    plot_dir = out_dir / 'calibration_plots'
-    plot_dir.mkdir()
-
-    names   = list(cal_plot_data.keys())
-    factors = [cal_plot_data[n]['factor'] for n in names]
-
-    # Per-sample overlay histograms
-    for name, d in cal_plot_data.items():
-        factor    = d['factor']
-        cc        = d['cc_vols']
-        ifxm_sc   = d['ifxm_vols'] * factor
-        vol_low   = d['vol_low']
-        vol_high  = d['vol_high']
-
-        fig, ax = plt.subplots(figsize=(6, 4))
-        vmin = max(vol_low, 1e-3)
-        bins = np.logspace(np.log10(vmin), np.log10(vol_high), 50)
-        cc_rng = cc[(cc >= vol_low) & (cc <= vol_high)]
-        ax.hist(cc_rng,  bins=bins, density=True, alpha=0.6,
-                color='orange',    label='Coulter')
-        ax.hist(ifxm_sc, bins=bins, density=True, alpha=0.6,
-                color='steelblue', label='Scaled iFXM')
-        ax.set_xscale('log')
-        ax.set_xlabel('Volume (fL)')
-        ax.set_ylabel('Density')
-        ax.set_title(f'{name}\nfactor = {factor:.4f} fL/AU')
-        ax.legend()
-        fig.tight_layout()
-        safe = re.sub(r'[^\w\-.]', '_', name)
-        fig.savefig(plot_dir / f'{safe}_calibration.png', dpi=150)
-        plt.close(fig)
-
-    # Bar chart of all calibration factors
-    fig, ax = plt.subplots(figsize=(max(5, len(names) * 0.8 + 1.5), 4))
-    x = range(len(names))
-    ax.bar(x, factors, color='steelblue', edgecolor='white', linewidth=0.5)
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(names, rotation=45, ha='right', fontsize=8)
-    ax.set_ylabel('Calibration factor (fL/AU)')
-    ax.set_title('Calibration factors per sample')
-    fig.tight_layout()
-    fig.savefig(plot_dir / 'calibration_factors.png', dpi=150)
-    plt.close(fig)
-
-    print(f"Calibration plots written -> {plot_dir}")
-
 
 # ---------------------------------------------------------------------------
 # Per-sample workbook blocks
@@ -1447,20 +1079,21 @@ def _write_calibration_plots(out_dir: Path, cal_plot_data: dict) -> None:
 # Each sample sheet holds up to three independent, side-by-side blocks. Their
 # columns are prefixed so the blocks can be separated again in analysis code
 # with df.filter(like='vol_') etc.:
-#     VOLUME (vol_)   — every FXM cell:   transit_index, volume_au, volume_fL
+#     VOLUME (vol_)   — every FXM cell:   transit_index, volume_au
 #     MASS   (mass_)  — every SMR cell:   mass_pg (+ any other mass columns)
 #     PAIRED (pair_)  — matched cells:    transit_index, mass_pg, volume_au,
-#                                          volume_fL, buoyant_density
+#                                          buoyant_density
 # The blocks are independent distributions (row N of one is unrelated to row N
 # of another), so they are never joined — only placed next to each other.
+#
+# Volume is written once, in raw FXM units, and never rescaled: a Coulter column
+# may be associated with a sample for reference, but no calibration is derived
+# from it, so there is no second volume column to keep in step.
 
-def _build_volume_block(volume_df: pd.DataFrame, factor: float | None) -> pd.DataFrame:
+def _build_volume_block(volume_df: pd.DataFrame) -> pd.DataFrame:
     """VOLUME block (vol_-prefixed) from a ProcessedVolumes DataFrame."""
     df = volume_df.rename(columns={'volume': 'volume_au'})
-    if factor is not None and 'volume_au' in df.columns and 'volume_fL' not in df.columns:
-        df = df.copy()
-        df['volume_fL'] = df['volume_au'] * factor
-    order = ['transit_index', 'volume_au', 'volume_fL']
+    order = ['transit_index', 'volume_au']
     keep = [c for c in order if c in df.columns]
     out = df[keep] if keep else df
     out = out.reset_index(drop=True)
@@ -1475,13 +1108,10 @@ def _build_mass_block(mass_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _build_paired_block(pairing_df: pd.DataFrame, factor: float | None) -> pd.DataFrame:
+def _build_paired_block(pairing_df: pd.DataFrame) -> pd.DataFrame:
     """PAIRED block (pair_-prefixed) — matched cells with mass+volume+density."""
     df = pairing_df.rename(columns={'volume': 'volume_au', 'matched_mass': 'mass_pg'})
-    if factor is not None and 'volume_au' in df.columns and 'volume_fL' not in df.columns:
-        df = df.copy()
-        df['volume_fL'] = df['volume_au'] * factor
-    order = ['transit_index', 'mass_pg', 'volume_au', 'volume_fL', 'buoyant_density']
+    order = ['transit_index', 'mass_pg', 'volume_au', 'buoyant_density']
     keep = [c for c in order if c in df.columns]
     out = df[keep] if keep else df
     out = out.reset_index(drop=True)
@@ -1489,7 +1119,7 @@ def _build_paired_block(pairing_df: pd.DataFrame, factor: float | None) -> pd.Da
     return out
 
 
-def _build_readme_df(timestamp: str) -> pd.DataFrame:
+def _build_readme_df(timestamp: str, has_vqvae: bool = False) -> pd.DataFrame:
     """Two-column (Field, Value) sheet documenting units and the read recipe."""
     rows = [
         ('Compiled',        timestamp),
@@ -1497,19 +1127,20 @@ def _build_readme_df(timestamp: str) -> pd.DataFrame:
                             'sample sheet holds three independent, side-by-side '
                             'blocks separated by one blank column.'),
         ('VOLUME block',    'Columns vol_* — every FXM cell: vol_transit_index, '
-                            'vol_volume_au, vol_volume_fL (when calibrated).'),
+                            'vol_volume_au.'),
         ('MASS block',      'Columns mass_* — every SMR cell: mass_mass_pg '
                             '(+ any other columns from the mass CSV).'),
         ('PAIRED block',    'Columns pair_* — cells matched between SMR and FXM: '
-                            'pair_mass_pg, pair_volume_au, pair_volume_fL, '
+                            'pair_mass_pg, pair_volume_au, '
                             'pair_buoyant_density on one row.'),
         ('Blocks are independent',
                             'Row N of one block is unrelated to row N of another; '
                             'they are separate distributions, not aligned.'),
         ('mass_pg',         'Buoyant mass in picograms (pg).'),
-        ('volume_au',       'Cell volume in arbitrary FXM units (AU).'),
-        ('volume_fL',       'Calibrated volume in femtolitres (fL); present only '
-                            'when a Coulter calibration factor was accepted.'),
+        ('volume_au',       'Cell volume in arbitrary FXM units (AU). NOT '
+                            'calibrated to fL — a coulter_column in the metadata '
+                            'sheet records which Coulter distribution a sample '
+                            'corresponds to, but no scaling is applied.'),
         ('buoyant_density', 'RELATIVE buoyant density (g/mL). Absolute density = '
                             'buoyant_density + experiment-specific baseline_density '
                             '(NOT stored here).'),
@@ -1525,6 +1156,27 @@ def _build_readme_df(timestamp: str) -> pd.DataFrame:
         ('Note',            'Use regex="^mass_" (anchored), not like="mass_", '
                             'since "mass_" also occurs inside "pair_mass_pg".'),
     ]
+    if has_vqvae:
+        rows += [
+            ('VQ-VAE cache',
+                            'concat_vqvae_cache.pt + concat_vqvae_cache_metadata'
+                            '.parquet sit beside this workbook and hold every '
+                            'sample\'s stage-2 crop cache concatenated along '
+                            'axis 0 — only for samples whose metadata row has '
+                            'has_vqvae = True.'),
+            ('cache row alignment',
+                            'Parquet row i describes tensor row i. Join back to '
+                            'this workbook on sample_name; use cache_row to index '
+                            'axis 0 of the tensors.'),
+            ('Read the cache',
+                            'import pyarrow.parquet as pq; import torch'),
+            ('',            'md = pq.read_table("concat_vqvae_cache_metadata'
+                            '.parquet").to_pandas()'),
+            ('',            'bf = torch.load("concat_vqvae_cache.pt", '
+                            'mmap=True)["bf_u8"]'),
+            ('',            'rows = md[md.sample_name == name].cache_row.values'),
+            ('',            'crops = bf[rows]   # (n, 1, S, S) uint8'),
+        ]
     return pd.DataFrame(rows, columns=['Field', 'Value'])
 
 
@@ -1532,18 +1184,43 @@ def _build_readme_df(timestamp: str) -> pd.DataFrame:
 # Output
 # ---------------------------------------------------------------------------
 
+def _plan_vqvae(sample_records: list) -> tuple[object, list[str]]:
+    """
+    Validate the crop caches of every record that has one.
+
+    Returns (plan_or_None, merged_sample_names). Metadata-only, so it runs
+    before the workbook is written and the metadata sheet's has_vqvae flag can
+    report which samples actually survived validation rather than merely which
+    ones had a cache file. A plan that cannot be built is reported and dropped:
+    the caches are a bonus output, and losing them must not cost the workbook.
+    """
+    sources = [r['vqvae_src'] for r in sample_records if r.get('vqvae_src')]
+    if not sources:
+        return None, []
+
+    print(f"\nValidating {len(sources)} VQ-VAE crop cache(s)...")
+    try:
+        plan = cvc.plan_concat(
+            sources,
+            note=lambda m: print(f"  [note] {m}"),
+            log=print)
+    except ValueError as exc:
+        print(f"  [warn] no concatenated crop cache written: {exc}")
+        return None, []
+
+    print(f"  {len(plan.usable)} usable, {plan.total_rows:,} rows, "
+          f"keys {', '.join(plan.keys)}")
+    return plan, [s.sample_name for s in plan.usable]
+
+
 def _write_output(superdir: Path, sample_records: list,
                   pairing: dict | None = None,
-                  calibration: dict | None = None,
-                  cal_plot_data: dict | None = None,
                   annotations: dict | None = None,
                   custom_cols: list | None = None,
                   checkbox_cols: set | None = None,
                   ordered_samples: list | None = None,
-                  save_images: bool = True) -> Path:
+                  save_vqvae: bool = True) -> Path:
     pairing       = pairing       or {}
-    calibration   = calibration   or {}
-    cal_plot_data = cal_plot_data or {}
     annotations   = annotations   or {}
     custom_cols   = custom_cols   or []
     checkbox_cols = checkbox_cols or set()
@@ -1554,11 +1231,18 @@ def _write_output(superdir: Path, sample_records: list,
         sample_records = sorted(
             sample_records, key=lambda r: order.get(r['name'], len(order)))
 
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # Planned before the workbook so has_vqvae and the README can describe the
+    # crop caches accurately. The .pt and .parquet themselves are written last,
+    # since they are by far the largest and slowest part of the output.
+    vqvae_plan, vqvae_samples = ((None, [])
+                                 if not save_vqvae
+                                 else _plan_vqvae(sample_records))
+    vqvae_names = set(vqvae_samples)
+
+    timestamp = datetime.now().strftime('%Y%m%d.%H%M%S')
     out_dir = superdir / f'{timestamp}_compiled'
     out_dir.mkdir()
     xlsx_path      = out_dir / 'experiment_data.xlsx'
-    images_h5_path = out_dir / 'images.h5'
 
     # Assign each sample an Excel-legal, unique worksheet name. 'metadata' and
     # 'readme' are reserved so a sample can never collide with them.
@@ -1580,13 +1264,12 @@ def _write_output(superdir: Path, sample_records: list,
             'has_pairing':       rec['pairing_df'] is not None,
             'has_bm_gate':       bm is not None,
             'has_ifxm_gate':     ifxm is not None,
-            'has_images':        rec['hdf5_src_path'] is not None,
+            'has_vqvae':         rec['name'] in vqvae_names,
             'bm_gate_lower':     bm[0]   if bm   else float('nan'),
             'bm_gate_upper':     bm[1]   if bm   else float('nan'),
             'ifxm_gate_lower':   ifxm[0] if ifxm else float('nan'),
             'ifxm_gate_upper':   ifxm[1] if ifxm else float('nan'),
             'coulter_column':    pairing.get(name, ''),
-            'calibration_factor': calibration.get(name) or float('nan'),
         }
         # Append custom annotation columns (checkbox cols normalised to yes/no).
         row_ann = annotations.get(name, {})
@@ -1607,20 +1290,15 @@ def _write_output(superdir: Path, sample_records: list,
         for rec in sample_records:
             name   = rec['name']
             sheet  = sheet_names[name]
-            factor = calibration.get(name)
 
             # Build the blocks this sample has, in VOLUME | MASS | PAIRED order.
             blocks = []
             if rec['volume_df'] is not None:
-                blocks.append(_build_volume_block(rec['volume_df'], factor))
+                blocks.append(_build_volume_block(rec['volume_df']))
             if rec['mass_df'] is not None:
                 blocks.append(_build_mass_block(rec['mass_df']))
             if rec['pairing_df'] is not None:
-                blocks.append(_build_paired_block(rec['pairing_df'], factor))
-
-            if factor is not None and rec['volume_df'] is not None:
-                print(f"  [{name}] volume_fL written "
-                      f"(factor = {factor:.4f} fL/AU)")
+                blocks.append(_build_paired_block(rec['pairing_df']))
 
             if not blocks:
                 # Sample with no tabular data still gets an (empty) sheet.
@@ -1641,30 +1319,26 @@ def _write_output(superdir: Path, sample_records: list,
                 blk.to_excel(xw, sheet_name=sheet, index=False, startcol=startcol)
                 startcol += len(blk.columns) + 1   # +1 blank spacer column
 
-        readme_df = _build_readme_df(timestamp)
+        readme_df = _build_readme_df(timestamp, vqvae_plan is not None)
         readme_df.to_excel(xw, sheet_name='README', index=False)
 
     print(f"\nCompiled {len(sample_records)} sample(s) -> {xlsx_path}")
 
-    image_candidates = [r for r in sample_records
-                        if r['hdf5_src_path'] and r['hdf5_index_path']]
-    if not save_images:
-        if image_candidates:
-            print(f"Skipping image stacks for {len(image_candidates)} sample(s) "
-                  f"(--no-images)")
-    elif image_candidates:
-        print(f"Writing image stacks for {len(image_candidates)} sample(s) "
-              f"-> {images_h5_path}")
-        with h5py.File(str(images_h5_path), 'w') as img_store:
-            for rec in image_candidates:
-                grp = img_store.require_group(_safe_key(rec['name']))
-                n   = _save_images_for_sample(
-                    rec['hdf5_src_path'], rec['hdf5_index_path'],
-                    grp, rec['name'])
-                print(f"  [{rec['name']}] {n} transits")
-
-    if cal_plot_data:
-        _write_calibration_plots(out_dir, cal_plot_data)
+    if not save_vqvae:
+        if any(r.get('vqvae_src') for r in sample_records):
+            print("Skipping the concatenated VQ-VAE crop cache (--no-vqvae)")
+    elif vqvae_plan is not None:
+        # plan.usable preserves the order the sources were collected in, which
+        # is the (possibly reordered) sample_records order, so the concatenated
+        # tensors run in the same sample order as the metadata sheet.
+        print(f"\nWriting concatenated VQ-VAE crop cache "
+              f"({vqvae_plan.total_rows:,} rows) -> {out_dir.name}/")
+        result = cvc.run_concat(vqvae_plan, out_dir, log=lambda m: print(f"  {m}"))
+        cvc.summarize(vqvae_plan, result,
+                      len(vqvae_plan.usable) + len(vqvae_plan.skipped))
+        if result.problems:
+            print("  [warn] the crop cache failed its own consistency check "
+                  "(see above); the workbook is unaffected.")
 
     return out_dir
 
@@ -1674,22 +1348,22 @@ def _write_output(superdir: Path, sample_records: list,
 # ---------------------------------------------------------------------------
 
 def main():
-    superdir, coulter_path, save_images = parse_cli_args()
+    superdir, coulter_path, save_vqvae = parse_cli_args()
     print(f"Compiling {superdir.name}...")
     records = compile_experiment(superdir)
     if not records:
         print("No sample data found.")
         sys.exit(1)
 
-    coulter_df = None
     coulter_cols: list = []
     if coulter_path is not None:
-        coulter_df = _load_coulter(coulter_path)
-        coulter_cols = list(coulter_df.columns)
+        # Only the column names are needed: the assignment is recorded as a
+        # label, and no per-cell Coulter volume is read or used.
+        coulter_cols = list(_load_coulter(coulter_path).columns)
         print(f"Loaded Coulter CSV: {coulter_path.name}  "
-              f"({len(coulter_df.columns)} columns, {len(coulter_df)} rows)")
+              f"({len(coulter_cols)} columns)")
 
-    # --- Phase 1: annotation + (optional) Coulter pairing GUI ---
+    # --- Annotation + (optional) Coulter association GUI ---
     ann_root = tk.Tk()
     volume_names = {r['name'] for r in records if r['volume_df'] is not None}
     aw = CompileAnnotationWindow(
@@ -1698,7 +1372,7 @@ def main():
 
     if not aw.completed:
         print("[warn] annotation window closed without Done — "
-              "compiling without annotations or calibration.")
+              "compiling without annotations or Coulter associations.")
 
     pairing         = aw.result
     annotations     = aw.annotations
@@ -1706,42 +1380,14 @@ def main():
     checkbox_cols   = aw.checkbox_cols
     ordered_samples = aw.ordered_samples
 
-    calibration:  dict = {}
-    cal_plot_data: dict = {}
+    assigned = sum(1 for v in pairing.values() if v)
+    if assigned:
+        print(f"\n{assigned} sample(s) associated with a Coulter column "
+              f"(recorded in the metadata sheet; volumes are not rescaled).")
 
-    # --- Phase 2: per-sample calibration (only with --coulter + assignments) ---
-    if coulter_path is not None and any(pairing.values()):
-        records_by_name = {r['name']: r for r in records}
-        cal_root = tk.Tk()
-        cal_root.withdraw()
-
-        paired_items = [(n, c) for n, c in pairing.items() if c]
-        print(f"\nStarting calibration for {len(paired_items)} sample(s)...")
-        for sample_name, cc_col in paired_items:
-            rec     = records_by_name[sample_name]
-            cc_vols = coulter_df[cc_col].dropna().values
-            print(f"  {sample_name} vs Coulter column '{cc_col}'  "
-                  f"(N={len(cc_vols)})")
-            cw = CalibrationWindow(cal_root, rec, cc_vols)
-            cal_root.wait_window(cw.window)
-            calibration[sample_name] = cw.result
-            if cw.result is not None:
-                print(f"    -> accepted  factor = {cw.result:.4f} fL/AU")
-                cal_plot_data[sample_name] = {
-                    'factor':    cw.result,
-                    'ifxm_vols': cw._ifxm_vols,
-                    'cc_vols':   cw._cc_vols,
-                    'vol_low':   cw.vol_low,
-                    'vol_high':  cw.vol_high,
-                }
-            else:
-                print(f"    -> skipped")
-
-        cal_root.destroy()
-
-    _write_output(superdir, records, pairing, calibration, cal_plot_data,
+    _write_output(superdir, records, pairing,
                   annotations, custom_cols, checkbox_cols, ordered_samples,
-                  save_images)
+                  save_vqvae)
 
 
 if __name__ == '__main__':

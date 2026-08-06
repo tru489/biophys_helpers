@@ -45,6 +45,11 @@ Usage:
                     (default: those present in every source).
     --require-fl    Fail if any source lacks fl_u8, instead of dropping it.
     --dry-run       Discover and validate, print the plan, write nothing.
+
+compile_experiment.py imports this module to write the same pair into its own
+`*_compiled/` output dir for the samples it discovered, via
+`_sample_cache` -> `plan_concat` -> `run_concat`. Keep those three importable
+without side effects.
 """
 import argparse
 import io
@@ -73,6 +78,11 @@ _BATCH_ROWS   = 8_192     # parquet rows per streamed batch
 _RUN_SUFFIX   = '_imaging_fxm_results'
 _STAGE2_DIR   = 'stage2_analysis'
 _CACHE_SUFFIX = '_vqvae_cache.pt'
+
+# Output file names. Public because compile_experiment.py writes the same pair
+# into its own output dir through concat_caches(), and the two must agree.
+OUT_PT_NAME      = 'concat_vqvae_cache.pt'
+OUT_PARQUET_NAME = 'concat_vqvae_cache_metadata.parquet'
 
 # Columns this script adds. A source column of the same name is renamed rather
 # than overwritten, so nothing upstream is ever lost.
@@ -189,6 +199,46 @@ def _last_matching_dir(parent: Path, pattern: re.Pattern) -> Path | None:
     return matches[-1] if matches else None
 
 
+def _sample_cache(superdir_name: str, sample_dir: Path, warn) -> CacheSource | None:
+    """
+    The newest crop cache under one sample dir, or None if it has none.
+
+    Split out of discover_caches so compile_experiment.py can ask the same
+    question about a single sample without rescanning a whole superdir, and so
+    both agree on which run directory wins.
+    """
+    run_dir = _last_matching_dir(sample_dir, _RUN_DIR_PATTERN)
+    if run_dir is None:
+        return None
+    stage2 = run_dir / _STAGE2_DIR
+    if not stage2.is_dir():
+        warn(f'{superdir_name}/{sample_dir.name}: no {_STAGE2_DIR} in '
+             f'{run_dir.name}')
+        return None
+
+    caches = sorted(f for f in stage2.iterdir()
+                    if f.is_file() and not is_appledouble(f)
+                    and f.name.endswith(_CACHE_SUFFIX))
+    if not caches:
+        return None
+    if len(caches) > 1:
+        warn(f'{superdir_name}/{sample_dir.name}: {len(caches)} caches in '
+             f'{run_dir.name}, using {caches[0].name}')
+
+    pt_path = caches[0]
+    parquet_path = sibling_path(pt_path)
+    if parquet_path is None:
+        warn(f'{superdir_name}/{sample_dir.name}: {pt_path.name} has no '
+             f'sibling metadata parquet')
+        return None
+
+    m = _TS_PATTERN.match(run_dir.name)
+    return CacheSource(
+        pt_path=pt_path, parquet_path=parquet_path,
+        experiment=superdir_name, sample_name=sample_dir.name,
+        run_timestamp=m.group(1) if m else '')
+
+
 def discover_caches(superdir: Path, warn) -> list[CacheSource]:
     """
     Find one cache pair per sample subdir of superdir.
@@ -207,37 +257,9 @@ def discover_caches(superdir: Path, warn) -> list[CacheSource]:
     for sample_dir in entries:
         if not sample_dir.is_dir() or is_appledouble(sample_dir):
             continue
-
-        run_dir = _last_matching_dir(sample_dir, _RUN_DIR_PATTERN)
-        if run_dir is None:
-            continue
-        stage2 = run_dir / _STAGE2_DIR
-        if not stage2.is_dir():
-            warn(f'{superdir.name}/{sample_dir.name}: no {_STAGE2_DIR} in '
-                 f'{run_dir.name}')
-            continue
-
-        caches = sorted(f for f in stage2.iterdir()
-                        if f.is_file() and not is_appledouble(f)
-                        and f.name.endswith(_CACHE_SUFFIX))
-        if not caches:
-            continue
-        if len(caches) > 1:
-            warn(f'{superdir.name}/{sample_dir.name}: {len(caches)} caches in '
-                 f'{run_dir.name}, using {caches[0].name}')
-
-        pt_path = caches[0]
-        parquet_path = sibling_path(pt_path)
-        if parquet_path is None:
-            warn(f'{superdir.name}/{sample_dir.name}: {pt_path.name} has no '
-                 f'sibling metadata parquet')
-            continue
-
-        m = _TS_PATTERN.match(run_dir.name)
-        found.append(CacheSource(
-            pt_path=pt_path, parquet_path=parquet_path,
-            experiment=superdir.name, sample_name=sample_dir.name,
-            run_timestamp=m.group(1) if m else ''))
+        src = _sample_cache(superdir.name, sample_dir, warn)
+        if src is not None:
+            found.append(src)
     return found
 
 
@@ -719,6 +741,129 @@ def self_check(pt_path: Path, parquet_path: Path,
 
 
 # ---------------------------------------------------------------------------
+# Plan / run
+# ---------------------------------------------------------------------------
+
+class ConcatPlan:
+    """
+    A validated merge, ready to write: which sources are usable, which tensor
+    keys they share, and the parquet schema their union needs.
+
+    Separated from the writing step so a caller can inspect or print the plan
+    (and, for --dry-run, stop there). compile_experiment.py builds a plan from
+    the samples it already discovered rather than rescanning the superdir.
+    """
+
+    def __init__(self, usable: list[CacheSource], skipped: list[tuple[str, str]],
+                 keys: list[str], schema: pa.Schema):
+        self.usable  = usable
+        self.skipped = skipped
+        self.keys    = keys
+        self.schema  = schema
+
+    @property
+    def total_rows(self) -> int:
+        return sum(s.nrows for s in self.usable)
+
+
+class ConcatResult:
+    """What run_concat wrote: output paths, per-key shapes, and any problems."""
+
+    def __init__(self, pt_path: Path, parquet_path: Path, shapes: dict,
+                 rows: int, problems: list[str]):
+        self.pt_path      = pt_path
+        self.parquet_path = parquet_path
+        self.shapes       = shapes
+        self.rows         = rows
+        self.problems     = problems
+
+
+def plan_concat(sources: list[CacheSource], requested_keys: str | None = None,
+                require_fl: bool = False, note=print, log=print) -> ConcatPlan:
+    """
+    Validate every source and decide what the merge will contain.
+
+    Metadata only — no tensor data and no parquet rows are read, so a bad input
+    aborts before anything is written. Raises ValueError when no usable source
+    survives, when the sources share no tensor key, or when their shapes/dtypes
+    are incompatible.
+    """
+    usable, skipped = [], []
+    for src in sources:
+        reason = inspect_source(src)
+        if reason is None:
+            usable.append(src)
+        else:
+            skipped.append((src.label, reason))
+            log(f'  [skip] {src.label}: {reason}')
+    if not usable:
+        raise ValueError('no usable sources after validation')
+
+    keys = select_keys(usable, requested_keys, require_fl, note)
+    if not keys:
+        raise ValueError('no tensor key is present in every source')
+    check_shapes(usable, keys)
+
+    schema, missing_cols = _union_schema(usable)
+    for column, lacking in sorted(missing_cols.items()):
+        note(f'column {column!r} absent from {len(lacking)} source(s), '
+             f'null-filled ({", ".join(lacking[:3])}'
+             f'{" ..." if len(lacking) > 3 else ""})')
+    for column in sorted({c for s in usable for c in s.columns
+                          if c in _ADDED_COLUMNS}):
+        note(f'source column {column!r} kept as {column}_source '
+             f'(the label column takes that name)')
+
+    return ConcatPlan(usable, skipped, keys, schema)
+
+
+def run_concat(plan: ConcatPlan, out_dir: Path, log=print) -> ConcatResult:
+    """
+    Write the plan's .pt and .parquet into out_dir, then self-check them.
+
+    The tensor pass and the parquet pass walk plan.usable in the same order,
+    which is what keeps tensor row i and parquet row i describing the same crop.
+    """
+    pt_out      = out_dir / OUT_PT_NAME
+    parquet_out = out_dir / OUT_PARQUET_NAME
+
+    log(f'Writing {pt_out.name}...')
+    shapes = write_concat_pt(plan.usable, plan.keys, pt_out)
+    log(f'Writing {parquet_out.name}...')
+    rows = write_concat_parquet(plan.usable, parquet_out, plan.schema)
+
+    problems = self_check(pt_out, parquet_out, plan.keys)
+    return ConcatResult(pt_out, parquet_out, shapes, rows, problems)
+
+
+def summarize(plan: ConcatPlan, result: ConcatResult, n_sources: int,
+              log=print) -> None:
+    """Print the per-key shapes, row/column counts and any self-check failure."""
+    log(f'  {len(plan.usable)}/{n_sources} sources merged, '
+        f'{len(plan.skipped)} skipped\n')
+    for key in plan.keys:
+        info = plan.usable[0].tensors[key]
+        nbytes = _STORAGE_ITEMSIZE[info.storage.storage_class]
+        for d in result.shapes[key]:
+            nbytes *= d
+        log(f'  {key:<8}{str(result.shapes[key]):<24}{info.dtype:<8}'
+            f'{nbytes / (1024 * 1024):>9,.1f} MB')
+    log(f'  {"rows":<8}{result.rows:,}')
+    log(f'  {"columns":<8}{len(plan.schema.names)} '
+        f'({len(plan.schema.names) - len(_ADDED_COLUMNS)} source + '
+        f'{len(_ADDED_COLUMNS)} added)')
+
+    if result.problems:
+        log('\n  [FAIL] output failed its own consistency check:')
+        for problem in result.problems:
+            log(f'         {problem}')
+    if plan.skipped:
+        log('')
+        for label, reason in plan.skipped:
+            log(f'  [skipped] {label}: {reason}')
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -757,43 +902,17 @@ def main():
 
     # ---- Validate ----
     print(f'\nValidating {len(sources)} source(s)...')
-    usable, skipped = [], []
-    for src in sources:
-        reason = inspect_source(src)
-        if reason is None:
-            usable.append(src)
-        else:
-            skipped.append((src.label, reason))
-            print(f'  [skip] {src.label}: {reason}')
-    if not usable:
-        print('\nNo usable sources after validation.', file=sys.stderr)
-        sys.exit(1)
-
     try:
-        keys = select_keys(usable, args.keys, args.require_fl, note)
-        if not keys:
-            raise ValueError('no tensor key is present in every source')
-        check_shapes(usable, keys)
+        plan = plan_concat(sources, args.keys, args.require_fl, note)
     except ValueError as exc:
         print(f'\nError: {exc}', file=sys.stderr)
         sys.exit(1)
 
-    schema, missing_cols = _union_schema(usable)
-    for column, lacking in sorted(missing_cols.items()):
-        note(f'column {column!r} absent from {len(lacking)} source(s), '
-             f'null-filled ({", ".join(lacking[:3])}'
-             f'{" ..." if len(lacking) > 3 else ""})')
-    renamed = sorted({c for s in usable for c in s.columns if c in _ADDED_COLUMNS})
-    for column in renamed:
-        note(f'source column {column!r} kept as {column}_source '
-             f'(the label column takes that name)')
-
-    total_rows = sum(s.nrows for s in usable)
-    print(f'\nPlan: {len(usable)} source(s), {total_rows:,} rows, '
-          f'keys {", ".join(keys)}')
-    for src in usable:
+    print(f'\nPlan: {len(plan.usable)} source(s), {plan.total_rows:,} rows, '
+          f'keys {", ".join(plan.keys)}')
+    for src in plan.usable:
         shape_bits = ', '.join(
-            f'{k}{tuple(int(d) for d in src.tensors[k].shape)}' for k in keys)
+            f'{k}{tuple(int(d) for d in src.tensors[k].shape)}' for k in plan.keys)
         print(f'  {src.label:<44}{src.nrows:>10,} rows   {shape_bits}')
 
     if args.dry_run:
@@ -811,45 +930,17 @@ def main():
     # something is wrong and should be loud (as compile_experiment.py does).
     out_dir.mkdir()
 
-    pt_out = out_dir / 'concat_vqvae_cache.pt'
-    parquet_out = out_dir / 'concat_vqvae_cache_metadata.parquet'
-
-    print(f'\nWriting {pt_out.name}...')
-    shapes = write_concat_pt(usable, keys, pt_out)
-    print(f'Writing {parquet_out.name}...')
-    written = write_concat_parquet(usable, parquet_out, schema)
+    print()
+    result = run_concat(plan, out_dir)
 
     # ---- Summary ----
     print(f'\n{"=" * 60}')
     print('VQVAE CONCAT SUMMARY')
     print(f'{"=" * 60}')
-    print(f'  {len(usable)}/{len(sources)} sources merged, '
-          f'{len(skipped)} skipped\n')
-    for key in keys:
-        info = usable[0].tensors[key]
-        itemsize = _STORAGE_ITEMSIZE[info.storage.storage_class]
-        nbytes = itemsize
-        for d in shapes[key]:
-            nbytes *= d
-        print(f'  {key:<8}{str(shapes[key]):<24}{info.dtype:<8}'
-              f'{nbytes / (1024 * 1024):>9,.1f} MB')
-    print(f'  {"rows":<8}{written:,}')
-    print(f'  {"columns":<8}{len(schema.names)} '
-          f'({len(schema.names) - len(_ADDED_COLUMNS)} source + '
-          f'{len(_ADDED_COLUMNS)} added)')
-
-    problems = self_check(pt_out, parquet_out, keys)
-    if problems:
-        print('\n  [FAIL] output failed its own consistency check:')
-        for problem in problems:
-            print(f'         {problem}')
-    if skipped:
-        print()
-        for label, reason in skipped:
-            print(f'  [skipped] {label}: {reason}')
+    summarize(plan, result, len(sources))
 
     print(f'\nDone. Output written to: {out_dir}')
-    if problems:
+    if result.problems:
         sys.exit(1)
 
 
