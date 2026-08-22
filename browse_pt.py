@@ -46,6 +46,7 @@ Usage:
 import argparse
 import io
 import pickle
+import random
 import subprocess
 import sys
 import zipfile
@@ -74,6 +75,15 @@ try:
     from PIL import Image, ImageTk
 except ImportError:
     Image = ImageTk = None
+
+# matplotlib backs the Images tab's "Save sample" button only, which lays out a
+# grid of transits (rows) x frames (columns) and rasterises it to a file. Guarded
+# like numpy/Pillow above so a machine missing it can still browse structure.
+try:
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+except ImportError:
+    Figure = FigureCanvasAgg = None
 
 
 _MAX_KIDS   = 200      # children shown per container
@@ -119,19 +129,25 @@ _ROWS_PER_PAGE = 5     # transits shown per page, as in browse_images.py
 _FRAME_HEIGHT  = 80    # display height (px) per crop; width scales to aspect
 _MAX_STRIP     = 400   # crops rendered in one row before the rest are elided
 _RAW_PER_ROW   = 24    # crops per row when there is no transit grouping
+_SAMPLE_SIZE   = 20    # transits drawn into a "Save sample" figure
 
-# The transit key in the sibling metadata parquet, best first. cell_group is the
-# label the ImageFXMAnalysis exporter carries through from the CELLGROUPED file
-# and is what a user recognises; transit_index is the same partition numerically.
-_TRANSIT_KEYS = ('cell_group', 'transit_index')
+# The transit key in the sibling metadata parquet, best first. cell_id is the
+# grouping column written by the current (SMRFXMAnalysis-style) producer;
+# cell_group/transit_index are the older ImageFXMAnalysis names, kept as a
+# fallback for caches exported before that producer became the default.
+_TRANSIT_KEYS = ('cell_id', 'cell_group', 'transit_index')
 
-# Orders crops within a transit. frame_idx counts frames within the transit, so
-# it is the natural left-to-right order; the others are fallbacks.
-_FRAME_ORDER_KEYS = ('frame_idx', 'frame_number_bf', 'loop_index')
+# Orders crops within a transit. frame_in_cell is the current producer's
+# within-transit frame counter; the rest are fallbacks for older exports.
+_FRAME_ORDER_KEYS = ('frame_in_cell', 'frame_idx', 'frame_number_bf', 'loop_index')
 
 # Per-row columns worth showing beside a transit. Only those present are used.
-_ROW_DETAIL_KEYS = ('classification', 'confidence', 'volume', 'matched_mass',
-                    'buoyant_density', 'frame_time')
+# cls/conf are the current producer's names for classification/confidence.
+_ROW_DETAIL_KEYS = ('cls', 'conf', 'classification', 'confidence', 'volume',
+                    'matched_mass', 'buoyant_density', 'frame_time')
+
+# classification-like column, best first, for the per-crop caption.
+_CLASS_DETAIL_KEYS = ('cls', 'classification')
 
 # Grouping columns added by concat_vqvae_caches.py. When present the tensor holds
 # several experiments, so a transit key alone is no longer unique across the file
@@ -1135,6 +1151,12 @@ class ImagePane:
         self._info_label = tk.Label(top, text='', font=self._NAV_FONT, anchor='w')
         self._info_label.pack(side=tk.LEFT)
 
+        # Needs a transit index to have rows to put in the grid, so it lives
+        # disabled until one is built.
+        self._sample_btn = tk.Button(top, text='Save sample...',
+                                     command=self._save_sample, state=tk.DISABLED)
+        self._sample_btn.pack(side=tk.RIGHT)
+
         # Rows live in a scrollable column: five strips of tall crops overflow a
         # short pane, and the tab shares its height with the tree.
         body = tk.Frame(self._frame, bg=self._BG)
@@ -1336,6 +1358,10 @@ class ImagePane:
         else:
             self._note = 'ungrouped: --no-sibling was given'
 
+        can_sample = (self._index is not None and len(self._index) > 0
+                     and Figure is not None)
+        self._sample_btn.config(state=tk.NORMAL if can_sample else tk.DISABLED)
+
         self._show_page()
 
     # ------------------------------------------------------------------
@@ -1401,6 +1427,7 @@ class ImagePane:
         self._note_label.config(text='')
         self._prev_btn.config(state=tk.DISABLED)
         self._next_btn.config(state=tk.DISABLED)
+        self._sample_btn.config(state=tk.DISABLED)
 
     def _show_page(self):
         if self._reader is None:
@@ -1485,15 +1512,85 @@ class ImagePane:
         """
         The line under one crop: its tensor row, plus a per-row metadata value.
 
-        classification is the column worth surfacing per frame — it is what marks
-        a crop as a usable cell — so it is appended when the sibling has it.
+        The classification-like column is what marks a crop as a usable cell,
+        so it is appended when the sibling has one, under whichever name the
+        producer used (cls is current, classification is the older name).
         """
         text = str(row)
         if self._index is not None:
-            values = self._index.detail.get('classification')
+            key = next((k for k in _CLASS_DETAIL_KEYS if k in self._index.detail),
+                      None)
+            values = self._index.detail.get(key) if key else None
             if values is not None and row < len(values) and values[row] is not None:
                 text += f' c{values[row]}'
         return text
+
+    def _save_sample(self):
+        """
+        Save a grid of _SAMPLE_SIZE transits (rows) x their frames (columns) to
+        an image file, in the same tensor/channel currently on screen.
+
+        Randomly sampled rather than the first page: the first _SAMPLE_SIZE
+        transits in file order are whatever the exporter happened to write
+        first, not representative of the cache as a whole.
+        """
+        if self._index is None or self._reader is None:
+            return
+        n_transits = len(self._index)
+        k = min(_SAMPLE_SIZE, n_transits)
+        chosen = sorted(random.sample(range(n_transits), k))
+
+        out_path = filedialog.asksaveasfilename(
+            title='Save transit sample',
+            initialdir=str(self._pt_path.parent),
+            initialfile=f'{self._pt_path.stem}_{self._tensor_key}_sample.png',
+            defaultextension='.png',
+            filetypes=[('PNG image', '*.png'), ('PDF', '*.pdf'),
+                      ('SVG', '*.svg'), ('All files', '*.*')])
+        if not out_path:
+            return
+
+        try:
+            self._render_sample(chosen, Path(out_path))
+        except Exception as exc:
+            messagebox.showerror('Save sample', f'Could not save sample:\n{exc}')
+            return
+        messagebox.showinfo('Save sample',
+                            f'Saved {k} transit(s) to {Path(out_path).name}')
+
+    def _render_sample(self, transit_indices: list[int], out_path: Path):
+        """Render the chosen transits into a rows-of-frames grid and write it out."""
+        rows = [self._index.rows[i] for i in transit_indices]
+        labels = [self._index.labels[i] for i in transit_indices]
+        n_rows = len(rows)
+        n_cols = max(1, max(len(r) for r in rows))
+
+        fig = Figure(figsize=(max(n_cols * 1.1, 4), max(n_rows * 1.1, 2)))
+        FigureCanvasAgg(fig)
+        axes = fig.subplots(n_rows, n_cols, squeeze=False)
+
+        for r, (label, tensor_rows) in enumerate(zip(labels, rows)):
+            for c in range(n_cols):
+                ax = axes[r][c]
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+                if c < len(tensor_rows):
+                    frame = self._reader.read(tensor_rows[c], self._channel)
+                    ax.imshow(frame, cmap='gray', vmin=0, vmax=255)
+                else:
+                    ax.set_facecolor('#eeeeee')
+                if r == 0:
+                    ax.set_title(str(c), fontsize=6)
+            axes[r][0].set_ylabel(label, rotation=0, ha='right', va='center',
+                                  fontsize=6)
+
+        chan = f'  ch{self._channel}' if self._channels > 1 else ''
+        fig.suptitle(f'{self._pt_path.name}  —  {self._tensor_key}{chan}  '
+                    f'({n_rows} transits x {n_cols} frames)')
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        fig.savefig(str(out_path), dpi=150)
 
     def _prev(self):
         if self._page > 0:
