@@ -8,9 +8,12 @@ loads them, and writes a structured output.
 
 Recognised sub-subdir types (all optional; most-recent used if multiple exist):
     *_mass_results          — mass CSV with mass_pg column
-    *_imaging_fxm_results   — stage2_analysis/*_ProcessedVolumes.csv;
-                               stage1_image_processing/*_CELLGROUPED.hdf5;
-                               stage2_analy1sis/*_Hdf5PathIndex.csv
+    *_imaging_fxm_results   — *_ProcessedVolumes.csv, and the *_CELLGROUPED.pt
+                               crop cache (+ its metadata parquet), directly in
+                               the results dir. Older runs from before
+                               SMRFXMAnalysis flattened its output nest these
+                               under a stage2_analysis/ subdir instead; both
+                               layouts are checked.
     *_pairing_results       — *_PairedSMRVolumes.csv
     *_bm_gating             — YAML with lower/upper thresholds
     *_ifxm-vol_gating       — YAML with lower/upper thresholds
@@ -173,6 +176,17 @@ def _last_matching_dir(parent: Path, pattern: re.Pattern) -> Path | None:
     return matches[-1] if matches else None
 
 
+def _resolve_stage2_dir(run_dir: Path) -> Path:
+    """
+    Where a run's stage-2 artifacts (*_ProcessedVolumes.csv, the crop cache) live.
+
+    Current SMRFXMAnalysis writes them directly in run_dir. Runs analyzed before
+    the stage1/stage2 split was dropped still have them under stage2_analysis/.
+    """
+    stage2 = run_dir / 'stage2_analysis'
+    return stage2 if stage2.is_dir() else run_dir
+
+
 def _discover_sample(sample_dir: Path) -> dict:
     """
     Locate the relevant file path for each known data type inside sample_dir.
@@ -210,13 +224,12 @@ def _discover_sample(sample_dir: Path) -> dict:
     # --- imaging_fxm_results ---
     fxm_dir = _last_matching_dir(sample_dir, re.compile(r'_imaging_fxm_results$'))
     if fxm_dir is not None:
-        stage2 = fxm_dir / 'stage2_analysis'
-        if stage2.is_dir():
-            for f in stage2.iterdir():
-                if (f.is_file() and not is_appledouble(f)
-                        and f.name.endswith('_ProcessedVolumes.csv')):
-                    paths['volume_path'] = f
-                    break
+        stage2 = _resolve_stage2_dir(fxm_dir)
+        for f in stage2.iterdir():
+            if (f.is_file() and not is_appledouble(f)
+                    and f.name.endswith('_ProcessedVolumes.csv')):
+                paths['volume_path'] = f
+                break
 
     # --- pairing_results ---
     pair_dir = _last_matching_dir(sample_dir, re.compile(r'_pairing_results$'))

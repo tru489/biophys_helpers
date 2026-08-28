@@ -35,8 +35,9 @@ Expected directory structure:
         Target column: mass_pg
 
     iFXM:
-        <superdir>/<sample_subdir>/<YYYYMMDD_HHMMSS>_imaging_fxm_results/
-            stage2_analysis/<sample>_ProcessedVolumes.csv
+        <superdir>/<sample_subdir>/<YYYYMMDD.HHMMSS>_imaging_fxm_results/
+            <sample>_ProcessedVolumes.csv (or stage2_analysis/<sample>_ProcessedVolumes.csv
+            for runs from before SMRFXMAnalysis dropped its stage1/stage2 split)
         Target column: volume
 
 Usage:
@@ -162,8 +163,9 @@ def _discover_ifxm(superdir: Path) -> dict:
     Finds iFXM volume data for each sample subdir in superdir.
 
     Searches two levels deep (superdir → sample_subdir →
-    *_imaging_fxm_results/stage2_analysis/*_ProcessedVolumes.csv) for CSVs
-    containing a volume column.
+    *_imaging_fxm_results/*_ProcessedVolumes.csv) for CSVs containing a volume
+    column. Runs from before SMRFXMAnalysis dropped its stage1/stage2 split
+    nest the CSV under a stage2_analysis/ subdirectory instead; both are checked.
 
     Args:
         superdir (Path): experiment superdir
@@ -171,7 +173,7 @@ def _discover_ifxm(superdir: Path) -> dict:
     Returns:
         dict: {sample_name (str): np.ndarray of volume values}
     """
-    run_dir_pattern = re.compile(r'\d{8}_\d{6}_imaging_fxm_results$')
+    run_dir_pattern = re.compile(r'\d{8}\.\d{6}_imaging_fxm_results$')
     data = {}
 
     for sample_dir in sorted(superdir.iterdir()):
@@ -186,8 +188,7 @@ def _discover_ifxm(superdir: Path) -> dict:
         run_dir = run_dirs[-1]
         stage2 = run_dir / 'stage2_analysis'
         if not stage2.is_dir():
-            print(f"  [skip] {sample_dir.name}: no stage2_analysis in {run_dir.name}")
-            continue
+            stage2 = run_dir
         csv_found = False
         for f in stage2.iterdir():
             if (f.is_file() and not is_appledouble(f)
@@ -204,7 +205,7 @@ def _discover_ifxm(superdir: Path) -> dict:
                 data[sample_dir.name] = vals
                 break
         if not csv_found:
-            print(f"  [skip] {sample_dir.name}: no _ProcessedVolumes.csv in {run_dir.name}/stage2_analysis/")
+            print(f"  [skip] {sample_dir.name}: no _ProcessedVolumes.csv in {run_dir.name}/")
 
     return data
 

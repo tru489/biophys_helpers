@@ -194,8 +194,9 @@ def _find_fxm_csvs(superdir: Path) -> list:
     """
     Finds FXM ProcessedVolumes CSV files within a superdir.
 
-    Looks for run dirs matching \\d{8}_\\d{6}_imaging_fxm_results, then descends
-    into stage2_analysis/ for *_ProcessedVolumes.csv files.
+    Looks for run dirs matching \\d{8}\\.\\d{6}_imaging_fxm_results, then looks
+    for *_ProcessedVolumes.csv files directly inside (or, for runs from before
+    SMRFXMAnalysis dropped its stage1/stage2 split, inside stage2_analysis/).
 
     Args:
         superdir (Path): superdir to search
@@ -203,7 +204,7 @@ def _find_fxm_csvs(superdir: Path) -> list:
     Returns:
         list(Path): matched CSV files
     """
-    run_dir_pattern = re.compile(r"\d{8}_\d{6}_imaging_fxm_results")
+    run_dir_pattern = re.compile(r"\d{8}\.\d{6}_imaging_fxm_results")
     found = []
 
     for subdir in sorted(superdir.iterdir()):
@@ -214,7 +215,7 @@ def _find_fxm_csvs(superdir: Path) -> list:
                 continue
             stage2_dir = run_dir / 'stage2_analysis'
             if not stage2_dir.is_dir():
-                continue
+                stage2_dir = run_dir
             for file in stage2_dir.iterdir():
                 if file.is_file() and file.name.endswith('_ProcessedVolumes.csv'):
                     found.append(file)

@@ -47,7 +47,6 @@ from pipeline.stage2.pairing_utils import (
 # ──────────────────────────────────────────────────────────────────────────────
 
 _TS_PATTERNS = [
-    (re.compile(r"^(\d{8}_\d{6})_"), "%Y%m%d_%H%M%S"),   # 20260606_025232_…
     (re.compile(r"^(\d{8}\.\d{6})_"), "%Y%m%d.%H%M%S"),  # 20260607.150735_…
 ]
 
@@ -525,14 +524,12 @@ def main() -> None:
         print(f"[INFO] Auto-selected imaging dir : {vol_dir_name}")
 
     vol_dir    = os.path.join(analysis_dir, vol_dir_name)
+    # Current SMRFXMAnalysis writes stage-2 artifacts directly in vol_dir. Runs
+    # from before the stage1/stage2 split was dropped nest them under
+    # stage2_analysis/ instead.
     stage2_dir = os.path.join(vol_dir, "stage2_analysis")
-
     if not os.path.isdir(stage2_dir):
-        print(
-            f"[ERROR] Expected stage2_analysis subdir not found in:\n  {vol_dir}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        stage2_dir = vol_dir
 
     # ── resolve mass dir ─────────────────────────────────────────────────
     if args.mass_dir:

@@ -72,7 +72,6 @@ from pipeline.stage2.pairing_utils import (
 # =============================================================================
 
 _TS_PATTERNS = [
-    (re.compile(r"^(\d{8}_\d{6})_"), "%Y%m%d_%H%M%S"),   # 20260606_025232_…
     (re.compile(r"^(\d{8}\.\d{6})_"), "%Y%m%d.%H%M%S"),  # 20260607.150735_…
 ]
 
@@ -862,11 +861,12 @@ def pair_one(
         print(f"[INFO]   Auto-selected imaging dir : {vol_dir_name}")
 
     vol_dir    = os.path.join(analysis_dir, vol_dir_name)
+    # Current SMRFXMAnalysis writes stage-2 artifacts directly in vol_dir. Runs
+    # from before the stage1/stage2 split was dropped nest them under
+    # stage2_analysis/ instead.
     stage2_dir = os.path.join(vol_dir, "stage2_analysis")
     if not os.path.isdir(stage2_dir):
-        raise FileNotFoundError(
-            f"stage2_analysis not found in {vol_dir}"
-        )
+        stage2_dir = vol_dir
 
     if mass_dir_name is None:
         mass_dir_name = find_most_recent_dir(analysis_dir, "_mass_results")

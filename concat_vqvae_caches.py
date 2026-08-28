@@ -5,10 +5,10 @@ Concatenates the stage-2 VQ-VAE crop caches of many experiments into one
 `.pt` + one `.parquet`, keeping every row traceable to the experiment it came
 from.
 
-A crop cache is a pair written by ImageFXMAnalysis stage 2:
+A crop cache is a pair written by SMRFXMAnalysis alongside the CELLGROUPED hdf5:
 
-    <sample>_vqvae_cache.pt               {'bf_u8': uint8 (N, 1, S, S), ...}
-    <sample>_vqvae_cache_metadata.parquet one row per crop
+    <base_id>_CELLGROUPED.pt               {'bf_u8': uint8 (N, 1, S, S), ...}
+    <base_id>_CELLGROUPED_metadata.parquet one row per crop
 
 The two are joined by position and nothing else — parquet row i describes tensor
 row i. This script therefore advances both in lockstep from a single ordered list
@@ -20,9 +20,11 @@ of sources, so the outputs cannot drift, and it adds three columns to every row:
 
 Caches are found under the layout the other aggregators in this repo walk:
 
-    <superdir>/<sample>/<YYYYMMDD_HHMMSS>_imaging_fxm_results/stage2_analysis/
+    <superdir>/<sample>/<YYYYMMDD.HHMMSS>_imaging_fxm_results/
 
-with the newest run directory winning when a sample has been reprocessed.
+Runs from before SMRFXMAnalysis dropped its stage1/stage2 split instead nest
+this under a stage2_analysis/ subdirectory; both layouts are checked. The
+newest run directory wins when a sample has been reprocessed.
 
 No PyTorch is required, and no file is ever read whole. torch.save writes an
 uncompressed zip whose storage blobs are 64-byte aligned, so for a contiguous
@@ -77,7 +79,7 @@ _BATCH_ROWS   = 8_192     # parquet rows per streamed batch
 
 _RUN_SUFFIX   = '_imaging_fxm_results'
 _STAGE2_DIR   = 'stage2_analysis'
-_CACHE_SUFFIX = '_vqvae_cache.pt'
+_CACHE_SUFFIX = '_CELLGROUPED.pt'
 
 # Output file names. Public because compile_experiment.py writes the same pair
 # into its own output dir through concat_caches(), and the two must agree.
@@ -91,10 +93,10 @@ _LABEL_SAMPLE     = 'sample_name'
 _LABEL_ROW        = 'cache_row'
 _ADDED_COLUMNS    = (_LABEL_EXPERIMENT, _LABEL_SAMPLE, _LABEL_ROW)
 
-# Matches the timestamp prefix on a run directory. Both separators occur in the
-# wild: _imaging_fxm_results uses YYYYMMDD_HHMMSS, _pairing_results uses
-# YYYYMMDD.HHMMSS, so accept either (as prune_timestamped_subdirs.py does).
-_TS_PATTERN = re.compile(r'^(\d{8}[._]\d{6})_')
+# Matches the timestamp prefix on a run directory. SMRFXMAnalysis's
+# imaging_fxm_results dirs are dot-separated (YYYYMMDD.HHMMSS) only -- there is
+# no underscore-separated form in the wild for this suffix.
+_TS_PATTERN = re.compile(r'^(\d{8}\.\d{6})_')
 
 _RUN_DIR_PATTERN = re.compile(re.escape(_RUN_SUFFIX) + r'$')
 
@@ -210,11 +212,11 @@ def _sample_cache(superdir_name: str, sample_dir: Path, warn) -> CacheSource | N
     run_dir = _last_matching_dir(sample_dir, _RUN_DIR_PATTERN)
     if run_dir is None:
         return None
+    # Current SMRFXMAnalysis writes the cache directly in run_dir. Runs from
+    # before the stage1/stage2 split was dropped nest it under stage2_analysis/.
     stage2 = run_dir / _STAGE2_DIR
     if not stage2.is_dir():
-        warn(f'{superdir_name}/{sample_dir.name}: no {_STAGE2_DIR} in '
-             f'{run_dir.name}')
-        return None
+        stage2 = run_dir
 
     caches = sorted(f for f in stage2.iterdir()
                     if f.is_file() and not is_appledouble(f)

@@ -87,7 +87,7 @@ iFXM images  ──> (FXM software) ──────────────�
                                        ▼
                            browse_experiment.py  (interactive viewer)
 
-VQ-VAE crop caches: *_imaging_fxm_results/stage2_analysis/*_vqvae_cache.pt (+ _metadata.parquet)
+VQ-VAE crop caches: *_imaging_fxm_results/*_CELLGROUPED.pt (+ _metadata.parquet)
                                        │
                                        ├─> concat_vqvae_caches.py ──> *_vqvae_concat/  (one merged
                                        │                               .pt + .parquet for training)
@@ -220,14 +220,15 @@ named `*_mass_results`; all CSVs within (except `curation_index*.csv`) are colle
       <csv files>
 ```
 
-FXM volume files (produced by `FXMAnalysis.py`):
+FXM volume files (produced by SMRFXMAnalysis):
 ```
 <superdir>/
   <sample_subdir>/
-    <YYYYMMDD_HHMMSS>_imaging_fxm_results/
-      stage2_analysis/
-        <sample_name>_ProcessedVolumes.csv
+    <YYYYMMDD.HHMMSS>_imaging_fxm_results/
+      <sample_name>_ProcessedVolumes.csv
 ```
+(runs from before SMRFXMAnalysis dropped its stage1/stage2 split instead nest
+the CSV under a `stage2_analysis/` subdirectory; both are checked)
 
 **Usage**
 
@@ -544,9 +545,11 @@ A YAML gate file written into each sample subfolder, and a summary folder in the
 
 ```
 BM:    <superdir>/<sample_subdir>/<name>_mass_results/<date>_<name>.csv          (column: mass_pg)
-iFXM:  <superdir>/<sample_subdir>/<YYYYMMDD_HHMMSS>_imaging_fxm_results/
-           stage2_analysis/<sample>_ProcessedVolumes.csv                          (column: volume)
+iFXM:  <superdir>/<sample_subdir>/<YYYYMMDD.HHMMSS>_imaging_fxm_results/
+           <sample>_ProcessedVolumes.csv                                        (column: volume)
 ```
+(runs from before SMRFXMAnalysis dropped its stage1/stage2 split instead nest
+the CSV under a `stage2_analysis/` subdirectory; both are checked)
 
 **Usage**
 
@@ -668,18 +671,20 @@ crops), loads them, and writes structured output. Most-recent is used if multipl
 type exist.
 
 > **Images now come from the crop cache only.** Earlier versions also wrote an `images.h5`
-> of full per-transit BF frames read from each sample's stage-1 CELLGROUPED file. That
-> output is gone, along with `--no-images`, so the field of view *outside* each crop is no
-> longer compiled and only samples with a stage-2 cache carry pixels at all. Inspect the
-> crops with [`browse_pt.py`](browse_pt.py). [`browse_images.py`](browse_images.py) reads
-> `images.h5` and so no longer has an input this script produces.
+> of full per-transit BF frames read from each sample's CELLGROUPED file. That output is
+> gone, along with `--no-images`, so the field of view *outside* each crop is no longer
+> compiled and only samples with a crop cache carry pixels at all. Inspect the crops with
+> [`browse_pt.py`](browse_pt.py) (the `browse_images.py` viewer this replaced has been
+> removed, since its `images.h5` input no longer exists).
 
 **Recognised sub-subdir types** (all optional)
 
 ```
 *_mass_results          mass CSV with mass_pg column
-*_imaging_fxm_results   stage2_analysis/*_ProcessedVolumes.csv;
-                        stage2_analysis/*_vqvae_cache.pt (+ _metadata.parquet)
+*_imaging_fxm_results   *_ProcessedVolumes.csv;
+                        *_CELLGROUPED.pt (+ _metadata.parquet)
+                        (runs from before SMRFXMAnalysis dropped its stage1/stage2
+                        split nest these under stage2_analysis/ instead)
 *_pairing_results       *_PairedSMRVolumes.csv
 *_bm_gating             YAML with lower/upper thresholds
 *_ifxm-vol_gating       YAML with lower/upper thresholds
@@ -782,8 +787,8 @@ traceable to where it came from.
 > pair into its `*_compiled/` output dir. Reach for this script when merging across
 > superdirs, or when you want the caches without a full compilation.
 
-A crop cache is a pair: `<sample>_vqvae_cache.pt` holding `bf_u8` (and `fl_u8` when
-fluorescence export is on) as `uint8 (N, 1, S, S)`, and `<sample>_vqvae_cache_metadata.parquet`
+A crop cache is a pair: `<base_id>_CELLGROUPED.pt` holding `bf_u8` (and `fl_u8` when
+fluorescence export is on) as `uint8 (N, 1, S, S)`, and `<base_id>_CELLGROUPED_metadata.parquet`
 holding one row per crop. **The two are joined by position and nothing else** — parquet row
 `i` describes tensor row `i`. This script drives both outputs from one ordered list of
 sources so they cannot drift, and adds three columns to every row:
@@ -798,7 +803,8 @@ sources so they cannot drift, and adds three columns to every row:
 later sort or filter of the parquet: `bf_u8[row.cache_row]` is always that row's crop.
 
 Caches are found under the same layout the other aggregators walk —
-`<superdir>/<sample>/<YYYYMMDD_HHMMSS>_imaging_fxm_results/stage2_analysis/` — with the
+`<superdir>/<sample>/<YYYYMMDD.HHMMSS>_imaging_fxm_results/` (or, for runs from before
+SMRFXMAnalysis dropped its stage1/stage2 split, `.../stage2_analysis/`) — with the
 newest run directory winning when a sample has been reprocessed. Samples missing any part
 of that chain are skipped with a warning rather than failing the run.
 
@@ -1001,13 +1007,12 @@ checkpoint cannot execute anything.
 
 #### Images tab
 
-An **Images** tab beside the details pane shows the crops themselves, one row per transit
-in the style of [`browse_images.py`](browse_images.py): each row is a horizontally
-scrollable strip of that transit's frames, five transits per page, with each crop captioned
-by its tensor row and `classification`. `View images` jumps straight there on the selected
-tensor.
+An **Images** tab beside the details pane shows the crops themselves, one row per transit,
+in the style of the now-removed `browse_images.py`: each row is a horizontally scrollable
+strip of that transit's frames, five transits per page, with each crop captioned by its
+tensor row and `classification`. `View images` jumps straight there on the selected tensor.
 
-Where `browse_images.py` reads a transit's frames from its own HDF5 group, a crop cache is
+Where `browse_images.py` used to read a transit's frames from its own HDF5 group, a crop cache is
 a **flat** `(N, 1, S, S)` stack with no such structure — the grouping comes from the sibling
 parquet's `cell_group` column (or `transit_index`), and a transit's rows are **not
 contiguous**: transits overlap in time and the exporter writes in frame order, so two cells
@@ -1045,10 +1050,10 @@ python browse_pt.py [<pt_path>] [--no-sibling] [--dump]
 
 ```bash
 # Browse a crop cache interactively (finds the sibling metadata parquet)
-python browse_pt.py "E:/data/stage2_analysis/SAMPLE_A_vqvae_cache.pt"
+python browse_pt.py "E:/data/20260814.082513_imaging_fxm_results/SAMPLE_A_CELLGROUPED.pt"
 
 # Check a cache from the terminal — dimensions, and whether the sibling row count matches
-python browse_pt.py --dump "E:/data/stage2_analysis/SAMPLE_A_vqvae_cache.pt"
+python browse_pt.py --dump "E:/data/20260814.082513_imaging_fxm_results/SAMPLE_A_CELLGROUPED.pt"
 
 # Any .pt works, not just crop caches
 python browse_pt.py --dump models/20241217_NewModelOldCrop.pt
