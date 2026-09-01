@@ -36,9 +36,11 @@ Expected directory structure:
 
     iFXM:
         <superdir>/<sample_subdir>/<YYYYMMDD.HHMMSS>_imaging_fxm_results/
-            <sample>_ProcessedVolumes.csv (or stage2_analysis/<sample>_ProcessedVolumes.csv
-            for runs from before SMRFXMAnalysis dropped its stage1/stage2 split)
-        Target column: volume
+            <sample>_CELLGROUPED.hdf5, table analysis/volume/cells
+            (falls back to <sample>_ProcessedVolumes.csv, or
+            stage2_analysis/<sample>_ProcessedVolumes.csv, for runs from
+            before SMRFXMAnalysis wrote calibrated volumes into the hdf5)
+        Target column: volume_fl (hdf5) or volume (legacy csv)
 
 Usage:
     python gate_experiment_subfolder.py <superdir>
@@ -49,6 +51,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pandas as pd
 import tkinter as tk
@@ -158,20 +161,45 @@ def _discover_bm(superdir: Path) -> dict:
     return data
 
 
+def _read_hdf5_volume_fl(hdf5_path: Path) -> np.ndarray | None:
+    """
+    Reads the volume_fl column out of a *_CELLGROUPED.hdf5's
+    analysis/volume/cells table, keeping only cells whose status_code is
+    'ok' (every other status, e.g. no_valid_roi_frames, means volume was not
+    successfully computed for that cell and volume_fl is NaN).
+
+    Returns None if the file/table could not be read at all.
+    """
+    try:
+        with h5py.File(hdf5_path, 'r') as f:
+            cells = f['analysis/volume/cells'][:]
+    except Exception as exc:
+        print(f"  [warn] could not read {hdf5_path.name}: {exc}")
+        return None
+    ok = cells[cells['status_code'] == b'ok']
+    vals = ok['volume_fl'].astype(float)
+    return vals[~np.isnan(vals)]
+
+
 def _discover_ifxm(superdir: Path) -> dict:
     """
     Finds iFXM volume data for each sample subdir in superdir.
 
     Searches two levels deep (superdir → sample_subdir →
-    *_imaging_fxm_results/*_ProcessedVolumes.csv) for CSVs containing a volume
-    column. Runs from before SMRFXMAnalysis dropped its stage1/stage2 split
-    nest the CSV under a stage2_analysis/ subdirectory instead; both are checked.
+    *_imaging_fxm_results/) for a *_CELLGROUPED.hdf5 and reads its
+    analysis/volume/cells table's volume_fl column (status_code == 'ok'
+    cells only) — the current SMRFXMAnalysis output.
+
+    Runs from before SMRFXMAnalysis wrote calibrated volumes into the hdf5
+    instead have a *_ProcessedVolumes.csv (nested under a stage2_analysis/
+    subdirectory for runs from before the stage1/stage2 split was dropped);
+    this legacy source is used as a fallback when no hdf5 is present.
 
     Args:
         superdir (Path): experiment superdir
 
     Returns:
-        dict: {sample_name (str): np.ndarray of volume values}
+        dict: {sample_name (str): np.ndarray of volume values (fL)}
     """
     run_dir_pattern = re.compile(r'\d{8}\.\d{6}_imaging_fxm_results$')
     data = {}
@@ -186,6 +214,24 @@ def _discover_ifxm(superdir: Path) -> dict:
         if not run_dirs:
             continue
         run_dir = run_dirs[-1]
+
+        hdf5_files = sorted(
+            f for f in run_dir.iterdir()
+            if f.is_file() and not is_appledouble(f)
+            and f.name.endswith('_CELLGROUPED.hdf5')
+        )
+        if hdf5_files:
+            f = hdf5_files[-1]
+            vals = _read_hdf5_volume_fl(f)
+            if vals is None:
+                continue
+            if len(vals) == 0:
+                print(f"  [skip] {sample_dir.name}: no 'ok' cells with a volume_fl in {f.name}")
+                continue
+            data[sample_dir.name] = vals
+            continue
+
+        # Legacy fallback: pre-hdf5 runs wrote a ProcessedVolumes.csv instead.
         stage2 = run_dir / 'stage2_analysis'
         if not stage2.is_dir():
             stage2 = run_dir
@@ -205,7 +251,7 @@ def _discover_ifxm(superdir: Path) -> dict:
                 data[sample_dir.name] = vals
                 break
         if not csv_found:
-            print(f"  [skip] {sample_dir.name}: no _ProcessedVolumes.csv in {run_dir.name}/")
+            print(f"  [skip] {sample_dir.name}: no CELLGROUPED.hdf5 or _ProcessedVolumes.csv in {run_dir.name}/")
 
     return data
 
