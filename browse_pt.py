@@ -3,7 +3,8 @@ browse_pt.py
 
 Structure browser for PyTorch (.pt / .pth) files. Reports the dimensions, dtype
 and device of every tensor inside, interprets 3-D and 4-D tensors as image stacks,
-and surfaces the sibling metadata parquet that accompanies a VQ-VAE crop cache.
+and surfaces the sibling metadata parquet and CELLGROUPED HDF5 that accompany a
+VQ-VAE crop cache.
 
 Written for the crop caches emitted by stage 2 of the ImageFXMAnalysis pipeline.
 Those files hold only image tensors — `bf_u8`, always, and `fl_u8` when
@@ -12,6 +13,8 @@ metadata deliberately lives in a sibling `<stem>_metadata.parquet` with one row
 per crop, row-aligned with axis 0 of the tensors. This tool therefore looks for
 that sibling and reports its row count, its constant-down-file columns, and
 whether its row count still matches N — a mismatch means a broken export.
+SMRFXMAnalysis also writes a `<stem>.hdf5` CELLGROUPED file beside the crop
+cache; `Open HDF5` launches browse_h5.py on it directly.
 
 The file is read WITHOUT importing torch. A .pt is a zip archive holding one
 pickle plus raw storage blobs; every shape and dtype lives in the pickle, so
@@ -909,6 +912,19 @@ def sibling_path(path: Path) -> Path | None:
     return None
 
 
+def sibling_hdf5_path(path: Path) -> Path | None:
+    """
+    The CELLGROUPED HDF5 SMRFXMAnalysis writes beside its crop cache.
+
+    Same stem, different extension: <base_id>_CELLGROUPED.pt sits next to
+    <base_id>_CELLGROUPED.hdf5.
+    """
+    candidate = path.with_suffix('.hdf5')
+    if candidate.is_file() and not is_appledouble(candidate):
+        return candidate
+    return None
+
+
 def _sibling_lines(path: Path, expected: tuple[str, int] | None) -> list[str]:
     """
     Describe the sibling metadata parquet, if there is one.
@@ -1714,6 +1730,11 @@ class BrowsePtApp:
         self._sib_btn.pack(side=tk.RIGHT, padx=(6, 0))
         if sibling_path(self._path) is None:
             self._sib_btn.config(state=tk.DISABLED)
+        self._hdf5_btn = tk.Button(top, text='Open HDF5',
+                                   command=self._open_sibling_hdf5)
+        self._hdf5_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        if sibling_hdf5_path(self._path) is None:
+            self._hdf5_btn.config(state=tk.DISABLED)
 
         self._key_label = tk.Label(top, text='', anchor='w', fg='#444')
         self._key_label.pack(side=tk.LEFT, padx=(16, 0))
@@ -1963,6 +1984,21 @@ class BrowsePtApp:
         if not script.is_file():
             messagebox.showerror('Cannot open',
                                  f'browse_parquet.py not found beside {Path(__file__).name}')
+            return
+        try:
+            subprocess.Popen([sys.executable, str(script), str(sib)])
+        except Exception as exc:
+            messagebox.showerror('Cannot open', str(exc))
+
+    def _open_sibling_hdf5(self):
+        """Launch browse_h5.py on the sibling CELLGROUPED HDF5 file."""
+        sib = sibling_hdf5_path(self._path)
+        if sib is None:
+            return
+        script = Path(__file__).with_name('browse_h5.py')
+        if not script.is_file():
+            messagebox.showerror('Cannot open',
+                                 f'browse_h5.py not found beside {Path(__file__).name}')
             return
         try:
             subprocess.Popen([sys.executable, str(script), str(sib)])

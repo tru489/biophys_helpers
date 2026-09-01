@@ -904,11 +904,17 @@ Unlike `browse_images.py` and `browse_experiment.py`, which each expect one spec
 schema, this tool assumes nothing about the contents.
 
 Objects written by pandas (`pd.HDFStore` / `DataFrame.to_hdf`) are shown **logically**:
-a stored DataFrame is one leaf with its real row/column counts, column dtypes, and a
-10-row preview, rather than the PyTables internals (`axis0`, `block0_values`, `table`)
-that back it. Tick **Show raw HDF5 nodes** to see the underlying hierarchy verbatim.
-`Copy path` puts the selected node's key on the clipboard, ready to paste into
-`store[...]`.
+a stored DataFrame is one leaf with its real row/column counts and column dtypes, rather
+than the PyTables internals (`axis0`, `block0_values`, `table`) that back it. Tick **Show
+raw HDF5 nodes** to see the underlying hierarchy verbatim. `Copy path` puts the selected
+node's key on the clipboard, ready to paste into `store[...]`.
+
+Selecting any node with rows — a pandas DataFrame/Series, or a raw compound dataset such as
+a CELLGROUPED file's `meta/frames` — fills the **Data** pane below the tree with a paged,
+column-labelled table, the same way `browse_pt.py` shows a metadata parquet: **Prev** /
+**Next** and a **Go to row** box page through the whole dataset (200 rows at a time)
+without ever loading it all into memory, so a hundred-thousand-row table opens as fast as
+a ten-row one.
 
 **Usage**
 
@@ -929,8 +935,11 @@ python browse_h5.py [<h5_path>] [--raw] [--dump]
 python browse_h5.py "E:/data/2026-05-22_tcell_act/20260611_235527_paired/data.h5"
 
 # Print the structure to the terminal (no display needed)
-python browse_h5.py --dump "E:/data/2026-05-22_tcell_act/sample_01/20260611_235527_imaging_fxm_results/stage1_image_processing/sample_01_CELLGROUPED.hdf5"
+python browse_h5.py --dump "E:/data/20260814.082513_imaging_fxm_results/sample_01_CELLGROUPED.hdf5"
 ```
+
+> A CELLGROUPED HDF5 is also one click away from its sibling crop cache: `browse_pt.py`'s
+> **Open HDF5** button launches this tool on it directly (see below).
 
 > Opens files read-only with HDF5 file locking disabled, so a file that is open
 > elsewhere or living on a network / cloud-synced volume can still be inspected.
@@ -971,10 +980,10 @@ python browse_parquet.py [<parquet_path>] [--rows N] [--dump]
 
 ```bash
 # Browse interactively
-python browse_parquet.py "E:/data/stage2_analysis/SAMPLE_A_vqvae_cache_metadata.parquet"
+python browse_parquet.py "E:/data/20260814.082513_imaging_fxm_results/SAMPLE_A_CELLGROUPED_metadata.parquet"
 
 # Print the schema and first 20 rows to the terminal (no display needed)
-python browse_parquet.py --dump --rows 20 "E:/data/stage2_analysis/SAMPLE_A_vqvae_cache_metadata.parquet"
+python browse_parquet.py --dump --rows 20 "E:/data/20260814.082513_imaging_fxm_results/SAMPLE_A_CELLGROUPED_metadata.parquet"
 ```
 
 > Reads through `pyarrow` rather than `pandas.read_parquet`, so the schema and row counts
@@ -998,6 +1007,11 @@ constant-down-file columns (`crop_size`, `center_pixel`, `source_file`, …), an
 its row count still matches N** — the two files are joined by position alone, so a
 mismatch is flagged loudly because it means the export is broken. `Open metadata parquet`
 launches `browse_parquet.py` on it.
+
+The sibling CELLGROUPED HDF5 that SMRFXMAnalysis writes alongside the crop cache — same
+stem, `.hdf5` instead of `.pt` — is one click away too: `Open HDF5` launches `browse_h5.py`
+on it, where `meta/frames` and the rest of the per-frame record show up in the same paged,
+tabular Data view as a metadata parquet. Disabled when no such file sits beside the `.pt`.
 
 **No `torch` install is required.** A `.pt` is a zip archive holding one pickle plus raw
 storage blobs, and every shape and dtype lives in the pickle — so unpickling with stubbed

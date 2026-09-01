@@ -16,6 +16,12 @@ column dtypes, rather than as the PyTables internals (axis0, block0_values,
 table) that back it. Tick "Show raw HDF5 nodes" to see the underlying hierarchy
 verbatim.
 
+Selecting a node with rows -- a pandas DataFrame/Series, or a raw compound
+dataset such as a CELLGROUPED file's meta/frames -- fills the Data pane with a
+paged, column-labelled table, the same way browse_parquet.py shows a parquet's
+rows: Prev/Next and a "go to row" box page through the whole dataset without
+loading it all into memory.
+
 Usage:
     python browse_h5.py [<h5_path>] [--raw] [--dump]
 
@@ -50,9 +56,10 @@ from fsutil import is_appledouble
 warnings.filterwarnings('ignore', message='object name is not a valid Python identifier')
 
 
-_HEAD_ROWS      = 10       # rows shown in the DataFrame preview
+_ROWS_PER_PAGE  = 200      # rows per page in the Data view
 _FULL_READ_CAP  = 200_000  # don't fall back to a whole-frame read above this many rows
 _ATTR_MAXLEN    = 200      # truncate attribute reprs to this many chars
+_CELL_MAXLEN    = 120      # truncate long cell reprs to this many chars
 _DUMP_MAXKIDS   = 50       # children printed per group in --dump mode
 
 # PyTables/pandas internal node names, hidden in logical mode.
@@ -391,27 +398,29 @@ def _attr_items(obj, logical: bool = False) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# DataFrame preview
+# Tabular data — pandas frames and raw compound datasets alike
 # ---------------------------------------------------------------------------
 
-def read_head(store, key: str, nrows: int | None) -> tuple[pd.DataFrame | None, str]:
+def read_page(store, key: str, start: int, stop: int,
+              nrows: int | None) -> tuple[pd.DataFrame | None, str]:
     """
-    Read the first _HEAD_ROWS rows of a pandas-stored object.
+    Read rows [start, stop) of a pandas-stored object.
 
-    Returns (frame, message). frame is None when no preview is possible, and
+    Returns (frame, message). frame is None when no page could be read, and
     message then explains why.
     """
     if store is None:
         return None, '(no pandas store available)'
     try:
-        obj = store.select(key, start=0, stop=_HEAD_ROWS)
+        obj = store.select(key, start=start, stop=stop)
     except (TypeError, NotImplementedError, ValueError):
-        # Some layouts don't honour start/stop; a whole-frame read is only
-        # acceptable when the frame is known to be small.
+        # Some layouts (fixed format) don't honour start/stop; slicing a
+        # whole-frame read is only acceptable when the frame is known to be
+        # small enough to hold in memory in the first place.
         if nrows is not None and nrows > _FULL_READ_CAP:
             return None, f'(preview unavailable - {nrows:,} rows, not read)'
         try:
-            obj = store.get(key).head(_HEAD_ROWS)
+            obj = store.get(key).iloc[start:stop]
         except Exception as exc:
             return None, f'(preview failed: {exc.__class__.__name__}: {exc})'
     except Exception as exc:
@@ -422,6 +431,40 @@ def read_head(store, key: str, nrows: int | None) -> tuple[pd.DataFrame | None, 
     if not isinstance(obj, pd.DataFrame):
         return None, f'(unexpected preview type: {type(obj).__name__})'
     return obj, ''
+
+
+def _fmt_cell(value) -> str:
+    """Render one cell as bounded, single-line text."""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode('utf-8')
+        except UnicodeDecodeError:
+            return f'<{len(value)} bytes, not text>'
+    if value is None:
+        return ''
+    text = value if isinstance(value, str) else str(value)
+    text = ' '.join(text.split())
+    if len(text) > _CELL_MAXLEN:
+        text = text[:_CELL_MAXLEN] + f'... ({len(text)} chars)'
+    return text
+
+
+def read_dataset_page(dset: h5py.Dataset, start: int,
+                      stop: int) -> tuple[list[str], list[list[str]], str]:
+    """
+    Field names and rows [start, stop) of a compound HDF5 dataset, as display
+    strings. Returns (names, rows, message); message is non-empty only when the
+    dataset has no named fields, in which case names/rows are both empty.
+    """
+    names = list(dset.dtype.names or ())
+    if not names:
+        return [], [], '(not a compound dataset -- no named fields)'
+    stop = max(start, min(stop, dset.shape[0]))
+    if start >= stop:
+        return names, [], ''
+    chunk = dset[start:stop]
+    rows = [[_fmt_cell(rec[name]) for name in names] for rec in chunk]
+    return names, rows, ''
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +532,12 @@ class BrowseH5App:
         # Treeview item id -> HDF5 path. The display text alone can't be trusted
         # to rebuild a path (names may repeat at different depths).
         self._paths: dict[str, str] = {}
+        # Describes the currently selected node's tabular data, or None when it
+        # has none: {'kind': 'pandas', 'key': str, 'nrows': int|None} for a
+        # pandas frame/series, {'kind': 'dataset', 'dset': h5py.Dataset} for a
+        # raw compound dataset.
+        self._data_source: dict | None = None
+        self._page = 0
 
         root.title(f'browse_h5 - {path.name}')
         root.geometry('1200x800')
@@ -591,24 +640,41 @@ class BrowseH5App:
         self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tvsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self._head_label = tk.Label(frame, text='', font=self._HDR_FONT,
+        self._data_label = tk.Label(frame, text='', font=self._HDR_FONT,
                                     anchor='w')
-        self._head_label.pack(fill=tk.X, pady=(8, 0))
+        self._data_label.pack(fill=tk.X, pady=(8, 0))
 
-        head_frame = tk.Frame(frame)
-        head_frame.pack(fill=tk.BOTH, expand=True)
-        hvsb = ttk.Scrollbar(head_frame, orient=tk.VERTICAL)
-        hhsb = ttk.Scrollbar(head_frame, orient=tk.HORIZONTAL)
-        self._head = ttk.Treeview(head_frame, show='headings', height=8,
-                                  yscrollcommand=hvsb.set,
-                                  xscrollcommand=hhsb.set)
-        hvsb.config(command=self._head.yview)
-        hhsb.config(command=self._head.xview)
-        self._head.grid(row=0, column=0, sticky='nsew')
-        hvsb.grid(row=0, column=1, sticky='ns')
-        hhsb.grid(row=1, column=0, sticky='ew')
-        head_frame.rowconfigure(0, weight=1)
-        head_frame.columnconfigure(0, weight=1)
+        data_frame = tk.Frame(frame)
+        data_frame.pack(fill=tk.BOTH, expand=True)
+        dvsb = ttk.Scrollbar(data_frame, orient=tk.VERTICAL)
+        dhsb = ttk.Scrollbar(data_frame, orient=tk.HORIZONTAL)
+        self._data = ttk.Treeview(data_frame, show='headings', height=8,
+                                  yscrollcommand=dvsb.set,
+                                  xscrollcommand=dhsb.set)
+        dvsb.config(command=self._data.yview)
+        dhsb.config(command=self._data.xview)
+        self._data.grid(row=0, column=0, sticky='nsew')
+        dvsb.grid(row=0, column=1, sticky='ns')
+        dhsb.grid(row=1, column=0, sticky='ew')
+        data_frame.rowconfigure(0, weight=1)
+        data_frame.columnconfigure(0, weight=1)
+
+        # ---- Nav bar (enabled only while the selection has pageable data) ----
+        nav = tk.Frame(frame)
+        nav.pack(fill=tk.X, pady=(6, 0))
+
+        self._prev_btn = tk.Button(nav, text='<< Prev', command=self._prev_page)
+        self._prev_btn.pack(side=tk.LEFT)
+        self._next_btn = tk.Button(nav, text='Next >>', command=self._next_page)
+        self._next_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._page_label = tk.Label(nav, text='', anchor='w')
+        self._page_label.pack(side=tk.LEFT, padx=(12, 0))
+
+        tk.Button(nav, text='Go', command=self._goto_page).pack(side=tk.RIGHT)
+        self._goto_entry = tk.Entry(nav, width=12)
+        self._goto_entry.pack(side=tk.RIGHT, padx=(6, 6))
+        self._goto_entry.bind('<Return>', self._goto_page)
+        tk.Label(nav, text='Go to row:').pack(side=tk.RIGHT)
 
         return frame
 
@@ -684,10 +750,11 @@ class BrowseH5App:
         self._text.config(state=tk.NORMAL)
         self._text.delete('1.0', tk.END)
         self._text.config(state=tk.DISABLED)
-        self._head_label.config(text='')
-        self._head.delete(*self._head.get_children())
-        self._head['columns'] = ()
+        self._data_label.config(text='')
+        self._data.delete(*self._data.get_children())
+        self._data['columns'] = ()
         self._path_label.config(text='')
+        self._reset_data_source(None)
 
     def _write(self, lines: list[str]):
         self._text.config(state=tk.NORMAL)
@@ -705,9 +772,10 @@ class BrowseH5App:
             return
 
         self._path_label.config(text=key)
-        self._head_label.config(text='')
-        self._head.delete(*self._head.get_children())
-        self._head['columns'] = ()
+        self._data_label.config(text='')
+        self._data.delete(*self._data.get_children())
+        self._data['columns'] = ()
+        self._reset_data_source(None)
 
         try:
             obj = self._h5[key] if key != '/' else self._h5
@@ -742,12 +810,16 @@ class BrowseH5App:
 
         if isinstance(obj, h5py.Dataset):
             lines += self._dataset_lines(obj)
+            if obj.dtype.names and obj.shape and obj.shape[0] > 0:
+                self._data_source = {'kind': 'dataset', 'dset': obj,
+                                     'nrows': int(obj.shape[0])}
 
         if info['pandas']:
             lines += self._pandas_lines(obj, key, info)
 
         lines += self._attr_lines(obj, logical)
         self._write(lines)
+        self._show_data_page()
 
     def _dataset_lines(self, dset: h5py.Dataset) -> list[str]:
         lines = []
@@ -767,14 +839,17 @@ class BrowseH5App:
         return lines
 
     def _pandas_lines(self, grp: h5py.Group, key: str, info: dict) -> list[str]:
-        """Column list from the preview read, plus the preview table itself."""
-        frame, msg = read_head(self._store, key, info['nrows'])
+        """Column list from a first-page read, plus the data itself (via the
+        Data pane's own paging, set up here for _show_data_page to use)."""
+        frame, msg = read_page(self._store, key, 0, _ROWS_PER_PAGE, info['nrows'])
 
         lines = ['', '  --- columns ---']
         if frame is not None:
             lines.append(f'  {"(index)":<24}{frame.index.dtype}')
             for col in frame.columns:
                 lines.append(f'  {str(col):<24}{frame.dtypes[col]}')
+            self._data_source = {'kind': 'pandas', 'key': key,
+                                 'nrows': info['nrows']}
         else:
             # No preview — fall back to names/dtypes recoverable from metadata.
             meta_cols = _pandas_columns_meta(grp, info['pandas'])
@@ -785,31 +860,109 @@ class BrowseH5App:
             else:
                 lines.append(f'  {msg}')
 
-        self._show_head(frame, msg, info['nrows'])
         return lines
 
-    def _show_head(self, frame: pd.DataFrame | None, msg: str,
-                   nrows: int | None):
+    # ------------------------------------------------------------------
+    # Data pane paging
+    # ------------------------------------------------------------------
+
+    def _reset_data_source(self, source: dict | None = None):
+        self._data_source = source
+        self._page = 0
+
+    def _max_page(self) -> int:
+        source = self._data_source
+        if not source or not source.get('nrows'):
+            return 0
+        return max(0, (source['nrows'] - 1) // _ROWS_PER_PAGE)
+
+    def _fetch_page(self, start: int, stop: int) -> tuple[list[str], list[list[str]], str]:
+        """(column names, rows, message) for the current data source's page."""
+        source = self._data_source
+        if source['kind'] == 'dataset':
+            return read_dataset_page(source['dset'], start, stop)
+
+        frame, msg = read_page(self._store, source['key'], start, stop,
+                               source['nrows'])
         if frame is None:
-            self._head_label.config(text=f'Head - {msg}')
+            return [], [], msg
+        names = ['(index)'] + [str(c) for c in frame.columns]
+        rows = [[_fmt_cell(idx)] + [_fmt_cell(v) for v in row]
+                for idx, row in zip(frame.index, frame.itertuples(index=False))]
+        return names, rows, ''
+
+    def _show_data_page(self):
+        self._data.delete(*self._data.get_children())
+        self._data['columns'] = ()
+
+        if self._data_source is None:
+            self._data_label.config(text='')
+            self._page_label.config(text='')
+            self._prev_btn.config(state=tk.DISABLED)
+            self._next_btn.config(state=tk.DISABLED)
             return
 
-        total = 'unknown' if nrows is None else f'{nrows:,}'
-        self._head_label.config(
-            text=f'Head - first {len(frame)} of {total} row(s)')
+        start = self._page * _ROWS_PER_PAGE
+        stop = start + _ROWS_PER_PAGE
+        names, rows, msg = self._fetch_page(start, stop)
 
-        # Use synthetic column ids: real DataFrame labels may repeat or contain
-        # spaces, either of which breaks Treeview's Tcl column list.
-        labels = ['(index)'] + [str(c) for c in frame.columns]
-        ids = [f'c{i}' for i in range(len(labels))]
-        self._head['columns'] = ids
-        for cid, label in zip(ids, labels):
-            self._head.heading(cid, text=label, anchor='w')
-            self._head.column(cid, width=110, minwidth=60, stretch=False,
+        if msg or not names:
+            self._data_label.config(text=f'Data - {msg or "(no data)"}')
+            self._page_label.config(text='')
+            self._prev_btn.config(state=tk.DISABLED)
+            self._next_btn.config(state=tk.DISABLED)
+            return
+
+        # Use synthetic column ids: real field/column labels may repeat or
+        # contain spaces, either of which breaks Treeview's Tcl column list.
+        ids = [f'c{i}' for i in range(len(names))]
+        self._data['columns'] = ids
+        for cid, label in zip(ids, names):
+            self._data.heading(cid, text=label, anchor='w')
+            self._data.column(cid, width=110, minwidth=60, stretch=False,
                               anchor='w')
-        for idx, row in zip(frame.index, frame.itertuples(index=False)):
-            self._head.insert('', 'end',
-                              values=[str(idx)] + [str(v) for v in row])
+        for row in rows:
+            self._data.insert('', 'end', values=row)
+
+        total = 'unknown' if self._data_source['nrows'] is None \
+            else f'{self._data_source["nrows"]:,}'
+        if rows:
+            self._data_label.config(
+                text=f'Data - rows {start:,} - {start + len(rows) - 1:,} of {total}')
+        else:
+            self._data_label.config(text=f'Data - none (past end of {total} rows)')
+
+        max_page = self._max_page()
+        self._page_label.config(text=f'Page {self._page + 1} / {max_page + 1}')
+        self._prev_btn.config(state=tk.NORMAL if self._page > 0 else tk.DISABLED)
+        self._next_btn.config(
+            state=tk.NORMAL if self._page < max_page else tk.DISABLED)
+
+    def _prev_page(self):
+        if self._data_source and self._page > 0:
+            self._page -= 1
+            self._show_data_page()
+
+    def _next_page(self):
+        if self._data_source and self._page < self._max_page():
+            self._page += 1
+            self._show_data_page()
+
+    def _goto_page(self, _event=None):
+        """Jump to the page holding a given absolute row number."""
+        raw = self._goto_entry.get().strip().replace(',', '')
+        self._goto_entry.delete(0, tk.END)
+        if self._data_source is None:
+            return
+        try:
+            row = int(raw)
+        except ValueError:
+            return
+        nrows = self._data_source.get('nrows')
+        if nrows is not None and not (0 <= row < nrows):
+            return
+        self._page = row // _ROWS_PER_PAGE
+        self._show_data_page()
 
     def _attr_lines(self, obj, logical: bool = False) -> list[str]:
         items = _attr_items(obj, logical)
