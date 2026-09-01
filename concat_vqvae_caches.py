@@ -601,10 +601,16 @@ def _union_schema(sources: list[CacheSource]) -> tuple[pa.Schema, dict]:
     A schema covering every source's columns, plus the added label columns.
 
     Column order follows first appearance so the common case (identical schemas)
-    comes out in the original order. Returns (schema, {column: [labels lacking
-    it]}) so the caller can report what was null-filled.
+    comes out in the original order. A column that is all-null in the source
+    where it first appears is stored by parquet with Arrow's null type there;
+    if a later source has real data for the same column, that concrete type is
+    what the union schema uses instead, since only null -> concrete is a
+    supported cast (concrete -> null is not, and would otherwise crash
+    write_concat_parquet for a mixed BF-only + BF+FL experiment where a
+    BF-only sample happens to sort first). Returns (schema, {column: [labels
+    lacking it]}) so the caller can report what was null-filled.
     """
-    fields: list[pa.Field] = []
+    order: list[str] = []
     seen: dict[str, pa.DataType] = {}
     for src in sources:
         try:
@@ -613,18 +619,20 @@ def _union_schema(sources: list[CacheSource]) -> tuple[pa.Schema, dict]:
             continue
         for field in schema:
             name = _renamed(field.name)
-            if name in seen:
-                continue
-            seen[name] = field.type
-            fields.append(pa.field(name, field.type))
+            if name not in seen:
+                seen[name] = field.type
+                order.append(name)
+            elif pa.types.is_null(seen[name]) and not pa.types.is_null(field.type):
+                seen[name] = field.type
 
     missing = {}
-    for name in seen:
+    for name in order:
         lacking = [s.label for s in sources
                    if name not in [_renamed(c) for c in s.columns]]
         if lacking:
             missing[name] = lacking
 
+    fields = [pa.field(name, seen[name]) for name in order]
     fields.append(pa.field(_LABEL_EXPERIMENT, pa.string()))
     fields.append(pa.field(_LABEL_SAMPLE, pa.string()))
     fields.append(pa.field(_LABEL_ROW, pa.int64()))
