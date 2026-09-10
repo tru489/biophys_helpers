@@ -42,7 +42,7 @@ import re
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import pandas as pd
@@ -194,40 +194,52 @@ def format_report(superdir_name: str, rfreq: float, rows: list,
 # Computation (shared by the headless and GUI entry points)
 # ---------------------------------------------------------------------------
 
-def run_computation(superdir: Path, rfreq: float, calib_json: Path) -> tuple[str, Path | None]:
+def run_computation(superdir: Path, rfreq: float,
+                    calib_json: Path) -> tuple[list, dict, Path | None]:
     """
-    Runs the full compute-and-write pipeline. Returns (report_text, out_path);
-    out_path is None when no buoyant mass CSVs were found under superdir.
+    Runs the full compute-and-write pipeline. Returns (rows, cal, out_path);
+    out_path (and rows) is empty/None when no buoyant mass CSVs were found
+    under superdir.
     """
     cal = load_calibration(calib_json)
     rows = per_sample_avg_baseline(superdir)
     if not rows:
-        return f"No buoyant mass CSVs found under {superdir}.", None
-    report = format_report(superdir.name, rfreq, rows, cal)
+        return [], cal, None
     out_path = write_output(superdir, rows, cal, rfreq)
-    return report, out_path
+    return rows, cal, out_path
 
 
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
+_CHECKED = '☑'    # ☑
+_UNCHECKED = '☐'  # ☐
+
+
 class BaselineDensityGUI:
     """
     Simple form: a superdir picker, a calibration-JSON picker, and a
     resonant-frequency entry, with a Run button that computes and writes the
-    same CSV as the headless path and shows the report inline.
+    same CSV as the headless path. Results are shown in a fixed-height,
+    scrollable table with a checkbox per sample; Select All / Select None /
+    Invert Selection buttons and a live average-density readout let the user
+    pick a subset of samples to average.
     """
+
+    _COLUMNS = ('check', 'sample', 'n_cells', 'mean_baseline', 'density')
 
     def __init__(self, root: tk.Tk, *, superdir: str | None,
                  calib_json: str | None, rfreq: float | None):
         self._root = root
         root.title('Baseline Density Calculator')
-        root.minsize(560, 420)
+        root.minsize(640, 480)
 
         self._superdir = tk.StringVar(value=superdir or '')
         self._calib_json = tk.StringVar(value=calib_json or '')
         self._rfreq = tk.StringVar(value='' if rfreq is None else f'{rfreq:g}')
+        self._checked: dict[str, bool] = {}
+        self._densities: dict[str, float] = {}
 
         pad = {'padx': 8, 'pady': 6}
         form = ttk.Frame(root)
@@ -248,9 +260,49 @@ class BaselineDensityGUI:
         self._run_button = ttk.Button(form, text='Run', command=self._run)
         self._run_button.grid(row=3, column=1, sticky='w', pady=(10, 0))
 
-        self._output = scrolledtext.ScrolledText(root, wrap=tk.NONE, height=18, font=('Courier New', 10))
-        self._output.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-        self._output.configure(state=tk.DISABLED)
+        self._message = ttk.Label(root, text='', foreground='#a00')
+        self._message.pack(fill=tk.X, padx=8)
+
+        button_bar = ttk.Frame(root)
+        button_bar.pack(fill=tk.X, padx=8, pady=(4, 0))
+        ttk.Button(button_bar, text='Select All', command=self._select_all).pack(side=tk.LEFT)
+        ttk.Button(button_bar, text='Select None', command=self._select_none).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(button_bar, text='Invert Selection', command=self._invert_selection).pack(side=tk.LEFT, padx=(6, 0))
+
+        table_frame = ttk.Frame(root)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 0))
+
+        self._tree = ttk.Treeview(table_frame, columns=self._COLUMNS, show='headings',
+                                  height=14, selectmode='none')
+        headings = {'check': '', 'sample': 'Sample', 'n_cells': 'n cells',
+                    'mean_baseline': 'Mean baseline', 'density': 'Baseline density'}
+        widths = {'check': 30, 'sample': 220, 'n_cells': 70,
+                 'mean_baseline': 130, 'density': 140}
+        for col in self._COLUMNS:
+            anchor = 'center' if col == 'check' else 'w'
+            self._tree.heading(col, text=headings[col])
+            self._tree.column(col, width=widths[col], anchor=anchor,
+                              stretch=(col == 'sample'))
+
+        vsb = ttk.Scrollbar(table_frame, orient='vertical', command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        self._tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        self._tree.bind('<Button-1>', self._on_tree_click)
+
+        self._current_average: float | None = None
+
+        average_bar = ttk.Frame(root)
+        average_bar.pack(fill=tk.X, padx=8, pady=8)
+        self._average_label = ttk.Label(average_bar, text='Average density of selected samples: n/a',
+                                        font=('Segoe UI', 10, 'bold'))
+        self._average_label.pack(side=tk.LEFT)
+        self._copy_button = ttk.Button(average_bar, text='Copy value', command=self._copy_average,
+                                       state=tk.DISABLED)
+        self._copy_button.pack(side=tk.LEFT, padx=(10, 0))
 
     def _pick_superdir(self):
         chosen = filedialog.askdirectory(title='Select experiment superdir',
@@ -266,11 +318,74 @@ class BaselineDensityGUI:
         if chosen:
             self._calib_json.set(chosen)
 
-    def _set_output(self, text: str):
-        self._output.configure(state=tk.NORMAL)
-        self._output.delete('1.0', tk.END)
-        self._output.insert(tk.END, text)
-        self._output.configure(state=tk.DISABLED)
+    # -- table population ---------------------------------------------------
+
+    def _populate_table(self, rows: list, cal: dict, rfreq: float):
+        self._tree.delete(*self._tree.get_children())
+        self._checked.clear()
+        self._densities.clear()
+
+        for i, (name, n, mean_b, _source) in enumerate(rows):
+            iid = str(i)
+            density = apply_calculation(mean_b, cal, rfreq)
+            self._checked[iid] = True
+            self._densities[iid] = density
+            self._tree.insert('', tk.END, iid=iid, values=(
+                _CHECKED, name, n, f'{mean_b:.6g}', f'{density:.6g}',
+            ))
+
+        self._update_average()
+
+    def _on_tree_click(self, event):
+        if self._tree.identify_region(event.x, event.y) != 'cell':
+            return
+        if self._tree.identify_column(event.x) != '#1':
+            return
+        iid = self._tree.identify_row(event.y)
+        if not iid:
+            return
+        self._set_checked(iid, not self._checked[iid])
+        self._update_average()
+
+    def _set_checked(self, iid: str, value: bool):
+        self._checked[iid] = value
+        self._tree.set(iid, 'check', _CHECKED if value else _UNCHECKED)
+
+    def _select_all(self):
+        for iid in self._checked:
+            self._set_checked(iid, True)
+        self._update_average()
+
+    def _select_none(self):
+        for iid in self._checked:
+            self._set_checked(iid, False)
+        self._update_average()
+
+    def _invert_selection(self):
+        for iid, value in self._checked.items():
+            self._set_checked(iid, not value)
+        self._update_average()
+
+    def _update_average(self):
+        selected = [self._densities[iid] for iid, checked in self._checked.items() if checked]
+        if not selected:
+            self._current_average = None
+            self._average_label.configure(text='Average density of selected samples: n/a')
+            self._copy_button.configure(state=tk.DISABLED)
+            return
+        avg = sum(selected) / len(selected)
+        self._current_average = avg
+        self._average_label.configure(
+            text=f'Average density of selected samples: {avg:.4f}  (n={len(selected)})')
+        self._copy_button.configure(state=tk.NORMAL)
+
+    def _copy_average(self):
+        if self._current_average is None:
+            return
+        self._root.clipboard_clear()
+        self._root.clipboard_append(f'{self._current_average:.4f}')
+
+    # -- run ------------------------------------------------------------
 
     def _run(self):
         superdir_text = self._superdir.get().strip()
@@ -301,16 +416,24 @@ class BaselineDensityGUI:
 
         self._run_button.configure(state=tk.DISABLED)
         try:
-            report, out_path = run_computation(superdir, rfreq, calib_json)
+            rows, cal, out_path = run_computation(superdir, rfreq, calib_json)
         except Exception as exc:
             messagebox.showerror('Baseline Density Calculator', str(exc))
             return
         finally:
             self._run_button.configure(state=tk.NORMAL)
 
-        self._set_output(report)
-        if out_path is not None:
-            messagebox.showinfo('Baseline Density Calculator', f'Written:\n{out_path}')
+        if not rows:
+            self._message.configure(text=f'No buoyant mass CSVs found under {superdir}.')
+            self._tree.delete(*self._tree.get_children())
+            self._checked.clear()
+            self._densities.clear()
+            self._update_average()
+            return
+
+        self._message.configure(text='')
+        self._populate_table(rows, cal, rfreq)
+        messagebox.showinfo('Baseline Density Calculator', f'Written:\n{out_path}')
 
 
 def run_gui(*, superdir: str | None, calib_json: str | None, rfreq: float | None):
@@ -328,8 +451,11 @@ def run_headless(args: argparse.Namespace):
     if not superdir.is_dir():
         raise FileNotFoundError(f"Directory not found: {superdir}")
 
-    report, _ = run_computation(superdir, args.rfreq, Path(args.calib_json))
-    print(report)
+    rows, cal, _ = run_computation(superdir, args.rfreq, Path(args.calib_json))
+    if not rows:
+        print(f"No buoyant mass CSVs found under {superdir}.")
+        return
+    print(format_report(superdir.name, args.rfreq, rows, cal))
 
 
 def main():
