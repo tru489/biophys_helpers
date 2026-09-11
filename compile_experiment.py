@@ -8,38 +8,35 @@ loads them, and writes a structured output.
 
 Recognised sub-subdir types (all optional; most-recent used if multiple exist):
     *_mass_results          — mass CSV with mass_pg column
-    *_imaging_fxm_results   — *_ProcessedVolumes.csv and/or *_CELLGROUPED.hdf5,
-                               plus the *_CELLGROUPED.pt crop cache (+ its
-                               metadata parquet), directly in the results dir.
-                               Older runs from before SMRFXMAnalysis flattened
-                               its output nest these under a stage2_analysis/
-                               subdir instead; both layouts are checked.
-    *_pairing_results       — *_PairedSMRVolumes.csv
+    *_imaging_fxm_results   — *_CELLGROUPED.hdf5, plus the *_CELLGROUPED.pt
+                               crop cache (+ its metadata parquet), directly
+                               in the results dir. Older runs from before
+                               SMRFXMAnalysis flattened its output nest these
+                               under a stage2_analysis/ subdir instead; both
+                               layouts are checked.
     *_bm_gating             — YAML with lower/upper thresholds
     *_ifxm-vol_gating       — YAML with lower/upper thresholds
 
-Pairing resolution (priority):
-    1. *_pairing_results/*_PairedSMRVolumes.csv (if dir present)
-    2. ProcessedVolumes rows where matched_mass is not NaN
-    3. *_CELLGROUPED.hdf5's analysis/density/cells table (current
-       SMRFXMAnalysis output), kept only where status_code == 'ok'. Unlike the
-       two CSV-based sources above (which contribute only a curated 4 columns
-       to the PAIRED block), this source is mirrored essentially verbatim —
-       every field of the row, including cell_density_g_per_mL (the ABSOLUTE
-       density, computed directly by the hdf5's own media_density_g_per_mL;
-       the CSV sources never had this, only the relative buoyant_density). Its
-       volume is already calibrated, in femtoliters, so it is carried as
-       volume_fl rather than the legacy raw-AU volume_au — the two are never
-       mixed in one sample's PAIRED block. For runs where pairing succeeds,
-       this is also the only place volume data reaches the workbook: current
-       SMRFXMAnalysis no longer writes a *_ProcessedVolumes.csv, so there is
-       no unpaired VOLUME block for them, only PAIRED. For an FXM-only run
-       with no SMR mass to pair against (so the hdf5 never got a
-       analysis/density/cells table), volume instead lands in a standalone
-       VOLUME block read straight from the hdf5's analysis/volume/cells table
-       (see _load_cellgrouped_volume) — the CELLGROUPED-hdf5 analogue of
-       ProcessedVolumes.csv for volume-only samples.
-    4. None — no pairing key written
+The legacy *_ProcessedVolumes.csv (imaging_fxm_results) and
+*_pairing_results/*_PairedSMRVolumes.csv sources are deprecated and no longer
+read; every sample is expected to carry a *_CELLGROUPED.hdf5.
+
+Pairing resolution:
+    *_CELLGROUPED.hdf5's analysis/density/cells table, kept only where
+    status_code == 'ok' (unpaired cells — unmatched mass, invalid volume,
+    etc. — are dropped; only fully-matched cells are worth keeping). Mirrored
+    essentially verbatim — every field of the row, including
+    cell_density_g_per_mL (the ABSOLUTE density, computed directly by the
+    hdf5's own media_density_g_per_mL) and volume_fl (already calibrated, in
+    femtoliters). This is also where volume data is detected: a sample whose
+    hdf5 paired successfully has volume_fl on every PAIRED row, so it is
+    reported as having volume in the metadata sheet. For an FXM-only run with
+    no SMR mass to pair against (so the hdf5 never got a
+    analysis/density/cells table), volume instead lands in a standalone
+    VOLUME block read straight from the hdf5's analysis/volume/cells table
+    (see _load_cellgrouped_volume), and that is what counts as volume data
+    for such a sample. A sample with neither gets no pairing key and no
+    volume data.
 
 Optional Coulter association (--coulter <csv>):
     The annotation GUI gains a coulter_col column that associates each sample
@@ -70,30 +67,30 @@ experiment_data.xlsx layout:
                        annotation columns added in the GUI, each written as
                        meta_<column name> (e.g. meta_is_activated) so they're
                        identifiable among the structural/gate columns.
-    <one sheet per sample> — three independent, side-by-side blocks separated by
-                       a single blank spacer column, with a single header row.
-                       Columns are prefixed so the blocks can be split again in
-                       code (df.filter(like='vol_') etc.):
-                         VOLUME (vol_)  every FXM cell: transit_index, volume_au
+    <one sheet per sample> — up to three independent, side-by-side blocks
+                       separated by a single blank spacer column, with a
+                       single header row. Columns are prefixed so the blocks
+                       can be split again in code (df.filter(like='pair_')
+                       etc.):
                          MASS   (mass_) every SMR cell: mass_pg (+ other mass cols)
-                         PAIRED (pair_) matched cells: transit_index, mass_pg,
-                                        volume_au, buoyant_density — or, for a
-                                        sample paired straight from a
-                                        CELLGROUPED hdf5 (see "Pairing
-                                        resolution" above), every field of its
-                                        analysis/density/cells row, including
-                                        cell_density_g_per_mL (ABSOLUTE density)
+                         PAIRED (pair_) matched cells only (status_code=='ok'
+                                        in analysis/density/cells), every
+                                        field of that hdf5 row mirrored
+                                        verbatim — including volume_fl
+                                        (calibrated, femtoliters) and
+                                        cell_density_g_per_mL (ABSOLUTE
+                                        density; see "Pairing resolution"
+                                        above)
+                         VOLUME (vol_)  only present for an FXM-only sample
+                                        with no SMR mass to pair against:
+                                        every field of the hdf5's
+                                        analysis/volume/cells row
                        Blocks are independent distributions (row N of one is
                        unrelated to row N of another). buoyant_density is RELATIVE
                        (add the experiment baseline for absolute g/mL) except
                        where cell_density_g_per_mL is present alongside it —
                        that column is already absolute.
     README sheet     — units, block meaning, and a pandas read recipe.
-
-Volume is written once, in raw FXM arbitrary units (volume_au). There is no
-second calibrated column: earlier versions ran a per-sample GUI that fitted a
-vol_au -> fL factor against a Coulter distribution and wrote volume_fL beside the
-raw value, and that whole path is gone.
 
 hdf5_key in the metadata sheet replaces - and . with _ so HDF5 key rules are
 satisfied. The original sample directory name is preserved alongside it.
@@ -206,7 +203,7 @@ def _last_matching_dir(parent: Path, pattern: re.Pattern) -> Path | None:
 
 def _resolve_stage2_dir(run_dir: Path) -> Path:
     """
-    Where a run's stage-2 artifacts (*_ProcessedVolumes.csv, the crop cache) live.
+    Where a run's stage-2 artifacts (the CELLGROUPED hdf5, the crop cache) live.
 
     Current SMRFXMAnalysis writes them directly in run_dir. Runs analyzed before
     the stage1/stage2 split was dropped still have them under stage2_analysis/.
@@ -220,18 +217,19 @@ def _discover_sample(sample_dir: Path) -> dict:
     Locate the relevant file path for each known data type inside sample_dir.
 
     Returns a dict with keys:
-        mass_path, volume_path, pairing_path, bm_gate_path, ifxm_gate_path
+        mass_path, cellgrouped_path, bm_gate_path, ifxm_gate_path
     Any key whose source is absent is set to None.
 
-    The stage-1 CELLGROUPED hdf5 and its Hdf5PathIndex.csv are deliberately not
-    looked up: images now come from the stage-2 crop cache alone, which
+    The legacy *_ProcessedVolumes.csv and *_pairing_results/*_PairedSMRVolumes
+    .csv sources are deprecated and deliberately not looked up any more: every
+    sample's volume/pairing data is expected to live in its *_CELLGROUPED.hdf5.
+    The stage-1 CELLGROUPED hdf5 and its Hdf5PathIndex.csv are also not looked
+    up: images now come from the stage-2 crop cache alone, which
     concat_vqvae_caches finds for itself.
     """
     paths = {
         'mass_path':        None,
-        'volume_path':      None,
         'cellgrouped_path': None,
-        'pairing_path':     None,
         'bm_gate_path':     None,
         'ifxm_gate_path':   None,
     }
@@ -251,27 +249,14 @@ def _discover_sample(sample_dir: Path) -> dict:
                     break
 
     # --- imaging_fxm_results ---
-    # Current SMRFXMAnalysis no longer writes a *_ProcessedVolumes.csv; its
-    # per-cell mass/volume/density tables live in *_CELLGROUPED.hdf5 instead.
-    # Both are checked for since older runs may still have the CSV.
+    # Per-cell mass/volume/density tables live in *_CELLGROUPED.hdf5.
     fxm_dir = _last_matching_dir(sample_dir, re.compile(r'_imaging_fxm_results$'))
     if fxm_dir is not None:
         stage2 = _resolve_stage2_dir(fxm_dir)
         for f in stage2.iterdir():
-            if not (f.is_file() and not is_appledouble(f)):
-                continue
-            if f.name.endswith('_ProcessedVolumes.csv'):
-                paths['volume_path'] = f
-            elif f.name.endswith('_CELLGROUPED.hdf5'):
-                paths['cellgrouped_path'] = f
-
-    # --- pairing_results ---
-    pair_dir = _last_matching_dir(sample_dir, re.compile(r'_pairing_results$'))
-    if pair_dir is not None:
-        for f in pair_dir.iterdir():
             if (f.is_file() and not is_appledouble(f)
-                    and f.name.endswith('_PairedSMRVolumes.csv')):
-                paths['pairing_path'] = f
+                    and f.name.endswith('_CELLGROUPED.hdf5')):
+                paths['cellgrouped_path'] = f
                 break
 
     # --- bm_gating ---
@@ -400,38 +385,6 @@ def _load_cellgrouped_volume(hdf5_path: Path) -> pd.DataFrame | None:
     return df
 
 
-def _resolve_pairing(volume_df: pd.DataFrame | None,
-                     pairing_path: Path | None,
-                     cellgrouped_path: Path | None = None,
-                     ) -> tuple[pd.DataFrame | None, str]:
-    """
-    Determine the pairing DataFrame and source label.
-
-    Priority:
-        1. pairing_path (PairedSMRVolumes.csv from pairing_results dir)
-        2. Non-NaN matched_mass rows in volume_df
-        3. cellgrouped_path's analysis/density/cells table, status_code=='ok'
-        4. None
-    Returns (df_or_None, source_label).
-    """
-    if pairing_path is not None:
-        try:
-            df = pd.read_csv(pairing_path)
-            return df, 'pairing_results'
-        except Exception as exc:
-            print(f"  [warn] could not read {pairing_path.name}: {exc}")
-
-    if volume_df is not None and 'matched_mass' in volume_df.columns:
-        paired = volume_df[volume_df['matched_mass'].notna()].copy()
-        if not paired.empty:
-            return paired, 'volume_cols'
-
-    if cellgrouped_path is not None:
-        paired = _load_density_pairing(cellgrouped_path)
-        if paired is not None and not paired.empty:
-            return paired, 'cellgrouped_hdf5'
-
-    return None, 'none'
 
 
 # ---------------------------------------------------------------------------
@@ -473,39 +426,37 @@ def compile_experiment(superdir: Path) -> list[dict]:
             except Exception as exc:
                 print(f"  [warn] {name}: could not read mass CSV: {exc}")
 
-        volume_df = None
-        volume_src = ''
-        if paths['volume_path'] is not None:
-            try:
-                volume_df = pd.read_csv(paths['volume_path'])
-            except Exception as exc:
-                print(f"  [warn] {name}: could not read volume CSV: {exc}")
-
-        pairing_df, pairing_src = _resolve_pairing(
-            volume_df, paths['pairing_path'], paths['cellgrouped_path'])
+        # Pairing comes solely from the CELLGROUPED hdf5's
+        # analysis/density/cells table now (status_code == 'ok' rows only —
+        # unpaired cells are dropped, which is the intended behavior).
+        pairing_df = None
+        if paths['cellgrouped_path'] is not None:
+            pairing_df = _load_density_pairing(paths['cellgrouped_path'])
 
         # A CELLGROUPED hdf5 with no mass to pair against (e.g. an FXM-only
-        # calibration run) still holds volume data, just not under the PAIRED
-        # source above — pull it in as a standalone VOLUME block instead.
-        if (volume_df is None and pairing_src != 'cellgrouped_hdf5'
-                and paths['cellgrouped_path'] is not None):
+        # calibration run) never gets a density/cells table, but still holds
+        # volume data under analysis/volume/cells — pull it in as a
+        # standalone VOLUME block instead. This, or a successful pairing
+        # above (whose rows already carry volume_fl), is what counts as
+        # volume data being detected for a sample.
+        volume_df = None
+        if pairing_df is None and paths['cellgrouped_path'] is not None:
             volume_df = _load_cellgrouped_volume(paths['cellgrouped_path'])
-            if volume_df is not None:
-                volume_src = 'cellgrouped_hdf5'
 
         bm_gate = (_load_gate(paths['bm_gate_path'])
                    if paths['bm_gate_path'] else None)
         ifxm_gate = (_load_gate(paths['ifxm_gate_path'])
                      if paths['ifxm_gate_path'] else None)
 
-        def _tick(val, label=''):
-            return f'ok({label})' if (val is not None and label) else ('ok' if val is not None else '--')
+        def _tick(val):
+            return 'ok' if val is not None else '--'
 
+        has_volume = pairing_df is not None or volume_df is not None
         print(
             f"[{name}]"
             f"  mass={_tick(mass_df)}"
-            f"  volume={_tick(volume_df, volume_src)}"
-            f"  pairing={_tick(pairing_df, pairing_src)}"
+            f"  volume={'ok' if has_volume else '--'}"
+            f"  pairing={_tick(pairing_df)}"
             f"  bm_gate={_tick(bm_gate)}"
             f"  ifxm_gate={_tick(ifxm_gate)}"
             f"  vqvae={'ok' if vqvae_src is not None else '--'}"
@@ -515,9 +466,8 @@ def compile_experiment(superdir: Path) -> list[dict]:
             'name':        name,
             'mass_df':     mass_df,
             'volume_df':   volume_df,
-            'volume_src':  volume_src,
+            'has_volume':  has_volume,
             'pairing_df':  pairing_df,
-            'pairing_src': pairing_src,
             'bm_gate':     bm_gate,
             'ifxm_gate':   ifxm_gate,
             'vqvae_src':   vqvae_src,
@@ -1227,45 +1177,30 @@ class CompileAnnotationWindow:
 #
 # Each sample sheet holds up to three independent, side-by-side blocks. Their
 # columns are prefixed so the blocks can be separated again in analysis code
-# with df.filter(like='vol_') etc.:
-#     VOLUME (vol_)   — every FXM cell:   transit_index, volume_au
+# with df.filter(like='pair_') etc.:
 #     MASS   (mass_)  — every SMR cell:   mass_pg (+ any other mass columns)
-#     PAIRED (pair_)  — matched cells:    transit_index, mass_pg,
-#                                          volume_au OR volume_fl, buoyant_density
-#                                          — or, for a CELLGROUPED-hdf5-sourced
-#                                          sample, every analysis/density/cells
-#                                          field mirrored verbatim (cell_id in
-#                                          place of transit_index, plus
-#                                          cell_density_g_per_mL — ABSOLUTE
-#                                          density — and QC/confidence columns)
+#     PAIRED (pair_)  — matched cells only (status_code=='ok' in
+#                       analysis/density/cells): every field of that hdf5 row
+#                       mirrored verbatim, including cell_id, volume_fl
+#                       (calibrated, femtoliters), buoyant_density, and
+#                       cell_density_g_per_mL (ABSOLUTE density) — see
+#                       _load_density_pairing
+#     VOLUME (vol_)   — only present for an FXM-only sample with no SMR mass
+#                       to pair against: every field of the hdf5's
+#                       analysis/volume/cells row — see _load_cellgrouped_volume
 # The blocks are independent distributions (row N of one is unrelated to row N
 # of another), so they are never joined — only placed next to each other.
-#
-# The VOLUME block's volume is written once, in raw FXM units, and never
-# rescaled: a Coulter column may be associated with a sample for reference, but
-# no calibration is derived from it, so there is no second volume column to
-# keep in step. The PAIRED block's volume is different: for samples paired via
-# a CELLGROUPED hdf5 (current SMRFXMAnalysis output, no *_ProcessedVolumes.csv)
-# it is already calibrated to femtoliters and carried as volume_fl rather than
-# volume_au, since the two are not the same quantity. See _load_density_pairing.
 
-def _build_volume_block(volume_df: pd.DataFrame, mirror: bool = False) -> pd.DataFrame:
+def _build_volume_block(volume_df: pd.DataFrame) -> pd.DataFrame:
     """
-    VOLUME block (vol_-prefixed).
-
-    By default (legacy ProcessedVolumes.csv source) only transit_index and
-    volume_au are kept. `mirror=True` (used for a CELLGROUPED-hdf5-sourced
-    volume_df — see _load_cellgrouped_volume, the fallback for FXM-only runs
-    with no SMR mass to pair against) instead keeps every column, mirroring
-    _build_paired_block's mirror behavior for the analogous PAIRED case.
+    VOLUME block (vol_-prefixed) — every column of the standalone
+    analysis/volume/cells fallback (see _load_cellgrouped_volume), mirrored
+    verbatim with a few well-known columns ordered first for readability.
     """
-    df = volume_df.rename(columns={'volume': 'volume_au'})
-    lead = ['transit_index', 'cell_id', 'volume_au', 'volume_fl']
-    ordered = [c for c in lead if c in df.columns]
-    if mirror:
-        ordered += [c for c in df.columns if c not in ordered]
-    out = df[ordered] if ordered else df
-    out = out.reset_index(drop=True)
+    lead = ['cell_id', 'volume_fl']
+    ordered = [c for c in lead if c in volume_df.columns]
+    ordered += [c for c in volume_df.columns if c not in ordered]
+    out = volume_df[ordered].reset_index(drop=True)
     out.columns = [f'vol_{c}' for c in out.columns]
     return out
 
@@ -1277,35 +1212,21 @@ def _build_mass_block(mass_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _build_paired_block(pairing_df: pd.DataFrame, mirror: bool = False) -> pd.DataFrame:
+def _build_paired_block(pairing_df: pd.DataFrame) -> pd.DataFrame:
     """
     PAIRED block (pair_-prefixed) — matched cells with mass+volume+density.
 
-    By default only the well-known columns are kept (transit_index, mass_pg,
-    volume_au, buoyant_density): the legacy PairedSMRVolumes.csv/
-    ProcessedVolumes.csv pairing sources carry many internal diagnostic
-    columns (mass_table_row, sample_id, node_dev_mean, ...) that have never
-    been surfaced in the compiled workbook, and there's no reason to start now.
-
-    `mirror=True` (used for a CELLGROUPED-hdf5-sourced pairing_df — see
-    _load_density_pairing) instead keeps every column, since that source is
-    already exactly the fields worth keeping (e.g. cell_density_g_per_mL, the
-    ABSOLUTE density, which the legacy PAIRED block never had) — known columns
-    are still ordered first for readability, then everything else follows in
-    source order.
-
-    volume_au (legacy) and volume_fl (hdf5, already calibrated) are distinct
-    quantities and never both present on the same pairing_df, but either may
-    show up depending on which source this sample's pairing came from.
+    Every column of the analysis/density/cells source (see
+    _load_density_pairing) is kept — that table is already exactly the fields
+    worth keeping (e.g. cell_density_g_per_mL, the ABSOLUTE density) — with a
+    few well-known columns ordered first for readability, then everything
+    else in source order.
     """
-    df = pairing_df.rename(columns={'volume': 'volume_au', 'matched_mass': 'mass_pg'})
-    lead = ['transit_index', 'cell_id', 'mass_pg', 'volume_au', 'volume_fl',
-            'buoyant_density', 'cell_density_g_per_mL']
-    ordered = [c for c in lead if c in df.columns]
-    if mirror:
-        ordered += [c for c in df.columns if c not in ordered]
-    out = df[ordered] if ordered else df
-    out = out.reset_index(drop=True)
+    lead = ['cell_id', 'mass_pg', 'volume_fl', 'buoyant_density',
+            'cell_density_g_per_mL']
+    ordered = [c for c in lead if c in pairing_df.columns]
+    ordered += [c for c in pairing_df.columns if c not in ordered]
+    out = pairing_df[ordered].reset_index(drop=True)
     out.columns = [f'pair_{c}' for c in out.columns]
     return out
 
@@ -1317,36 +1238,29 @@ def _build_readme_df(timestamp: str, has_vqvae: bool = False) -> pd.DataFrame:
         ('Layout',          'One worksheet per sample, plus this README. Each '
                             'sample sheet holds three independent, side-by-side '
                             'blocks separated by one blank column.'),
-        ('VOLUME block',    'Columns vol_* — every FXM cell. Two possible shapes '
-                            '(never mixed on one sample): vol_transit_index, '
-                            'vol_volume_au from a ProcessedVolumes.csv; or, for an '
-                            'FXM-only sample with no SMR mass to pair against '
-                            '(current SMRFXMAnalysis output, no CSV), every field '
-                            'of the CELLGROUPED hdf5\'s analysis/volume/cells row, '
+        ('VOLUME block',    'Columns vol_* — only present for an FXM-only sample '
+                            'with no SMR mass to pair against. Every field of the '
+                            'CELLGROUPED hdf5\'s analysis/volume/cells row, '
                             'including vol_volume_fl (already calibrated, '
                             'femtoliters).'),
         ('MASS block',      'Columns mass_* — every SMR cell: mass_mass_pg '
                             '(+ any other columns from the mass CSV).'),
-        ('PAIRED block',    'Columns pair_* — cells matched between SMR and FXM. '
-                            'Two possible shapes depending on the sample\'s pairing '
-                            'source (never mixed on one sample): a curated set — '
-                            'pair_mass_pg, pair_buoyant_density, and either '
-                            'pair_volume_au (raw FXM units) or pair_volume_fl '
-                            '(already calibrated, femtoliters) — for samples paired '
-                            'from a PairedSMRVolumes/ProcessedVolumes CSV; or, for a '
-                            'sample paired straight from a CELLGROUPED hdf5 (current '
-                            'SMRFXMAnalysis output), every field of that hdf5\'s '
-                            'analysis/density/cells row, including '
+        ('PAIRED block',    'Columns pair_* — cells matched between SMR and FXM '
+                            '(status_code==\'ok\' in the CELLGROUPED hdf5\'s '
+                            'analysis/density/cells table; unmatched/invalid cells '
+                            'are dropped). Every field of that hdf5 row, including '
+                            'pair_volume_fl (already calibrated, femtoliters) and '
                             'pair_cell_density_g_per_mL (ABSOLUTE density) and '
                             'confidence/QC columns.'),
         ('Blocks are independent',
                             'Row N of one block is unrelated to row N of another; '
                             'they are separate distributions, not aligned.'),
         ('mass_pg',         'Buoyant mass in picograms (pg).'),
-        ('volume_au',       'Cell volume in arbitrary FXM units (AU). NOT '
-                            'calibrated to fL — a coulter_column in the metadata '
-                            'sheet records which Coulter distribution a sample '
-                            'corresponds to, but no scaling is applied.'),
+        ('volume_fl',       'Cell volume in femtoliters (fL), already calibrated '
+                            'by the hdf5 pipeline. A coulter_column in the '
+                            'metadata sheet records which Coulter distribution a '
+                            'sample corresponds to, but is a label only — no '
+                            'rescaling is applied to volume_fl.'),
         ('buoyant_density', 'RELATIVE buoyant density (g/mL). Absolute density = '
                             'buoyant_density + experiment-specific baseline_density '
                             '(NOT stored here) — unless pair_cell_density_g_per_mL '
@@ -1471,7 +1385,7 @@ def _write_output(superdir: Path, sample_records: list,
             'sheet_name':        sheet_names[name],
             'hdf5_key':          _safe_key(name),
             'has_mass':          rec['mass_df'] is not None,
-            'has_volume':        rec['volume_df'] is not None,
+            'has_volume':        rec['has_volume'],
             'has_pairing':       rec['pairing_df'] is not None,
             'has_bm_gate':       bm is not None,
             'has_ifxm_gate':     ifxm is not None,
@@ -1507,15 +1421,11 @@ def _write_output(superdir: Path, sample_records: list,
             # Build the blocks this sample has, in VOLUME | MASS | PAIRED order.
             blocks = []
             if rec['volume_df'] is not None:
-                blocks.append(_build_volume_block(
-                    rec['volume_df'],
-                    mirror=(rec.get('volume_src') == 'cellgrouped_hdf5')))
+                blocks.append(_build_volume_block(rec['volume_df']))
             if rec['mass_df'] is not None:
                 blocks.append(_build_mass_block(rec['mass_df']))
             if rec['pairing_df'] is not None:
-                blocks.append(_build_paired_block(
-                    rec['pairing_df'],
-                    mirror=(rec.get('pairing_src') == 'cellgrouped_hdf5')))
+                blocks.append(_build_paired_block(rec['pairing_df']))
 
             if not blocks:
                 # Sample with no tabular data still gets an (empty) sheet.
@@ -1582,7 +1492,7 @@ def main():
 
     # --- Annotation + (optional) Coulter association GUI ---
     ann_root = tk.Tk()
-    volume_names = {r['name'] for r in records if r['volume_df'] is not None}
+    volume_names = {r['name'] for r in records if r['has_volume']}
     aw = CompileAnnotationWindow(
         ann_root, [r['name'] for r in records], volume_names, coulter_cols)
     ann_root.mainloop()   # blocks until the window destroys ann_root
