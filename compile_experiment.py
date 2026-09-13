@@ -109,7 +109,7 @@ from pathlib import Path
 import h5py
 import pandas as pd
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 import yaml
 
 from fsutil import is_appledouble
@@ -480,7 +480,7 @@ def compile_experiment(superdir: Path) -> list[dict]:
 # Annotation + Coulter association GUI
 # ---------------------------------------------------------------------------
 
-class CompileAnnotationWindow:
+class CompileAnnotationWindow(ttk.Frame):
     """
     Spreadsheet-style GUI over every discovered sample.
 
@@ -497,20 +497,33 @@ class CompileAnnotationWindow:
     checkbox), edited in place, with bulk "Set Cells", add/remove-column and
     row reordering — mirroring annotate_coulter_samples.py.
 
-    On Done (self.completed = True):
-        self.result           {sample_name: coulter_col}  ('' if unset)
-        self.annotations      {sample_name: {col: value}}
-        self.custom_cols      ordered annotation column names
-        self.checkbox_cols    set of annotation columns that are checkboxes
-        self.ordered_samples  sample names in final (possibly reordered) order
+    A ttk.Frame so it can be packed into any parent widget — a throwaway
+    standalone root or a page of a larger embedding application. Rather than
+    blocking until closed and exposing results as instance attributes, it
+    reports through the `on_result` callback:
 
-    Closing without Done leaves self.completed = False and empty defaults, so
-    compilation still proceeds (without annotations or Coulter associations).
+        on_result(completed, pairing, annotations, custom_cols,
+                  checkbox_cols, ordered_samples)
+
+    called once, when the Done button is clicked (completed=True; see
+    _finish) with:
+        pairing          {sample_name: coulter_col}  ('' if unset)
+        annotations      {sample_name: {col: value}}
+        custom_cols      ordered annotation column names
+        checkbox_cols    set of annotation columns that are checkboxes
+        ordered_samples  sample names in final (possibly reordered) order
+
+    A standalone caller that also wants "closing the window without Done
+    still compiles, just without annotations" (the historical behavior of
+    this script) should bind WM_DELETE_WINDOW on its own root to this
+    instance's handle_close() method, which calls on_result(False, {}, {},
+    [], set(), <original sample order>) — see main().
     """
 
-    def __init__(self, root: tk.Tk, sample_names: list,
-                 volume_names, coulter_cols: list):
-        self._root = root
+    def __init__(self, parent: tk.Widget, sample_names: list,
+                 volume_names, coulter_cols: list, on_result=None):
+        super().__init__(parent)
+        self._on_result = on_result
         self._samples = list(sample_names)
         self._volume_names = set(volume_names)
         self._coulter_cols = list(coulter_cols)
@@ -531,19 +544,10 @@ class CompileAnnotationWindow:
         # the 'coulter_col' key.
         self._row_data: dict = {name: {} for name in self._samples}
 
-        # Outputs — these defaults hold if the window is closed without Done.
-        self.completed = False
-        self.result: dict = {}
-        self.annotations: dict = {}
-        self.custom_cols: list = []
-        self.checkbox_cols: set = set()
-        self.ordered_samples: list = list(self._samples)
-
-        root.title('Annotate & associate samples' if self._has_coulter
-                   else 'Annotate samples')
+        self.title = ('Annotate & associate samples' if self._has_coulter
+                     else 'Annotate samples')
         self._build_ui()
         self._populate_table()
-        root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     # ------------------------------------------------------------------
     # Column lists
@@ -565,7 +569,7 @@ class CompileAnnotationWindow:
                   + ("associate Coulter columns (optional), then annotate"
                      if self._has_coulter else "annotate"))
         tk.Label(
-            self._root, text=header,
+            self, text=header,
             font=('TkDefaultFont', 10, 'bold'), anchor='w',
         ).pack(fill=tk.X, padx=10, pady=(8, 2))
 
@@ -577,7 +581,7 @@ class CompileAnnotationWindow:
         except tk.TclError:
             pass
 
-        tree_frame = tk.Frame(self._root)
+        tree_frame = tk.Frame(self)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
 
         vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
@@ -608,7 +612,7 @@ class CompileAnnotationWindow:
 
         self._setup_columns()
 
-        btn_frame = tk.Frame(self._root)
+        btn_frame = tk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
 
         tk.Button(btn_frame, text="Add Column",
@@ -630,7 +634,7 @@ class CompileAnnotationWindow:
         # When a Coulter CSV is loaded, let the user hide already-assigned
         # columns from the per-cell picker so only unassigned ones remain.
         if self._has_coulter:
-            self._hide_assigned_var = tk.BooleanVar(master=self._root, value=False)
+            self._hide_assigned_var = tk.BooleanVar(master=self, value=False)
             tk.Checkbutton(
                 btn_frame, text="Only unassigned Coulter columns",
                 variable=self._hide_assigned_var).pack(side=tk.LEFT, padx=(0, 12))
@@ -933,7 +937,7 @@ class CompileAnnotationWindow:
 
     def _add_column(self):
         result = {'name': None, 'checkbox': False}
-        top = tk.Toplevel(self._root)
+        top = tk.Toplevel(self)
         top.title("Add column")
         top.grab_set()
         top.resizable(False, False)
@@ -963,7 +967,7 @@ class CompileAnnotationWindow:
         tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
 
         top.protocol('WM_DELETE_WINDOW', _cancel)
-        self._root.wait_window(top)
+        self.wait_window(top)
 
         name = result['name']
         if not name:
@@ -971,7 +975,7 @@ class CompileAnnotationWindow:
         if name in self._all_cols():
             messagebox.showwarning("Duplicate",
                                    f"Column '{name}' already exists.",
-                                   parent=self._root)
+                                   parent=self.winfo_toplevel())
             return
         self._custom_cols.append(name)
         if result['checkbox']:
@@ -985,11 +989,11 @@ class CompileAnnotationWindow:
     def _remove_column(self):
         if not self._custom_cols:
             messagebox.showinfo("No columns", "No custom columns to remove.",
-                                parent=self._root)
+                                parent=self.winfo_toplevel())
             return
 
         result = {'name': None}
-        top = tk.Toplevel(self._root)
+        top = tk.Toplevel(self)
         top.title("Remove column")
         top.grab_set()
         top.resizable(False, False)
@@ -1019,7 +1023,7 @@ class CompileAnnotationWindow:
         tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
 
         top.protocol('WM_DELETE_WINDOW', _cancel)
-        self._root.wait_window(top)
+        self.wait_window(top)
 
         name = result['name']
         if not name:
@@ -1035,12 +1039,12 @@ class CompileAnnotationWindow:
     def _set_cells(self):
         if not self._custom_cols:
             messagebox.showinfo("No columns", "Add a custom column first.",
-                                parent=self._root)
+                                parent=self.winfo_toplevel())
             return
 
         selected = self._tree.selection()
 
-        top = tk.Toplevel(self._root)
+        top = tk.Toplevel(self)
         top.title("Set cells")
         top.grab_set()
         top.resizable(False, False)
@@ -1101,7 +1105,7 @@ class CompileAnnotationWindow:
         tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
 
         top.protocol('WM_DELETE_WINDOW', _cancel)
-        self._root.wait_window(top)
+        self.wait_window(top)
 
         if not result['ok']:
             return
@@ -1111,7 +1115,7 @@ class CompileAnnotationWindow:
             messagebox.showwarning(
                 "No selection",
                 "Select one or more rows, or check 'Apply to all rows'.",
-                parent=self._root)
+                parent=self.winfo_toplevel())
             return
 
         col = result['col']
@@ -1149,25 +1153,34 @@ class CompileAnnotationWindow:
     # ------------------------------------------------------------------
 
     def _finish(self):
-        self.ordered_samples = list(self._tree.get_children())
-        self.result = {s: self._row_data[s].get('coulter_col', '')
-                       for s in self._samples}
-        self.annotations = {
+        ordered_samples = list(self._tree.get_children())
+        pairing = {s: self._row_data[s].get('coulter_col', '')
+                  for s in self._samples}
+        annotations = {
             s: {c: self._row_data[s].get(c, '') for c in self._custom_cols}
             for s in self._samples}
-        self.custom_cols = list(self._custom_cols)
-        self.checkbox_cols = set(self._checkbox_cols)
-        self.completed = True
-        self._root.destroy()
 
-    def _on_close(self):
-        self.completed = False
-        self.result = {}
-        self.annotations = {}
-        self.custom_cols = []
-        self.checkbox_cols = set()
-        self.ordered_samples = list(self._samples)
-        self._root.destroy()
+        # Writing the workbook (and possibly a VQ-VAE cache) can take a
+        # noticeable moment; disable Done immediately so a second click
+        # can't restart it, and force that to actually paint before
+        # on_result blocks this thread doing the write.
+        self._done_btn.config(state=tk.DISABLED)
+        self.update_idletasks()
+
+        if self._on_result is not None:
+            self._on_result(True, pairing, annotations,
+                            list(self._custom_cols), set(self._checkbox_cols),
+                            ordered_samples)
+
+    def handle_close(self):
+        """
+        Bind to a standalone host window's WM_DELETE_WINDOW to preserve this
+        script's historical behavior: closing without clicking Done still
+        proceeds to compile, just without annotations or Coulter
+        associations. Not used when embedded (no window to close).
+        """
+        if self._on_result is not None:
+            self._on_result(False, {}, {}, [], set(), list(self._samples))
 
 
 
@@ -1491,30 +1504,164 @@ def main():
               f"({len(coulter_cols)} columns)")
 
     # --- Annotation + (optional) Coulter association GUI ---
+    def on_result(completed, pairing, annotations, custom_cols,
+                 checkbox_cols, ordered_samples):
+        if not completed:
+            print("[warn] annotation window closed without Done — "
+                  "compiling without annotations or Coulter associations.")
+
+        assigned = sum(1 for v in pairing.values() if v)
+        if assigned:
+            print(f"\n{assigned} sample(s) associated with a Coulter column "
+                  f"(recorded in the metadata sheet; volumes are not rescaled).")
+
+        _write_output(superdir, records, pairing,
+                      annotations, custom_cols, checkbox_cols, ordered_samples,
+                      save_vqvae)
+        ann_root.destroy()
+
     ann_root = tk.Tk()
     volume_names = {r['name'] for r in records if r['has_volume']}
     aw = CompileAnnotationWindow(
-        ann_root, [r['name'] for r in records], volume_names, coulter_cols)
-    ann_root.mainloop()   # blocks until the window destroys ann_root
+        ann_root, [r['name'] for r in records], volume_names, coulter_cols,
+        on_result=on_result)
+    ann_root.title(aw.title)
+    aw.pack(fill=tk.BOTH, expand=True)
+    ann_root.protocol('WM_DELETE_WINDOW', aw.handle_close)
+    ann_root.mainloop()   # blocks until on_result destroys ann_root
 
-    if not aw.completed:
-        print("[warn] annotation window closed without Done — "
-              "compiling without annotations or Coulter associations.")
 
-    pairing         = aw.result
-    annotations     = aw.annotations
-    custom_cols     = aw.custom_cols
-    checkbox_cols   = aw.checkbox_cols
-    ordered_samples = aw.ordered_samples
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
 
-    assigned = sum(1 for v in pairing.values() if v)
-    if assigned:
-        print(f"\n{assigned} sample(s) associated with a Coulter column "
-              f"(recorded in the metadata sheet; volumes are not rescaled).")
+def build_embedded_page(parent: tk.Widget, *,
+                        initial_superdir: str | None = None,
+                        on_done=None) -> ttk.Frame:
+    """
+    Build this tool's discover-and-compile UI as a Frame suitable for
+    embedding in a larger application, e.g. a wizard page.
 
-    _write_output(superdir, records, pairing,
-                  annotations, custom_cols, checkbox_cols, ordered_samples,
-                  save_vqvae)
+    Directory (+ optional Coulter CSV) fields and a "Discover Samples"
+    button stand in for the CLI's positional/--coulter arguments; clicking
+    it runs compile_experiment() (+ _load_coulter if a CSV was given) and
+    embeds a fresh CompileAnnotationWindow below, whose Done button writes
+    the workbook via _write_output() — same as the standalone path, just
+    without an owned window to close.
+
+    `on_done`, if given, is called after a successful compile (i.e. after
+    the embedded window's Done button is clicked) — e.g. a wizard hosting
+    this as its final page can pass its own root.destroy to close on Done.
+    """
+    page = ttk.Frame(parent)
+
+    top = ttk.Frame(page)
+    top.pack(fill=tk.X, padx=8, pady=8)
+    top.columnconfigure(1, weight=1)
+
+    ttk.Label(top, text='Experiment superdir:').grid(row=0, column=0, sticky='w')
+    superdir_var = tk.StringVar(value=initial_superdir or '')
+    ttk.Entry(top, textvariable=superdir_var).grid(
+        row=0, column=1, sticky='ew', padx=(6, 6))
+
+    def _browse_superdir():
+        chosen = filedialog.askdirectory(
+            title='Select experiment superdir',
+            initialdir=superdir_var.get() or None)
+        if chosen:
+            superdir_var.set(chosen)
+
+    ttk.Button(top, text='Browse…', command=_browse_superdir).grid(row=0, column=2)
+
+    ttk.Label(top, text='Coulter CSV (optional):').grid(
+        row=1, column=0, sticky='w', pady=(6, 0))
+    coulter_var = tk.StringVar(value='')
+    ttk.Entry(top, textvariable=coulter_var).grid(
+        row=1, column=1, sticky='ew', padx=(6, 6), pady=(6, 0))
+
+    def _browse_coulter():
+        chosen = filedialog.askopenfilename(
+            title='Select Coulter Counter CSV',
+            initialdir=(str(Path(coulter_var.get()).parent)
+                       if coulter_var.get() else None),
+            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')])
+        if chosen:
+            coulter_var.set(chosen)
+
+    ttk.Button(top, text='Browse…', command=_browse_coulter).grid(
+        row=1, column=2, pady=(6, 0))
+
+    status_var = tk.StringVar(value='')
+    status_label = ttk.Label(page, textvariable=status_var, foreground='#a00')
+    status_label.pack(fill=tk.X, padx=8)
+
+    _STATUS_COLORS = {'error': '#a00', 'progress': '#8a6d00', 'done': '#1a6b1a'}
+
+    def _set_status(text: str, kind: str = 'error'):
+        status_label.configure(foreground=_STATUS_COLORS[kind])
+        status_var.set(text)
+
+    panel_container = ttk.Frame(page)
+    panel_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+
+    def _discover():
+        for child in panel_container.winfo_children():
+            child.destroy()
+        status_var.set('')
+
+        superdir_text = superdir_var.get().strip()
+        if not superdir_text:
+            _set_status('Choose an experiment superdir first.')
+            return
+        superdir = Path(superdir_text)
+        if not superdir.is_dir():
+            _set_status(f'Directory not found: {superdir}')
+            return
+
+        coulter_text = coulter_var.get().strip()
+        coulter_cols: list = []
+        if coulter_text:
+            coulter_path = Path(coulter_text)
+            if not coulter_path.is_file():
+                _set_status(f'Coulter CSV not found: {coulter_path}')
+                return
+            coulter_cols = list(_load_coulter(coulter_path).columns)
+
+        records = compile_experiment(superdir)
+        if not records:
+            _set_status(f'No sample data found under {superdir}.')
+            return
+
+        save_vqvae = True
+
+        def on_result(completed, pairing, annotations, custom_cols,
+                     checkbox_cols, ordered_samples):
+            note = ('Closed without Done — compiling without annotations or '
+                    'Coulter associations. ' if not completed else '')
+            # Writing the workbook (and possibly a VQ-VAE cache) can take a
+            # noticeable moment; show that immediately and force it to
+            # actually paint, since the write below blocks this same thread.
+            _set_status(f'{note}Compiling — writing workbook, please wait…',
+                       kind='progress')
+            page.update_idletasks()
+
+            out_dir = _write_output(superdir, records, pairing,
+                                    annotations, custom_cols, checkbox_cols,
+                                    ordered_samples, save_vqvae)
+            _set_status(f'Compiled -> {out_dir}', kind='done')
+            if on_done is not None:
+                on_done()
+
+        volume_names = {r['name'] for r in records if r['has_volume']}
+        aw = CompileAnnotationWindow(
+            panel_container, [r['name'] for r in records], volume_names,
+            coulter_cols, on_result=on_result)
+        aw.pack(fill=tk.BOTH, expand=True)
+
+    ttk.Button(top, text='Discover Samples', command=_discover).grid(
+        row=2, column=1, sticky='w', pady=(8, 0))
+
+    return page
 
 
 if __name__ == '__main__':

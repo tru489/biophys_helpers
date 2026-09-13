@@ -217,7 +217,7 @@ _CHECKED = '☑'    # ☑
 _UNCHECKED = '☐'  # ☐
 
 
-class BaselineDensityGUI:
+class BaselineDensityGUI(ttk.Frame):
     """
     Simple form: a superdir picker, a calibration-JSON picker, and a
     resonant-frequency entry, with a Run button that computes and writes the
@@ -225,17 +225,20 @@ class BaselineDensityGUI:
     scrollable table with a checkbox per sample; Select All / Select None /
     Invert Selection buttons and a live average-density readout let the user
     pick a subset of samples to average.
+
+    A ttk.Frame so it can be packed into any parent widget — a throwaway
+    standalone root (see run_gui()) or a page of a larger embedding GUI.
     """
 
     _COLUMNS = ('check', 'sample', 'n_cells', 'mean_baseline', 'density')
 
-    def __init__(self, root: tk.Tk, *, superdir: str | None,
-                 calib_json: str | None, rfreq: float | None):
-        self._root = root
-        root.title('Baseline Density Calculator')
-        root.minsize(640, 480)
+    def __init__(self, parent: tk.Widget, *, superdir: str | None,
+                 calib_json: str | None, rfreq: float | None,
+                 superdir_var: tk.StringVar | None = None):
+        super().__init__(parent)
+        root = self
 
-        self._superdir = tk.StringVar(value=superdir or '')
+        self._superdir = superdir_var if superdir_var is not None else tk.StringVar(value=superdir or '')
         self._calib_json = tk.StringVar(value=calib_json or '')
         self._rfreq = tk.StringVar(value='' if rfreq is None else f'{rfreq:g}')
         self._checked: dict[str, bool] = {}
@@ -382,8 +385,8 @@ class BaselineDensityGUI:
     def _copy_average(self):
         if self._current_average is None:
             return
-        self._root.clipboard_clear()
-        self._root.clipboard_append(f'{self._current_average:.4f}')
+        self.clipboard_clear()
+        self.clipboard_append(f'{self._current_average:.4f}')
 
     # -- run ------------------------------------------------------------
 
@@ -438,8 +441,31 @@ class BaselineDensityGUI:
 
 def run_gui(*, superdir: str | None, calib_json: str | None, rfreq: float | None):
     root = tk.Tk()
-    BaselineDensityGUI(root, superdir=superdir, calib_json=calib_json, rfreq=rfreq)
+    root.title('Baseline Density Calculator')
+    root.minsize(640, 480)
+    gui = BaselineDensityGUI(root, superdir=superdir, calib_json=calib_json, rfreq=rfreq)
+    gui.pack(fill=tk.BOTH, expand=True)
     root.mainloop()
+
+
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
+
+def build_embedded_page(parent: tk.Widget, *, superdir: str | None = None,
+                        calib_json: str | None = None,
+                        rfreq: float | None = None,
+                        superdir_var: tk.StringVar | None = None) -> ttk.Frame:
+    """
+    Build this tool's GUI as a Frame suitable for embedding in a larger
+    application (e.g. a wizard page), rather than owning its own Tk root.
+
+    Pass an existing `superdir_var` (rather than `superdir`) to bind this
+    page's directory field to a StringVar shared with another page — e.g. a
+    wizard sharing one directory across several steps.
+    """
+    return BaselineDensityGUI(parent, superdir=superdir, calib_json=calib_json,
+                              rfreq=rfreq, superdir_var=superdir_var)
 
 
 # ---------------------------------------------------------------------------

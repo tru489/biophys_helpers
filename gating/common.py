@@ -8,6 +8,10 @@ Public API
 ----------
 CutoffWindow          Modal histogram window; click-to-set lower/upper cutoffs.
 MainWindow            Scrollable sample/column list that drives CutoffWindow per group.
+GatingPanel            Combined single-window gating UI (list left, histogram/cutoff
+                       controls right, no modal popup) — used by
+                       gate_experiments_inplace.py; embeddable in any parent widget.
+style_finalize_button Apply the enabled/disabled color scheme to a "Finalize gating" button.
 ask_data_type_dialog  Modal mode-selection dialog (parameterised button labels).
 save_group_histograms Save one PNG per cutoff group.
 write_stats_csv       Write descriptive statistics CSV for all gated samples.
@@ -21,11 +25,34 @@ from tkinter import messagebox
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# "Finalize gating" button styling
+# ---------------------------------------------------------------------------
+
+_FINALIZE_ENABLED_STYLE = dict(bg='#2a6f2a', fg='white',
+                               activebackground='#245e24', activeforeground='white')
+_FINALIZE_DISABLED_STYLE = dict(bg='#b8b8b8', fg='#e4e4e4',
+                                activebackground='#b8b8b8', activeforeground='#e4e4e4')
+
+
+def style_finalize_button(btn: tk.Button, enabled: bool):
+    """
+    Apply an explicit enabled/disabled color scheme to a "Finalize gating"
+    button, in addition to its `state`. A plain tk.Button doesn't dim a
+    custom `bg` on its own when disabled (only `disabledforeground` has any
+    visible effect), so without this it stays bright green — and looking
+    clickable — even while inactive.
+    """
+    btn.config(state=tk.NORMAL if enabled else tk.DISABLED,
+              **(_FINALIZE_ENABLED_STYLE if enabled else _FINALIZE_DISABLED_STYLE))
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +422,439 @@ class MainWindow:
             return
         self._cutoffs, self._groups, self._remaining = self._history.pop()
         self._refresh_list()
+
+
+# ---------------------------------------------------------------------------
+# GatingPanel — combined single-window gating UI
+# ---------------------------------------------------------------------------
+
+class GatingPanel(tk.Frame):
+    """
+    Combined single-window gating UI: a left sub-frame with the scrollable
+    sample list (as in MainWindow) and a right sub-frame with the histogram
+    and cutoff controls (as in CutoffWindow), merged into one non-modal
+    window instead of a main list window that pops a modal Toplevel per
+    group. Selecting/deselecting samples in the left list immediately
+    updates the right panel's histogram (samples added/removed live, no
+    separate "activate" step); clicking on the plot still sets the lower
+    then upper cutoff exactly as before, and "Apply cutoffs" commits the
+    group (in place of CutoffWindow's "Accept" + closing the popup) and
+    returns the right panel to an idle placeholder.
+
+    A tk.Frame so it can be packed into any parent widget — a throwaway
+    standalone root or a page of a larger embedding application.
+
+    Args:
+        parent:        parent tkinter widget
+        columns:       ordered list of all column/sample names
+        data:          mapping of name → ungated value array
+        mode_cfg:      entry from a _MODE dict
+        on_finish:     callable(cutoffs, groups) → Path | str | None
+                       Called when Done is clicked; return value shown in dialog.
+        context_label: text appended to the header, e.g. filename or superdir name
+        listbox_width: character width of the listbox widget (default 40)
+        on_done:       optional callable() invoked after the Done dialog is
+                       dismissed — e.g. root.destroy for a standalone window;
+                       left None when embedded (must not destroy the host app).
+        on_gate_change: optional callable() invoked whenever the active
+                       selection or its lower/upper cutoff changes (selecting
+                       samples, clicking to set a bound, Reset, or committing
+                       a group) — lets an external caller (e.g. a paired
+                       mass+volume retained-% indicator) stay in sync without
+                       reaching into private state; see get_active_gate().
+
+    Attributes:
+        title: suggested window title ("Gating — <mode label>  [<context_label>]"),
+               for a standalone caller to apply with root.title(panel.title).
+    """
+
+    def __init__(self, parent: tk.Widget, columns: list, data: dict,
+                 mode_cfg: dict, on_finish,
+                 context_label: str = '', listbox_width: int = 40,
+                 on_done=None, on_gate_change=None):
+        super().__init__(parent)
+        self._columns = columns
+        self._data = data
+        self._cfg = mode_cfg
+        self._on_finish = on_finish
+        self._on_done = on_done
+        self._on_gate_change = on_gate_change
+        self._cutoffs: dict = {}
+        self._groups: list = []
+        self._remaining: list = list(columns)
+        self._history: list = []
+
+        # In-progress gating state for the right-hand panel (was CutoffWindow's).
+        self._active_selection: list | None = None
+        self._lower = None
+        self._upper = None
+        self._state = 0         # 0=awaiting lower, 1=awaiting upper, 2=both set
+        self._view = None       # current x-axis view; None = default full view
+        self._full_xlim = None
+
+        label = mode_cfg['label']
+        ctx = f"  [{context_label}]" if context_label else ''
+        self.title = f"Gating — {label}{ctx}"
+
+        left = tk.Frame(self)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        right = tk.Frame(self)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # --- left: sample list (from MainWindow) ---
+        self._header_var = tk.StringVar()
+        tk.Label(left, textvariable=self._header_var,
+                 font=('TkDefaultFont', 11, 'bold'),
+                 anchor='w').pack(fill=tk.X, pady=(10, 4))
+
+        list_frame = tk.Frame(left)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
+        self._listbox = tk.Listbox(
+            list_frame, selectmode=tk.MULTIPLE, exportselection=False,
+            yscrollcommand=scrollbar.set, height=24, width=listbox_width)
+        scrollbar.config(command=self._listbox.yview)
+        self._listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._listbox.bind('<<ListboxSelect>>', self._on_select)
+
+        btn_frame = tk.Frame(left)
+        btn_frame.pack(fill=tk.X, pady=8)
+        self._back_btn = tk.Button(btn_frame, text="← Back",
+                                   state=tk.DISABLED, command=self._do_back)
+        self._back_btn.pack(side=tk.LEFT)
+        self._done_btn = tk.Button(btn_frame, text="Finalize gating",
+                                   command=self._finish)
+        self._done_btn.pack(side=tk.LEFT, padx=(8, 0))
+        style_finalize_button(self._done_btn, False)
+
+        # --- right: histogram + cutoff controls (from CutoffWindow) ---
+        # Figure() directly rather than plt.subplots(): the latter goes
+        # through pyplot's stateful backend, which for TkAgg creates its own
+        # *extra* hidden Tk root per figure that's never touched again (we
+        # embed via our own FigureCanvasTkAgg below) and never gets torn
+        # down — with several of these panels alive in one process (as in
+        # the analysis wizard), those orphaned roots kept the whole process
+        # alive after the app's real window was closed. Figure() never
+        # touches Tkinter at all, so there's nothing to leak.
+        self._fig = Figure(figsize=(9, 5))
+        self._ax = self._fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(self._fig, master=right)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._canvas = canvas
+        self._cid = canvas.mpl_connect('button_press_event', self._on_click)
+
+        view_frame = tk.Frame(right)
+        view_frame.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(view_frame, text="X-axis view:").pack(side=tk.LEFT)
+        tk.Label(view_frame, text="min").pack(side=tk.LEFT, padx=(8, 2))
+        self._xmin_var = tk.StringVar()
+        tk.Entry(view_frame, textvariable=self._xmin_var,
+                 width=10).pack(side=tk.LEFT)
+        tk.Label(view_frame, text="max").pack(side=tk.LEFT, padx=(8, 2))
+        self._xmax_var = tk.StringVar()
+        tk.Entry(view_frame, textvariable=self._xmax_var,
+                 width=10).pack(side=tk.LEFT)
+        tk.Button(view_frame, text="Apply",
+                  command=self._apply_xlim).pack(side=tk.LEFT, padx=(8, 4))
+        tk.Button(view_frame, text="Reset view",
+                  command=self._reset_xlim).pack(side=tk.LEFT)
+
+        info_frame = tk.Frame(right)
+        info_frame.pack(fill=tk.X, pady=(4, 0))
+        self._status_var = tk.StringVar()
+        tk.Label(info_frame, textvariable=self._status_var,
+                 anchor='w').pack(side=tk.LEFT)
+
+        self._retained_var = tk.StringVar()
+        tk.Label(right, textvariable=self._retained_var, anchor='w',
+                font=('TkDefaultFont', 9, 'bold'),
+                foreground='#1a6b1a').pack(fill=tk.X, pady=(2, 0))
+
+        gate_btn_frame = tk.Frame(right)
+        gate_btn_frame.pack(fill=tk.X, pady=6)
+        self._reset_btn = tk.Button(gate_btn_frame, text="Reset",
+                                    state=tk.DISABLED, command=self._reset)
+        self._reset_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._apply_btn = tk.Button(gate_btn_frame, text="Apply cutoffs",
+                                    state=tk.DISABLED, command=self._apply_cutoffs)
+        self._apply_btn.pack(side=tk.RIGHT)
+
+        self._draw_idle()
+        self._refresh_list()
+
+    # -- left: sample list ---------------------------------------------
+
+    def _refresh_list(self):
+        self._listbox.delete(0, tk.END)
+        for col in self._remaining:
+            self._listbox.insert(tk.END, col)
+        n_done = len(self._cutoffs)
+        n_total = len(self._columns)
+        self._header_var.set(
+            f"Remaining: {n_total - n_done} / {n_total}   "
+            f"[{self._cfg['label']}]")
+        style_finalize_button(self._done_btn, n_done == n_total)
+        self._back_btn.config(
+            state=tk.NORMAL if self._history else tk.DISABLED)
+
+    def _on_select(self, _event):
+        """
+        Live preview: every change to the left-list selection immediately
+        redraws the right panel's histogram for exactly the samples now
+        selected (added/removed as the selection changes), discarding any
+        in-progress (unapplied) lower/upper cutoff — same as freshly
+        activating gating for the new selection.
+        """
+        indices = self._listbox.curselection()
+        if not indices:
+            self._clear_active_gating()
+            return
+        self._activate_gating([self._remaining[i] for i in indices])
+
+    def _do_back(self):
+        if not self._history:
+            return
+        self._cutoffs, self._groups, self._remaining = self._history.pop()
+        self._clear_active_gating()
+        self._refresh_list()
+
+    def _finish(self):
+        result = self._on_finish(self._cutoffs, self._groups)
+        msg = f"Output written to:\n{result}" if result else "Done."
+        messagebox.showinfo("Done", msg, parent=self.winfo_toplevel())
+        if self._on_done is not None:
+            self._on_done()
+
+    # -- right: histogram / cutoff controls ------------------------------
+
+    def _draw_idle(self):
+        """Placeholder view shown while no sample is selected on the left."""
+        self._status_var.set('Select samples on the left to preview their histogram.')
+        ax = self._ax
+        ax.clear()
+        ax.text(0.5, 0.5,
+                'Select samples on the left to preview\n'
+                'their histogram here.',
+                ha='center', va='center', transform=ax.transAxes,
+                color='#888888', fontsize=11)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        self._fig.tight_layout()
+        self._canvas.draw()
+
+    def _activate_gating(self, selection: list):
+        """
+        (Re)point the right panel at `selection` and redraw its histogram,
+        discarding any in-progress lower/upper cutoff. Called both on every
+        left-list selection change (live preview) and, implicitly, whenever
+        the selection is otherwise established.
+        """
+        self._active_selection = selection
+        self._lower = None
+        self._upper = None
+        self._state = 0
+        self._view = None
+        self._xmin_var.set('')
+        self._xmax_var.set('')
+        self._reset_btn.config(state=tk.NORMAL)
+        self._apply_btn.config(state=tk.DISABLED)
+        self._status_var.set("Click to set lower cutoff.")
+        self._draw_histograms()
+        self._update_retained_label()
+        self._notify_gate_change()
+
+    def _draw_histograms(self, xlim: tuple = None):
+        """
+        Draw the overlaid histograms for the active selection, binned across
+        the visible x-range. Mirrors CutoffWindow._draw_histograms.
+        """
+        if self._active_selection is None:
+            self._draw_idle()
+            return
+
+        cfg = self._cfg
+        ax = self._ax
+        ax.clear()
+
+        arrays = [self._data[col][~np.isnan(self._data[col])]
+                  for col in self._active_selection]
+        arrays = [a for a in arrays if len(a) > 0]
+        if not arrays:
+            self._draw_idle()
+            return
+
+        all_vals = np.concatenate(arrays)
+        self._full_xlim = (float(all_vals.min()), float(all_vals.max()))
+        if not self._xmin_var.get() and not self._xmax_var.get():
+            self._xmin_var.set(f'{self._full_xlim[0]:.4g}')
+            self._xmax_var.set(f'{self._full_xlim[1]:.4g}')
+        shared_bins = _view_bins(cfg, all_vals, xlim)
+
+        for col, vals in zip(self._active_selection, arrays):
+            ax.hist(vals, bins=shared_bins, alpha=0.5, edgecolor='black',
+                    linewidth=0.3, label=col)
+        ax.set_xscale(cfg['scale'])
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+        elif cfg['xlim']:
+            ax.set_xlim(*cfg['xlim'])
+        ax.set_xlabel(cfg['xlabel'])
+        ax.set_ylabel('count')
+        ax.legend(fontsize=7, loc='upper right')
+        self._fig.tight_layout()
+
+        self._draw_cutoffs()
+        self._canvas.draw()
+
+    def _draw_cutoffs(self):
+        """Draw the cutoff lines, labels and accepted span from the current bounds."""
+        ax = self._ax
+        y_top = ax.get_ylim()[1]
+        if self._lower is not None:
+            ax.axvline(self._lower, color='red', linestyle='--', linewidth=1.2)
+            ax.text(self._lower, y_top, f'{self._lower:.3g}',
+                    color='red', fontsize=8, va='top', ha='right')
+        if self._upper is not None:
+            ax.axvline(self._upper, color='steelblue', linestyle='--',
+                       linewidth=1.2)
+            ax.text(self._upper, y_top, f'{self._upper:.3g}',
+                    color='steelblue', fontsize=8, va='top', ha='left')
+        if self._lower is not None and self._upper is not None:
+            ax.axvspan(self._lower, self._upper, alpha=0.12, color='green')
+
+    def _current_xlim(self) -> tuple:
+        """Parse the view entry boxes; returns None and sets status on bad input."""
+        try:
+            lo = float(self._xmin_var.get())
+            hi = float(self._xmax_var.get())
+        except ValueError:
+            self._status_var.set("X-axis view: min and max must be numbers.")
+            return None
+        if hi <= lo:
+            self._status_var.set("X-axis view: max must be greater than min.")
+            return None
+        return lo, hi
+
+    def _apply_xlim(self):
+        if self._active_selection is None:
+            return
+        xlim = self._current_xlim()
+        if xlim is None:
+            return
+        self._view = xlim
+        self._draw_histograms(xlim=xlim)
+
+    def _reset_xlim(self):
+        if self._active_selection is None or self._full_xlim is None:
+            return
+        lo, hi = self._full_xlim
+        self._xmin_var.set(f'{lo:.4g}')
+        self._xmax_var.set(f'{hi:.4g}')
+        self._view = None
+        self._draw_histograms()
+
+    def _on_click(self, event):
+        if self._active_selection is None:
+            return
+        if event.inaxes is None or event.xdata is None:
+            return
+        x = event.xdata
+
+        if self._state == 0:
+            self._lower = x
+            self._state = 1
+            self._status_var.set(f"Lower: {x:.4g}  —  Click to set upper cutoff.")
+
+        elif self._state == 1:
+            if x <= self._lower:
+                self._status_var.set("Upper must be greater than lower. Click again.")
+                return
+            self._upper = x
+            self._state = 2
+            self._status_var.set(
+                f"Lower: {self._lower:.4g}   Upper: {self._upper:.4g}")
+            self._apply_btn.config(state=tk.NORMAL)
+        else:
+            return
+
+        self._draw_cutoffs()
+        self._canvas.draw()
+        self._update_retained_label()
+        self._notify_gate_change()
+
+    def _reset(self):
+        if self._active_selection is None:
+            return
+        self._lower = None
+        self._upper = None
+        self._state = 0
+        self._apply_btn.config(state=tk.DISABLED)
+        self._status_var.set("Click to set lower cutoff.")
+        self._draw_histograms(xlim=self._view)   # keep the current view
+        self._update_retained_label()
+        self._notify_gate_change()
+
+    def _update_retained_label(self):
+        """Live '% of data retained' readout for the current lower/upper, if set."""
+        if (self._active_selection is None or self._lower is None
+                or self._upper is None):
+            self._retained_var.set('')
+            return
+        lo, hi = self._lower, self._upper
+        total = 0
+        kept = 0
+        for col in self._active_selection:
+            vals = self._data[col]
+            vals = vals[~np.isnan(vals)]
+            total += vals.size
+            kept += int(np.count_nonzero((vals >= lo) & (vals <= hi)))
+        pct = 100 * kept / total if total else 0.0
+        self._retained_var.set(f'Retained: {pct:.1f}%  ({kept}/{total})')
+
+    def get_active_gate(self):
+        """
+        Current right-panel gate state, for an external caller that wants to
+        react to it (e.g. a cross-referenced retained-% indicator) without
+        reaching into private attributes: (selection, lower, upper), each
+        None if not yet set.
+        """
+        return self._active_selection, self._lower, self._upper
+
+    def _notify_gate_change(self):
+        if self._on_gate_change is not None:
+            self._on_gate_change()
+
+    def _apply_cutoffs(self):
+        if (self._active_selection is None or self._lower is None
+                or self._upper is None):
+            return
+        self._history.append((
+            self._cutoffs.copy(),
+            list(self._groups),
+            list(self._remaining),
+        ))
+        lower, upper, view = self._lower, self._upper, self._view
+        for col in self._active_selection:
+            self._cutoffs[col] = (lower, upper)
+            self._remaining.remove(col)
+        self._groups.append((lower, upper, self._active_selection, view))
+        self._clear_active_gating()
+        self._refresh_list()
+
+    def _clear_active_gating(self):
+        self._active_selection = None
+        self._lower = None
+        self._upper = None
+        self._state = 0
+        self._view = None
+        self._reset_btn.config(state=tk.DISABLED)
+        self._apply_btn.config(state=tk.DISABLED)
+        self._draw_idle()
+        self._update_retained_label()
+        self._notify_gate_change()
 
 
 # ---------------------------------------------------------------------------
