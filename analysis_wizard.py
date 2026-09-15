@@ -93,8 +93,13 @@ class _DataAvailability:
     """
     Caches, per directory string, whether mass and volume data were found —
     so Next/Previous can decide which of the BM/iFXM gating steps to skip
-    without re-running full discovery on every click. Call `refresh()`
-    whenever the shared directory might have changed since the last check.
+    without re-running full discovery (CSV/hdf5 reads) on every keystroke in
+    the directory field. Call `refresh()` whenever the shared directory
+    might have changed since the last check; pass `force=True` to bypass the
+    cache and re-run discovery even if the directory string is unchanged —
+    used right when Next/Previous is clicked to actually cross into the BM
+    or iFXM gating step, since the separate mass/volume analyses may have
+    been run (producing new files) after the directory was first set here.
     """
 
     def __init__(self):
@@ -102,9 +107,9 @@ class _DataAvailability:
         self._has_mass = True
         self._has_volume = True
 
-    def refresh(self, superdir_text: str):
+    def refresh(self, superdir_text: str, force: bool = False):
         superdir_text = (superdir_text or '').strip()
-        if superdir_text == self._dir:
+        if not force and superdir_text == self._dir:
             return
         self._dir = superdir_text
         if not superdir_text or not Path(superdir_text).is_dir():
@@ -152,8 +157,13 @@ class Wizard:
         requires_finalize: if True, Next stays disabled on this step until
                           mark_complete(index) is called (and is disabled
                           again by mark_incomplete(index)).
-        skip_check:       optional callable() -> bool; Next/Previous skip
-                          over this step whenever it returns True.
+        skip_check:       optional callable(force=False) -> bool; Next/Previous
+                          skip over this step whenever it returns True. Called
+                          with force=False (cache allowed) for button-state
+                          bookkeeping, and force=True (cache bypassed, re-run
+                          discovery) at the moment Next/Previous actually
+                          crosses over this step, so a skip decided from a
+                          stale cache never happens.
         next_check:       optional callable() -> bool; Next stays disabled
                           on this step whenever it returns False (checked
                           live — call refresh_nav() when something this
@@ -206,9 +216,9 @@ class Wizard:
 
     # -- navigation -----------------------------------------------------
 
-    def _is_skipped(self, index: int) -> bool:
+    def _is_skipped(self, index: int, force: bool = False) -> bool:
         check = self._steps[index].get('skip_check')
-        return bool(check and check())
+        return bool(check and check(force=force))
 
     def _first_visible_index(self, start: int, direction: int) -> int:
         """The first in-range, non-skipped index reachable from `start`
@@ -267,7 +277,7 @@ class Wizard:
 
     def _go_prev(self):
         idx = self._index - 1
-        while idx >= 0 and self._is_skipped(idx):
+        while idx >= 0 and self._is_skipped(idx, force=True):
             idx -= 1
         if idx >= 0:
             self._show(idx)
@@ -276,7 +286,7 @@ class Wizard:
         if not self._step_ready(self._index):
             return   # guard directly, don't rely solely on the button's disabled state
         idx = self._index + 1
-        while idx < len(self._steps) and self._is_skipped(idx):
+        while idx < len(self._steps) and self._is_skipped(idx, force=True):
             idx += 1
         if idx < len(self._steps):
             self._show(idx)
@@ -325,12 +335,12 @@ def main():
             parent, initial_superdir=experiment_superdir.get(),
             on_done=root.destroy)
 
-    def _skip_bm():
-        availability.refresh(experiment_superdir.get())
+    def _skip_bm(force=False):
+        availability.refresh(experiment_superdir.get(), force=force)
         return availability.skip_bm_step
 
-    def _skip_ifxm():
-        availability.refresh(experiment_superdir.get())
+    def _skip_ifxm(force=False):
+        availability.refresh(experiment_superdir.get(), force=force)
         return availability.skip_ifxm_step
 
     def _has_superdir():
