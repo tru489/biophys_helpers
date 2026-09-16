@@ -135,6 +135,25 @@ either page revokes this until Finalize is clicked again).
 python analysis_wizard.py
 ```
 
+**Running it as an `analysis-wizard` shell command (Windows)**
+
+Add a function like the following to your PowerShell profile (`$PROFILE`;
+typically `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1`)
+to launch the wizard from any shell, using the `biophys_helpers` conda env's
+interpreter directly (no `conda activate` needed):
+
+```powershell
+function analysis-wizard {
+    & "C:\Users\<you>\anaconda3\envs\biophys_helpers\python.exe" "C:\path\to\biophys_helpers\analysis_wizard.py" @args
+}
+```
+
+Reload the profile (`. $PROFILE`, or open a new shell) and run:
+
+```powershell
+analysis-wizard
+```
+
 ---
 
 ## Coulter counter
