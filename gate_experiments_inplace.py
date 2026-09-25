@@ -19,7 +19,7 @@ Workflow:
     3. A single window shows the sample list on the left and the
        histogram(s) on the right. Selecting/deselecting samples in the list
        immediately previews their overlaid histogram(s) (shared bin edges).
-    4. The user clicks on a histogram to set a lower then upper cutoff;
+    4. The user clicks on a histogram to set lower and upper cutoffs (either order);
        changing the left-list selection while doing this restarts the cutoff
        for the new selection. For BM, every one of the four histograms is
        independently clickable at all times (no per-plot "arm" button) and
@@ -88,7 +88,7 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from gating.common import (GatingPanel, ask_data_type_dialog,
+from gating.common import (GatingPanel, ask_data_type_dialog, positive_range,
                            save_group_histograms, style_finalize_button,
                            write_stats_csv, write_log)
 
@@ -116,8 +116,9 @@ _MODE = {
         'label':        'iFXM Volume',
         'unit':         'fL',
         'xlabel':       'Volume (fL)',
-        'scale':        'linear',
-        'bins':         lambda vals: np.linspace(vals.min(), vals.max(), 201),
+        'scale':        'log',
+        # Log-spaced edges so bars are equal width on the log x axis.
+        'bins':         lambda vals: np.geomspace(*positive_range(vals), 201),
         'xlim':         None,
         'data_type':    'ifxm_volume',
         'dir_suffix':   '_ifxm_volume_gating_summary',
@@ -140,7 +141,10 @@ _BM_ATTRS = [
     {'key': 'mass_pg', 'label': 'Buoyant mass',
      'xlabel': 'Buoyant mass (pg)'},
     {'key': 'baseline_norm', 'label': 'Normalized baseline',
-     'xlabel': 'Normalized baseline (frac. of first-10% mean)', 'derived': True},
+     'xlabel': 'Normalized baseline (frac. of first-10% mean)', 'derived': True,
+     # Default view extends past the data by this fraction of its range on
+     # each side, leaving room to place gates in the tails.
+     'x_pad': 0.25},
     {'key': 'bl_slope', 'label': 'Baseline slope',
      'xlabel': 'Baseline slope'},
     {'key': 'node_dev_mean', 'label': 'Average node deviation',
@@ -720,7 +724,7 @@ class MultiAttributeGatingPanel(tk.Frame):
     histogram/cutoff panels — one per attribute (mass, normalized baseline,
     baseline slope, average node deviation) — ported from MATLAB's
     gate_mass_results.m. Each attribute panel is always "live": clicking on
-    it sets its own lower then upper cutoff without any per-plot activation
+    it sets its own lower and upper cutoff (either order) without any per-plot activation
     button, and selecting/deselecting samples on the left immediately
     updates all four histograms (as in GatingPanel).
 
@@ -850,9 +854,14 @@ class MultiAttributeGatingPanel(tk.Frame):
         view_row.pack(fill=tk.X, padx=4, pady=(2, 0))
         tk.Label(view_row, text='x:').pack(side=tk.LEFT)
         xmin_var = tk.StringVar()
-        tk.Entry(view_row, textvariable=xmin_var, width=8).pack(side=tk.LEFT, padx=(2, 2))
+        xmin_entry = tk.Entry(view_row, textvariable=xmin_var, width=8)
+        xmin_entry.pack(side=tk.LEFT, padx=(2, 2))
         xmax_var = tk.StringVar()
-        tk.Entry(view_row, textvariable=xmax_var, width=8).pack(side=tk.LEFT, padx=(0, 4))
+        xmax_entry = tk.Entry(view_row, textvariable=xmax_var, width=8)
+        xmax_entry.pack(side=tk.LEFT, padx=(0, 4))
+        for entry in (xmin_entry, xmax_entry):
+            for seq in ('<Return>', '<KP_Enter>'):
+                entry.bind(seq, lambda _e, k=key: self._apply_attr_xlim(k))
         tk.Button(view_row, text='Apply',
                  command=lambda k=key: self._apply_attr_xlim(k)).pack(side=tk.LEFT)
         tk.Button(view_row, text='Reset view',
@@ -922,7 +931,7 @@ class MultiAttributeGatingPanel(tk.Frame):
             st['view'] = None
             st['xmin_var'].set('')
             st['xmax_var'].set('')
-            st['status_var'].set('Click to set lower cutoff.')
+            st['status_var'].set('Click to set a cutoff.')
             self._draw_attr_histograms(key)
             self._update_attr_retained(key)
         self._apply_btn.config(state=tk.NORMAL)
@@ -1005,7 +1014,9 @@ class MultiAttributeGatingPanel(tk.Frame):
             return
 
         pooled = np.concatenate([v for _, v in arrays])
-        st['full_xlim'] = (float(pooled.min()), float(pooled.max()))
+        pmin, pmax = float(pooled.min()), float(pooled.max())
+        pad = spec.get('x_pad', 0.0) * (pmax - pmin)
+        st['full_xlim'] = (pmin - pad, pmax + pad)
         if not st['xmin_var'].get() and not st['xmax_var'].get():
             st['xmin_var'].set(f"{st['full_xlim'][0]:.4g}")
             st['xmax_var'].set(f"{st['full_xlim'][1]:.4g}")
@@ -1083,7 +1094,7 @@ class MultiAttributeGatingPanel(tk.Frame):
         st['lower'] = None
         st['upper'] = None
         st['state'] = 0
-        st['status_var'].set('Click to set lower cutoff.')
+        st['status_var'].set('Click to set a cutoff.')
         self._draw_attr_histograms(key, xlim=st['view'])
         self._update_attr_retained(key)
         self._update_overall_retained()
@@ -1099,14 +1110,15 @@ class MultiAttributeGatingPanel(tk.Frame):
         if st['state'] == 0:
             st['lower'] = x
             st['state'] = 1
-            st['status_var'].set(f"Lower: {x:.4g} — click upper cutoff")
+            st['status_var'].set(f"First cutoff: {x:.4g} — click second cutoff")
         elif st['state'] == 1:
-            if x <= st['lower']:
-                st['status_var'].set("Upper must be > lower. Click again.")
+            # Cutoffs may be clicked in either order; sort them here.
+            if x == st['lower']:
+                st['status_var'].set("Second cutoff must differ from the first. Click again.")
                 return
-            st['upper'] = x
+            st['lower'], st['upper'] = sorted((st['lower'], x))
             st['state'] = 2
-            st['status_var'].set(f"Lower: {st['lower']:.4g}  Upper: {x:.4g}")
+            st['status_var'].set(f"Lower: {st['lower']:.4g}  Upper: {st['upper']:.4g}")
         else:
             return
 

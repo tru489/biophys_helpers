@@ -59,6 +59,26 @@ def style_finalize_button(btn: tk.Button, enabled: bool):
 # Histogram binning
 # ---------------------------------------------------------------------------
 
+def positive_range(vals: np.ndarray) -> tuple:
+    """(min, max) over the strictly positive, finite entries of `vals` — the
+    range a log axis can show. Falls back to (1, 10) if there are none."""
+    vals = np.asarray(vals, dtype=float)
+    pos = vals[np.isfinite(vals) & (vals > 0)]
+    if pos.size == 0:
+        return 1.0, 10.0
+    lo, hi = float(pos.min()), float(pos.max())
+    if hi <= lo:
+        hi = lo * 10
+    return lo, hi
+
+
+def _data_xlim(mode_cfg: dict, all_vals: np.ndarray) -> tuple:
+    """Full data x-range for a mode, restricted to positive values on a log axis."""
+    if mode_cfg['scale'] == 'log':
+        return positive_range(all_vals)
+    return float(all_vals.min()), float(all_vals.max())
+
+
 def _view_bins(mode_cfg: dict, all_vals: np.ndarray, view: tuple = None):
     """
     Bin edges for a histogram drawn over `view`.
@@ -150,7 +170,7 @@ class CutoffWindow:
 
         info_frame = tk.Frame(self._top)
         info_frame.pack(fill=tk.X, padx=10, pady=(4, 0))
-        self._status_var = tk.StringVar(value="Click to set lower cutoff.")
+        self._status_var = tk.StringVar(value="Click to set a cutoff.")
         tk.Label(info_frame, textvariable=self._status_var,
                  anchor='w').pack(side=tk.LEFT)
 
@@ -193,7 +213,7 @@ class CutoffWindow:
             return
 
         all_vals = np.concatenate(arrays)
-        self._full_xlim = (float(all_vals.min()), float(all_vals.max()))
+        self._full_xlim = _data_xlim(cfg, all_vals)
         shared_bins = _view_bins(cfg, all_vals, xlim)
 
         for col, vals in zip(self._cols, arrays):
@@ -238,6 +258,9 @@ class CutoffWindow:
         if hi <= lo:
             self._status_var.set("X-axis view: max must be greater than min.")
             return None
+        if self._cfg['scale'] == 'log' and lo <= 0:
+            self._status_var.set("X-axis view: min must be > 0 on a log axis.")
+            return None
         return lo, hi
 
     def _apply_xlim(self):
@@ -268,13 +291,14 @@ class CutoffWindow:
         if self._state == 0:
             self._lower = x
             self._state = 1
-            self._status_var.set(f"Lower: {x:.4g}  —  Click to set upper cutoff.")
+            self._status_var.set(f"First cutoff: {x:.4g}  —  Click to set second cutoff.")
 
         elif self._state == 1:
-            if x <= self._lower:
-                self._status_var.set("Upper must be greater than lower. Click again.")
+            # Cutoffs may be clicked in either order; sort them here.
+            if x == self._lower:
+                self._status_var.set("Second cutoff must differ from the first. Click again.")
                 return
-            self._upper = x
+            self._lower, self._upper = sorted((self._lower, x))
             self._state = 2
             self._status_var.set(
                 f"Lower: {self._lower:.4g}   Upper: {self._upper:.4g}")
@@ -290,7 +314,7 @@ class CutoffWindow:
         self._upper = None
         self._state = 0
         self._accept_btn.config(state=tk.DISABLED)
-        self._status_var.set("Click to set lower cutoff.")
+        self._status_var.set("Click to set a cutoff.")
         self._draw_histograms(xlim=self._view)   # keep the current view
         self._canvas.draw()
 
@@ -549,12 +573,15 @@ class GatingPanel(tk.Frame):
         tk.Label(view_frame, text="X-axis view:").pack(side=tk.LEFT)
         tk.Label(view_frame, text="min").pack(side=tk.LEFT, padx=(8, 2))
         self._xmin_var = tk.StringVar()
-        tk.Entry(view_frame, textvariable=self._xmin_var,
-                 width=10).pack(side=tk.LEFT)
+        xmin_entry = tk.Entry(view_frame, textvariable=self._xmin_var, width=10)
+        xmin_entry.pack(side=tk.LEFT)
         tk.Label(view_frame, text="max").pack(side=tk.LEFT, padx=(8, 2))
         self._xmax_var = tk.StringVar()
-        tk.Entry(view_frame, textvariable=self._xmax_var,
-                 width=10).pack(side=tk.LEFT)
+        xmax_entry = tk.Entry(view_frame, textvariable=self._xmax_var, width=10)
+        xmax_entry.pack(side=tk.LEFT)
+        for entry in (xmin_entry, xmax_entry):
+            for seq in ('<Return>', '<KP_Enter>'):
+                entry.bind(seq, lambda _e: self._apply_xlim())
         tk.Button(view_frame, text="Apply",
                   command=self._apply_xlim).pack(side=tk.LEFT, padx=(8, 4))
         tk.Button(view_frame, text="Reset view",
@@ -661,7 +688,7 @@ class GatingPanel(tk.Frame):
         self._xmax_var.set('')
         self._reset_btn.config(state=tk.NORMAL)
         self._apply_btn.config(state=tk.DISABLED)
-        self._status_var.set("Click to set lower cutoff.")
+        self._status_var.set("Click to set a cutoff.")
         self._draw_histograms()
         self._update_retained_label()
         self._notify_gate_change()
@@ -687,7 +714,7 @@ class GatingPanel(tk.Frame):
             return
 
         all_vals = np.concatenate(arrays)
-        self._full_xlim = (float(all_vals.min()), float(all_vals.max()))
+        self._full_xlim = _data_xlim(cfg, all_vals)
         if not self._xmin_var.get() and not self._xmax_var.get():
             self._xmin_var.set(f'{self._full_xlim[0]:.4g}')
             self._xmax_var.set(f'{self._full_xlim[1]:.4g}')
@@ -736,6 +763,9 @@ class GatingPanel(tk.Frame):
         if hi <= lo:
             self._status_var.set("X-axis view: max must be greater than min.")
             return None
+        if self._cfg['scale'] == 'log' and lo <= 0:
+            self._status_var.set("X-axis view: min must be > 0 on a log axis.")
+            return None
         return lo, hi
 
     def _apply_xlim(self):
@@ -766,13 +796,14 @@ class GatingPanel(tk.Frame):
         if self._state == 0:
             self._lower = x
             self._state = 1
-            self._status_var.set(f"Lower: {x:.4g}  —  Click to set upper cutoff.")
+            self._status_var.set(f"First cutoff: {x:.4g}  —  Click to set second cutoff.")
 
         elif self._state == 1:
-            if x <= self._lower:
-                self._status_var.set("Upper must be greater than lower. Click again.")
+            # Cutoffs may be clicked in either order; sort them here.
+            if x == self._lower:
+                self._status_var.set("Second cutoff must differ from the first. Click again.")
                 return
-            self._upper = x
+            self._lower, self._upper = sorted((self._lower, x))
             self._state = 2
             self._status_var.set(
                 f"Lower: {self._lower:.4g}   Upper: {self._upper:.4g}")
@@ -792,7 +823,7 @@ class GatingPanel(tk.Frame):
         self._upper = None
         self._state = 0
         self._apply_btn.config(state=tk.DISABLED)
-        self._status_var.set("Click to set lower cutoff.")
+        self._status_var.set("Click to set a cutoff.")
         self._draw_histograms(xlim=self._view)   # keep the current view
         self._update_retained_label()
         self._notify_gate_change()
