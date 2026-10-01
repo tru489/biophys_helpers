@@ -243,6 +243,8 @@ class BaselineDensityGUI(ttk.Frame):
         self._rfreq = tk.StringVar(value='' if rfreq is None else f'{rfreq:g}')
         self._checked: dict[str, bool] = {}
         self._densities: dict[str, float] = {}
+        self._names: dict[str, str] = {}
+        self._red: set[str] = set()   # iids marked red ("done") — visual only
 
         pad = {'padx': 8, 'pady': 6}
         form = ttk.Frame(root)
@@ -271,6 +273,11 @@ class BaselineDensityGUI(ttk.Frame):
         ttk.Button(button_bar, text='Select All', command=self._select_all).pack(side=tk.LEFT)
         ttk.Button(button_bar, text='Select None', command=self._select_none).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(button_bar, text='Invert Selection', command=self._invert_selection).pack(side=tk.LEFT, padx=(6, 0))
+        # Visual-only row marking (doesn't affect the selection or average):
+        # red flags rows the user is done with.
+        ttk.Button(button_bar, text='Clear All Red', command=self._clear_all_red).pack(side=tk.RIGHT)
+        ttk.Button(button_bar, text='Reset Selected Color', command=self._unmark_selected).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(button_bar, text='Mark Selected Red', command=self._mark_selected_red).pack(side=tk.RIGHT, padx=(0, 6))
 
         table_frame = ttk.Frame(root)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 0))
@@ -286,6 +293,11 @@ class BaselineDensityGUI(ttk.Frame):
             self._tree.heading(col, text=headings[col])
             self._tree.column(col, width=widths[col], anchor=anchor,
                               stretch=(col == 'sample'))
+        # Each row carries exactly one of these tags, so there's no reliance
+        # on Treeview's tag-priority rules.
+        self._tree.tag_configure('even', background='#ffffff')
+        self._tree.tag_configure('odd', background='#ececec')
+        self._tree.tag_configure('done', background='#f4a3a3')
 
         vsb = ttk.Scrollbar(table_frame, orient='vertical', command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
@@ -307,6 +319,9 @@ class BaselineDensityGUI(ttk.Frame):
                                        state=tk.DISABLED)
         self._copy_button.pack(side=tk.LEFT, padx=(10, 0))
 
+        self._range_label = ttk.Label(root, text='Min: n/a    Max: n/a')
+        self._range_label.pack(anchor='w', padx=8, pady=(0, 8))
+
     def _pick_superdir(self):
         chosen = filedialog.askdirectory(title='Select experiment superdir',
                                          initialdir=self._superdir.get() or None)
@@ -327,22 +342,51 @@ class BaselineDensityGUI(ttk.Frame):
         self._tree.delete(*self._tree.get_children())
         self._checked.clear()
         self._densities.clear()
+        self._names.clear()
+        self._red.clear()
 
         for i, (name, n, mean_b, _source) in enumerate(rows):
             iid = str(i)
             density = apply_calculation(mean_b, cal, rfreq)
             self._checked[iid] = True
             self._densities[iid] = density
+            self._names[iid] = name
             self._tree.insert('', tk.END, iid=iid, values=(
                 _CHECKED, name, n, f'{mean_b:.6g}', f'{density:.6g}',
             ))
+            self._apply_row_color(iid)
 
         self._update_average()
 
+    # -- row coloring (visual only) --------------------------------------
+
+    def _apply_row_color(self, iid: str):
+        if iid in self._red:
+            tag = 'done'
+        else:
+            tag = 'odd' if self._tree.index(iid) % 2 else 'even'
+        self._tree.item(iid, tags=(tag,))
+
+    def _mark_selected_red(self):
+        for iid, checked in self._checked.items():
+            if checked:
+                self._red.add(iid)
+                self._apply_row_color(iid)
+
+    def _unmark_selected(self):
+        for iid, checked in self._checked.items():
+            if checked:
+                self._red.discard(iid)
+                self._apply_row_color(iid)
+
+    def _clear_all_red(self):
+        red, self._red = self._red, set()
+        for iid in red:
+            self._apply_row_color(iid)
+
     def _on_tree_click(self, event):
+        # Clicking anywhere on a row toggles its checkbox.
         if self._tree.identify_region(event.x, event.y) != 'cell':
-            return
-        if self._tree.identify_column(event.x) != '#1':
             return
         iid = self._tree.identify_row(event.y)
         if not iid:
@@ -370,16 +414,23 @@ class BaselineDensityGUI(ttk.Frame):
         self._update_average()
 
     def _update_average(self):
-        selected = [self._densities[iid] for iid, checked in self._checked.items() if checked]
-        if not selected:
+        selected_iids = [iid for iid, checked in self._checked.items() if checked]
+        if not selected_iids:
             self._current_average = None
             self._average_label.configure(text='Average density of selected samples: n/a')
+            self._range_label.configure(text='Min: n/a    Max: n/a')
             self._copy_button.configure(state=tk.DISABLED)
             return
+        selected = [self._densities[iid] for iid in selected_iids]
         avg = sum(selected) / len(selected)
         self._current_average = avg
         self._average_label.configure(
             text=f'Average density of selected samples: {avg:.4f}  (n={len(selected)})')
+        min_iid = min(selected_iids, key=self._densities.__getitem__)
+        max_iid = max(selected_iids, key=self._densities.__getitem__)
+        self._range_label.configure(
+            text=f'Min: {self._densities[min_iid]:.4f} ({self._names[min_iid]})    '
+                 f'Max: {self._densities[max_iid]:.4f} ({self._names[max_iid]})')
         self._copy_button.configure(state=tk.NORMAL)
 
     def _copy_average(self):
