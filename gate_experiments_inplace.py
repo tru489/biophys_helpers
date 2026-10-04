@@ -9,13 +9,16 @@ superdir.
 
 Workflow:
     1. A data-type selection dialog asks whether you are gating Buoyant Mass
-       or iFXM Volume data.
+       + iFXM Volume together (combined) or iFXM Volume only.
     2. The script discovers the relevant data file for each sample subdir.
-       iFXM gates a single histogram (volume_fl); BM gates FOUR independent
-       histograms at once — mass_pg, normalized baseline (avg_baseline
-       divided by its mean over the first 10% of the run), bl_slope, and
-       node_dev_mean — porting the four-attribute gate from this repo's
-       MATLAB gate_mass_results.m (see MultiAttributeGatingPanel).
+       iFXM-only gates a single histogram (volume_fl). Combined gates FIVE
+       independent histograms at once — mass_pg, normalized baseline
+       (avg_baseline divided by its mean over the first 10% of the run),
+       bl_slope, and node_dev_mean, porting the four-attribute gate from
+       this repo's MATLAB gate_mass_results.m, plus volume_fl (see
+       MultiAttributeGatingPanel). A sample with only mass or only volume
+       data simply doesn't appear in the other kind's histogram(s); the
+       volume histogram is omitted entirely if no sample has volume data.
     3. A single window shows the sample list on the left and the
        histogram(s) on the right. Selecting/deselecting samples in the list
        immediately previews their overlaid histogram(s) (shared bin edges).
@@ -23,10 +26,10 @@ Workflow:
        changing the left-list selection while doing this restarts the cutoff
        for the new selection. For BM, every one of the four histograms is
        independently clickable at all times (no per-plot "arm" button) and
-       gating each is optional — the eventual per-sample gate is the
-       logical AND of whichever attribute(s) were actually gated, and each
-       gated histogram shows a live "% retained" readout (BM also shows the
-       pooled AND retained %). "Apply cutoffs" commits the group (BM:
+       gating each is optional — the eventual per-sample mass gate is the
+       logical AND of whichever mass attribute(s) were actually gated, and
+       each gated histogram shows a live "% retained" readout (combined also
+       shows the pooled mass AND retained %). "Apply cutoffs" commits the group (BM:
        confirming first if zero attributes are gated) and returns the
        panel to an idle preview.
     5. Step 3-4 repeats until all samples are assigned. "Finalize gating"
@@ -34,11 +37,14 @@ Workflow:
     6. On "Finalize gating":
          - A YAML gate file is written into each sample subfolder:
              <sample_subdir_name>_<mode>_gate.yaml
-           For BM this includes a `gates:` mapping of every attribute
-           actually gated; top-level lower/upper mirror the mass_pg gate
-           specifically, for backward compatibility with
-           compile_experiment.py's gate reader.
-         - A summary folder is written into the superdir:
+           Combined mode writes both a BM gate (samples with mass data) and
+           an iFXM volume gate (samples with volume data), exactly as the
+           separate modes used to. The BM YAML includes a `gates:` mapping of
+           every mass attribute actually gated; top-level lower/upper mirror
+           the mass_pg gate specifically, for backward compatibility with
+           compile_experiment.py's gate reader. A gate YAML with no
+           lower/upper means that sample was deliberately left ungated.
+         - A summary folder per data type is written into the superdir:
              <YYMMDD.HHMMSS>_<mode>_gating_summary/
                cutoff_log.txt
                cutoff_stats.csv
@@ -46,7 +52,10 @@ Workflow:
     7. A "← Back" button undoes the last group of cutoffs, restoring those
        samples to the remaining list. Can be pressed repeatedly.
 
-On the iFXM page, if a sample already has a BM gate on disk (see
+On the combined page, for samples with matched mass+volume cells
+(analysis/density/cells in the CELLGROUPED hdf5), a readout shows the % of
+paired cells inside both the live mass_pg gate and the live volume gate.
+On the iFXM-only page, if a sample already has a BM gate on disk (see
 _read_bm_gate_bounds) and matched mass+volume cells (analysis/density/cells
 in its CELLGROUPED hdf5), an extra readout shows the % of paired cells
 retained by that BM mass_pg bound together with the volume gate being set.
@@ -153,6 +162,14 @@ _BM_ATTRS = [
 _ATTR_SPEC = {a['key']: a for a in _BM_ATTRS}
 _ATTR_KEYS = [a['key'] for a in _BM_ATTRS]
 _ATTR_LABELS = {a['key']: a['label'] for a in _BM_ATTRS}
+
+# The optional 5th histogram on the combined gating page: iFXM volume. Unlike
+# the four BM attributes (all columns of one per-cell mass table), volume
+# comes from separate per-sample data (_discover_ifxm) with its own cell
+# population, so its gate is never AND-ed with the mass-table gates — it's
+# written out as its own iFXM volume gate YAML on Finalize.
+_VOLUME_ATTR = {'key': 'volume_fl', 'label': 'iFXM volume',
+                'xlabel': 'Volume (fL)', 'source': 'volume', 'scale': 'log'}
 
 
 def _baseline_norm(df: pd.DataFrame) -> np.ndarray:
@@ -412,6 +429,26 @@ def _load_paired_mass_volume(hdf5_path: Path) -> pd.DataFrame | None:
     })
 
 
+def _discover_combined(superdir: Path) -> tuple[dict, dict, dict]:
+    """
+    Everything the combined mass + volume gating page needs:
+    (mass_data, volume_data, paired_data) — per-sample mass tables
+    (_discover_bm_tables), volume arrays (_discover_ifxm), and, for samples
+    with both, matched mass+volume cells (_load_paired_mass_volume).
+    """
+    mass_data = _discover_bm_tables(superdir)
+    volume_data = _discover_ifxm(superdir)
+    paired_data = {}
+    for name in mass_data.keys() & volume_data.keys():
+        hdf5_path = _find_cellgrouped_hdf5(superdir / name)
+        if hdf5_path is None:
+            continue
+        pdf = _load_paired_mass_volume(hdf5_path)
+        if pdf is not None and not pdf.empty:
+            paired_data[name] = pdf
+    return mass_data, volume_data, paired_data
+
+
 def _read_bm_gate_bounds(sample_dir: Path) -> tuple | None:
     """
     The mass_pg (lower, upper) bounds from the newest
@@ -454,7 +491,7 @@ def _write_yaml_files(superdir: Path, sample_dirs: dict,
     """
     subdir_name = f"{timestamp}_{mode_cfg['yaml_dir_tag']}"
 
-    for sample, (lo, hi) in cutoffs.items():
+    for sample, bounds in cutoffs.items():
         sample_dir = sample_dirs[sample]
         gate_dir = sample_dir / subdir_name
         gate_dir.mkdir(exist_ok=True)
@@ -463,9 +500,13 @@ def _write_yaml_files(superdir: Path, sample_dirs: dict,
         payload = {
             'experiment': superdir.name,
             'data_type':  mode_cfg['data_type'],
-            'lower':      float(lo),
-            'upper':      float(hi),
         }
+        # bounds is None for a sample deliberately left ungated (combined
+        # page): the file is still written so it supersedes any older gate.
+        if bounds is not None:
+            lo, hi = bounds
+            payload['lower'] = float(lo)
+            payload['upper'] = float(hi)
         with open(out_path, 'w') as fh:
             yaml.dump(payload, fh, default_flow_style=False, sort_keys=False)
         print(f"Written: {out_path}")
@@ -712,6 +753,53 @@ def _write_bm_multi_output(superdir: Path, sample_dirs: dict, data: dict,
     return summary_dir
 
 
+def _write_combined_output(superdir: Path, sample_dirs: dict, mass_data: dict,
+                           volume_data: dict, cutoffs: dict, groups: list) -> str:
+    """
+    Splits the combined page's gates back into the two existing outputs, so
+    compile_experiment.py reads them unchanged:
+      - BM: the four mass-table attributes, for every sample with mass data
+        (_write_bm_multi_output — *_bm_gating/ YAMLs + summary folder).
+      - iFXM volume: for every sample with volume data
+        (_write_output — *_ifxm-vol_gating/ YAMLs + summary folder). A
+        sample whose group didn't gate volume still gets a YAML, without
+        lower/upper, so it supersedes any older volume gate on disk.
+
+    `cutoffs` maps sample -> {attr_key: (lower, upper)} and `groups` is an
+    ordered list of ({attr_key: (lower, upper, view)}, [sample, ...]), with
+    'volume_fl' as just another attribute key. Returns the summary folder(s)
+    written, newline-separated.
+    """
+    vkey = _VOLUME_ATTR['key']
+    out_dirs = []
+
+    bm_cutoffs = {name: {k: r for k, r in ranges.items() if k != vkey}
+                  for name, ranges in cutoffs.items() if name in mass_data}
+    if bm_cutoffs:
+        bm_groups = []
+        for ranges, names in groups:
+            names = [n for n in names if n in mass_data]
+            if names:
+                bm_groups.append(({k: r for k, r in ranges.items() if k != vkey}, names))
+        out_dirs.append(_write_bm_multi_output(
+            superdir, sample_dirs, mass_data, bm_cutoffs, bm_groups))
+
+    vol_cutoffs = {name: ranges.get(vkey)
+                   for name, ranges in cutoffs.items() if name in volume_data}
+    if vol_cutoffs:
+        vol_groups = []
+        for ranges, names in groups:
+            names = [n for n in names if n in volume_data]
+            if names and vkey in ranges:
+                lo, hi, view = ranges[vkey]
+                vol_groups.append((lo, hi, names, view))
+        out_dirs.append(_write_output(
+            superdir, sample_dirs, list(volume_data), volume_data,
+            vol_cutoffs, vol_groups, _MODE['ifxm']))
+
+    return '\n'.join(str(d) for d in out_dirs)
+
+
 # ---------------------------------------------------------------------------
 # MultiAttributeGatingPanel — BM gating (mass / normalized baseline /
 # baseline slope / average node deviation)
@@ -735,7 +823,17 @@ class MultiAttributeGatingPanel(tk.Frame):
 
     Every attribute panel shows a live "Retained: X%" readout once its own
     cutoff is set (its data only), and the bottom bar shows the pooled
-    percentage retained by the AND of every attribute currently gated.
+    percentage retained by the AND of every mass-table attribute currently
+    gated.
+
+    If `volume_data` is given, a 5th iFXM volume histogram (log x axis) is
+    added to the grid (2x3 instead of 2x2) and gated per-sample together with
+    the other four. Its cells are a separate population from the mass table,
+    so its gate isn't part of the mass-table AND; instead, for samples with
+    matched mass+volume cells (`paired_data`), the bottom bar also shows the
+    % of paired cells inside both the mass_pg and the volume gate. Samples
+    may have mass data, volume data, or both; each histogram just skips
+    samples lacking its data.
 
     Args:
         parent:        parent tkinter widget
@@ -750,13 +848,19 @@ class MultiAttributeGatingPanel(tk.Frame):
         on_done:       optional callable() invoked after the Finalize dialog
                        is dismissed (e.g. root.destroy standalone; a wizard
                        "mark this step complete" callback when embedded).
+        volume_data:   optional mapping of sample name -> volume array (fL)
+        paired_data:   optional mapping of sample name -> pd.DataFrame with
+                       mass_pg + volume_fl per matched cell
     """
 
     def __init__(self, parent: tk.Widget, columns: list, data: dict,
-                on_finish, context_label: str = '', on_done=None):
+                on_finish, context_label: str = '', on_done=None,
+                volume_data: dict | None = None, paired_data: dict | None = None):
         super().__init__(parent)
         self._columns = columns
         self._data = data
+        self._volume_data = volume_data or {}
+        self._paired_data = paired_data or {}
         self._on_finish = on_finish
         self._on_done = on_done
         self._cutoffs: dict = {}
@@ -765,8 +869,13 @@ class MultiAttributeGatingPanel(tk.Frame):
         self._history: list = []
         self._active_selection: list | None = None
 
+        self._specs = list(_BM_ATTRS) + ([_VOLUME_ATTR] if self._volume_data else [])
+        self._spec = {s['key']: s for s in self._specs}
+        self._keys = [s['key'] for s in self._specs]
+
         ctx = f"  [{context_label}]" if context_label else ''
-        self.title = f"Gating — Buoyant Mass (mass, baseline, slope, node dev){ctx}"
+        vol = ', volume' if self._volume_data else ''
+        self.title = f"Gating — Buoyant Mass (mass, baseline, slope, node dev{vol}){ctx}"
 
         left = tk.Frame(self)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
@@ -800,38 +909,45 @@ class MultiAttributeGatingPanel(tk.Frame):
         self._done_btn.pack(side=tk.LEFT, padx=(8, 0))
         style_finalize_button(self._done_btn, False)
 
-        # --- right: 2x2 attribute grid ---
+        # --- right: attribute grid (2x2, or 2x3 with volume) ---
+        n_cols = 2 if len(self._specs) <= 4 else 3
         grid = tk.Frame(right)
         grid.pack(fill=tk.BOTH, expand=True)
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-        grid.rowconfigure(0, weight=1)
-        grid.rowconfigure(1, weight=1)
+        for c in range(n_cols):
+            grid.columnconfigure(c, weight=1, uniform='attr')
+        grid.rowconfigure(0, weight=1, uniform='attr')
+        grid.rowconfigure(1, weight=1, uniform='attr')
 
+        figsize = (4.6, 2.8) if n_cols == 2 else (3.6, 2.6)
         self._attr: dict = {}
-        for idx, spec in enumerate(_BM_ATTRS):
-            r, c = divmod(idx, 2)
-            state = self._build_attr_cell(grid, spec)
+        for idx, spec in enumerate(self._specs):
+            r, c = divmod(idx, n_cols)
+            state = self._build_attr_cell(grid, spec, figsize)
             state['frame'].grid(row=r, column=c, sticky='nsew', padx=3, pady=3)
             self._attr[spec['key']] = state
 
         bottom = tk.Frame(right)
         bottom.pack(fill=tk.X, pady=(6, 0))
-        self._overall_var = tk.StringVar()
-        tk.Label(bottom, textvariable=self._overall_var, anchor='w',
-                font=('TkDefaultFont', 10, 'bold')).pack(side=tk.LEFT)
         self._apply_btn = tk.Button(bottom, text='Apply cutoffs',
                                     state=tk.DISABLED, command=self._apply_cutoffs)
-        self._apply_btn.pack(side=tk.RIGHT)
+        self._apply_btn.pack(side=tk.RIGHT, anchor='n')
+        self._overall_var = tk.StringVar()
+        tk.Label(bottom, textvariable=self._overall_var, anchor='w',
+                font=('TkDefaultFont', 10, 'bold')).pack(fill=tk.X)
+        self._paired_var = tk.StringVar()
+        if self._paired_data:
+            tk.Label(bottom, textvariable=self._paired_var, anchor='w',
+                    font=('TkDefaultFont', 9, 'bold'),
+                    foreground='#1a6b1a').pack(fill=tk.X)
 
-        for key in _ATTR_KEYS:
+        for key in self._keys:
             self._draw_idle_attr(key)
         self._update_overall_retained()
         self._refresh_list()
 
     # -- attribute cell construction -------------------------------------
 
-    def _build_attr_cell(self, parent: tk.Widget, spec: dict) -> dict:
+    def _build_attr_cell(self, parent: tk.Widget, spec: dict, figsize: tuple) -> dict:
         key = spec['key']
         cell = tk.Frame(parent, bd=1, relief=tk.GROOVE)
         tk.Label(cell, text=spec['label'],
@@ -843,7 +959,7 @@ class MultiAttributeGatingPanel(tk.Frame):
         # never torn down. With 4 of these per BM panel, that's enough
         # orphaned roots to keep the whole process alive after the app's
         # real window is closed. Figure() never touches Tkinter.
-        fig = Figure(figsize=(4.6, 2.8))
+        fig = Figure(figsize=figsize)
         ax = fig.add_subplot(111)
         canvas = FigureCanvasTkAgg(fig, master=cell)
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=2)
@@ -893,8 +1009,9 @@ class MultiAttributeGatingPanel(tk.Frame):
             self._listbox.insert(tk.END, col)
         n_done = len(self._cutoffs)
         n_total = len(self._columns)
+        kind = 'Buoyant Mass + Volume' if self._volume_data else 'Buoyant Mass'
         self._header_var.set(f"Remaining: {n_total - n_done} / {n_total}   "
-                             f"[Buoyant Mass]")
+                             f"[{kind}]")
         style_finalize_button(self._done_btn, n_done == n_total)
         self._back_btn.config(state=tk.NORMAL if self._history else tk.DISABLED)
 
@@ -923,7 +1040,7 @@ class MultiAttributeGatingPanel(tk.Frame):
 
     def _activate_gating(self, selection: list):
         self._active_selection = selection
-        for key in _ATTR_KEYS:
+        for key in self._keys:
             st = self._attr[key]
             st['lower'] = None
             st['upper'] = None
@@ -939,7 +1056,7 @@ class MultiAttributeGatingPanel(tk.Frame):
 
     def _clear_active_gating(self):
         self._active_selection = None
-        for key in _ATTR_KEYS:
+        for key in self._keys:
             st = self._attr[key]
             st['lower'] = None
             st['upper'] = None
@@ -954,7 +1071,7 @@ class MultiAttributeGatingPanel(tk.Frame):
     def _apply_cutoffs(self):
         if self._active_selection is None:
             return
-        set_keys = [k for k in _ATTR_KEYS if self._attr[k]['state'] == 2]
+        set_keys = [k for k in self._keys if self._attr[k]['state'] == 2]
         if not set_keys:
             if not messagebox.askyesno(
                     "No cutoffs set",
@@ -980,11 +1097,19 @@ class MultiAttributeGatingPanel(tk.Frame):
 
     # -- per-attribute histogram / cutoff -----------------------------------
 
-    def _draw_idle_attr(self, key: str):
+    def _values(self, name: str, spec: dict) -> np.ndarray | None:
+        """One sample's values for one attribute, or None if that sample has
+        no data of this attribute's kind (mass table vs. volume)."""
+        if spec.get('source') == 'volume':
+            return self._volume_data.get(name)
+        df = self._data.get(name)
+        return None if df is None else _attr_values(df, spec)
+
+    def _draw_idle_attr(self, key: str, text: str = 'Select samples\non the left'):
         st = self._attr[key]
         ax = st['ax']
         ax.clear()
-        ax.text(0.5, 0.5, 'Select samples\non the left', ha='center', va='center',
+        ax.text(0.5, 0.5, text, ha='center', va='center',
                 transform=ax.transAxes, color='#888888', fontsize=9)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -998,19 +1123,22 @@ class MultiAttributeGatingPanel(tk.Frame):
             self._draw_idle_attr(key)
             return
 
-        spec = _ATTR_SPEC[key]
+        spec = self._spec[key]
         st = self._attr[key]
         ax = st['ax']
         ax.clear()
 
+        log = spec.get('scale') == 'log'
         arrays = []
         for name in self._active_selection:
-            v = _attr_values(self._data[name], spec)
-            v = v[np.isfinite(v)]
+            v = self._values(name, spec)
+            if v is None:
+                continue
+            v = v[np.isfinite(v) & (v > 0)] if log else v[np.isfinite(v)]
             if v.size:
                 arrays.append((name, v))
         if not arrays:
-            self._draw_idle_attr(key)
+            self._draw_idle_attr(key, 'No data for\nthis selection')
             return
 
         pooled = np.concatenate([v for _, v in arrays])
@@ -1023,17 +1151,20 @@ class MultiAttributeGatingPanel(tk.Frame):
 
         lo, hi = xlim if xlim is not None else st['full_xlim']
         if hi <= lo:
-            hi = lo + 1
-        edges = np.linspace(lo, hi, 101)
+            hi = lo * 2 if log else lo + 1
+        # Log-spaced edges on a log axis so bars are equal width.
+        edges = np.geomspace(lo, hi, 101) if log else np.linspace(lo, hi, 101)
 
         for name, v in arrays:
             ax.hist(v, bins=edges, alpha=0.5, edgecolor='black',
                     linewidth=0.3, label=name)
+        if log:
+            ax.set_xscale('log')
         ax.set_xlim(lo, hi)
         ax.set_xlabel(spec['xlabel'], fontsize=8)
         ax.set_ylabel('count', fontsize=8)
         ax.tick_params(labelsize=7)
-        if key == _ATTR_KEYS[0] and len(arrays) > 1:
+        if key == self._keys[0] and len(arrays) > 1:
             ax.legend(fontsize=6, loc='upper right')
         st['fig'].tight_layout()
 
@@ -1065,6 +1196,9 @@ class MultiAttributeGatingPanel(tk.Frame):
             return None
         if hi <= lo:
             st['status_var'].set('x view: max must be > min.')
+            return None
+        if self._spec[key].get('scale') == 'log' and lo <= 0:
+            st['status_var'].set('x view: min must be > 0 on a log axis.')
             return None
         return lo, hi
 
@@ -1134,37 +1268,76 @@ class MultiAttributeGatingPanel(tk.Frame):
             st['retained_var'].set('')
             return
         lo, hi = st['lower'], st['upper']
-        spec = _ATTR_SPEC[key]
+        spec = self._spec[key]
         total = 0
         kept = 0
         for name in self._active_selection:
-            v = _attr_values(self._data[name], spec)
+            v = self._values(name, spec)
+            if v is None:
+                continue
             total += v.size
             kept += int(np.count_nonzero((v >= lo) & (v <= hi)))
         pct = 100 * kept / total if total else 0.0
         st['retained_var'].set(f'Retained: {pct:.1f}%  ({kept}/{total})')
 
     def _update_overall_retained(self):
+        self._update_paired_retained()
         if self._active_selection is None:
             self._overall_var.set('')
             return
-        set_keys = [k for k in _ATTR_KEYS if self._attr[k]['state'] == 2]
+        set_keys = [k for k in self._keys if self._attr[k]['state'] == 2]
+        # The mass-table AND covers only the four BM attributes; volume is a
+        # separate cell population (see _update_paired_retained).
+        flat_ranges = {k: (self._attr[k]['lower'], self._attr[k]['upper'])
+                      for k in set_keys if k in _ATTR_SPEC}
         total = 0
         kept = 0
         for name in self._active_selection:
-            df = self._data[name]
-            n = len(df)
-            total += n
-            if not set_keys:
-                kept += n
+            df = self._data.get(name)
+            if df is None:
                 continue
-            flat_ranges = {k: (self._attr[k]['lower'], self._attr[k]['upper'])
-                          for k in set_keys}
+            total += len(df)
             kept += int(np.count_nonzero(_bm_multi_mask(df, flat_ranges)))
-        pct = 100 * kept / total if total else 0.0
+        if total:
+            pct = 100 * kept / total
+            retained = f'Mass retained (AND of BM gates): {pct:.1f}%  ({kept}/{total})'
+        else:
+            retained = 'Mass retained: n/a (no mass data in selection)'
         self._overall_var.set(
-            f'Gates set: {len(set_keys)}/4    '
-            f'Overall retained (AND): {pct:.1f}%  ({kept}/{total})')
+            f'Gates set: {len(set_keys)}/{len(self._keys)}    {retained}')
+
+    def _update_paired_retained(self):
+        """% of matched mass+volume cells (CELLGROUPED analysis/density/cells)
+        inside both the mass_pg gate and the volume gate — whichever of the
+        two is set; an unset one passes everything."""
+        if not self._paired_data:
+            return
+        if self._active_selection is None:
+            self._paired_var.set('')
+            return
+        relevant = [n for n in self._active_selection if n in self._paired_data]
+        if not relevant:
+            self._paired_var.set('Paired mass+volume retained: n/a for this selection')
+            return
+        gates = {}
+        for key in ('mass_pg', _VOLUME_ATTR['key']):
+            st = self._attr.get(key)
+            if st is not None and st['state'] == 2:
+                gates[key] = (st['lower'], st['upper'])
+        total = 0
+        kept = 0
+        for name in relevant:
+            pdf = self._paired_data[name]
+            mask = np.ones(len(pdf), dtype=bool)
+            for key, (lo, hi) in gates.items():
+                v = pdf[key].to_numpy(dtype=float)
+                mask &= (v >= lo) & (v <= hi)
+            total += len(pdf)
+            kept += int(np.count_nonzero(mask))
+        pct = 100 * kept / total if total else 0.0
+        self._paired_var.set(
+            f'Paired mass+volume retained (mass gate x volume gate): '
+            f'{pct:.1f}%  ({kept}/{total})')
 
 
 # ---------------------------------------------------------------------------
@@ -1177,27 +1350,30 @@ def main():
     root = tk.Tk()
     root.withdraw()
     mode_key = ask_data_type_dialog(root, [
-        ('Buoyant Mass', 'bm'),
-        ('iFXM Volume', 'ifxm'),
+        ('Buoyant Mass + iFXM Volume', 'combined'),
+        ('iFXM Volume only', 'ifxm'),
     ])
 
-    if mode_key == 'bm':
-        print(f"Discovering Buoyant Mass data in {superdir.name}...")
-        data = _discover_bm_tables(superdir)
-        if not data:
-            print(f"No Buoyant Mass data found in {superdir}")
+    if mode_key == 'combined':
+        print(f"Discovering Buoyant Mass + iFXM Volume data in {superdir.name}...")
+        mass_data, volume_data, paired_data = _discover_combined(superdir)
+        columns = sorted(mass_data.keys() | volume_data.keys())
+        if not columns:
+            print(f"No Buoyant Mass or iFXM Volume data found in {superdir}")
             sys.exit(1)
-        sample_dirs = {name: superdir / name for name in data}
-        columns = list(data.keys())
+        sample_dirs = {name: superdir / name for name in columns}
         print(f"Found {len(columns)} sample(s): {', '.join(columns)}")
 
         def on_finish(cutoffs, groups):
-            return _write_bm_multi_output(superdir, sample_dirs, data, cutoffs, groups)
+            return _write_combined_output(superdir, sample_dirs, mass_data,
+                                          volume_data, cutoffs, groups)
 
         root.deiconify()
-        panel = MultiAttributeGatingPanel(root, columns, data, on_finish,
+        panel = MultiAttributeGatingPanel(root, columns, mass_data, on_finish,
                                           context_label=superdir.name,
-                                          on_done=root.destroy)
+                                          on_done=root.destroy,
+                                          volume_data=volume_data,
+                                          paired_data=paired_data)
     else:
         mode_cfg = _MODE[mode_key]
         print(f"Discovering {mode_cfg['label']} data in {superdir.name}...")
@@ -1231,8 +1407,11 @@ def build_embedded_page(parent: tk.Widget, mode_key: str, *,
                         superdir_var: tk.StringVar | None = None,
                         on_finalized=None, on_discover=None) -> ttk.Frame:
     """
-    Build this tool's gating UI (for a single data type, 'bm' or 'ifxm') as a
-    Frame suitable for embedding in a larger application, e.g. a wizard page.
+    Build this tool's gating UI as a Frame suitable for embedding in a larger
+    application, e.g. a wizard page. `mode_key` is 'combined' (the BM
+    four-attribute page plus an iFXM volume histogram, gated together
+    per-sample — the volume histogram is simply absent if the directory has
+    no volume data) or 'ifxm' (volume only).
 
     Unlike the standalone main(), the data-type is fixed by `mode_key` rather
     than asked via ask_data_type_dialog (a wizard page is already scoped to
@@ -1259,20 +1438,22 @@ def build_embedded_page(parent: tk.Widget, mode_key: str, *,
     to re-disable Next, since a fresh discovery means whatever was
     previously finalized here no longer applies.
     """
-    if mode_key == 'bm':
-        return _build_bm_embedded_page(parent, initial_superdir=initial_superdir,
-                                       superdir_var=superdir_var,
-                                       on_finalized=on_finalized,
-                                       on_discover=on_discover)
-    return _build_ifxm_embedded_page(parent, initial_superdir=initial_superdir,
-                                     superdir_var=superdir_var,
-                                     on_finalized=on_finalized,
-                                     on_discover=on_discover)
+    if mode_key == 'combined':
+        return _build_combined_embedded_page(parent, initial_superdir=initial_superdir,
+                                             superdir_var=superdir_var,
+                                             on_finalized=on_finalized,
+                                             on_discover=on_discover)
+    if mode_key == 'ifxm':
+        return _build_ifxm_embedded_page(parent, initial_superdir=initial_superdir,
+                                         superdir_var=superdir_var,
+                                         on_finalized=on_finalized,
+                                         on_discover=on_discover)
+    raise ValueError(f"Unknown mode_key: {mode_key!r} (expected 'combined' or 'ifxm')")
 
 
-def _build_bm_embedded_page(parent: tk.Widget, *, initial_superdir=None,
-                            superdir_var=None, on_finalized=None,
-                            on_discover=None) -> ttk.Frame:
+def _build_combined_embedded_page(parent: tk.Widget, *, initial_superdir=None,
+                                  superdir_var=None, on_finalized=None,
+                                  on_discover=None) -> ttk.Frame:
     page = ttk.Frame(parent)
 
     top = ttk.Frame(page)
@@ -1316,25 +1497,27 @@ def _build_bm_embedded_page(parent: tk.Widget, *, initial_superdir=None,
             status_var.set(f'Directory not found: {superdir}')
             return
 
-        data = _discover_bm_tables(superdir)
-        if not data:
-            status_var.set(f'No Buoyant Mass data found under {superdir}.')
+        mass_data, volume_data, paired_data = _discover_combined(superdir)
+        columns = sorted(mass_data.keys() | volume_data.keys())
+        if not columns:
+            status_var.set(f'No Buoyant Mass or iFXM Volume data found under {superdir}.')
             return
 
-        sample_dirs = {name: superdir / name for name in data}
-        columns = list(data.keys())
+        sample_dirs = {name: superdir / name for name in columns}
 
         def on_finish(cutoffs, groups):
-            out_dir = _write_bm_multi_output(superdir, sample_dirs, data, cutoffs, groups)
-            status_var.set(f'Gate files written to: {out_dir}')
-            return out_dir
+            out = _write_combined_output(superdir, sample_dirs, mass_data,
+                                         volume_data, cutoffs, groups)
+            status_var.set(f'Gate files written to: {out.replace(chr(10), "; ")}')
+            return out
 
         gating_panel = MultiAttributeGatingPanel(
-            panel_container, columns, data, on_finish,
-            context_label=superdir.name, on_done=on_finalized)
+            panel_container, columns, mass_data, on_finish,
+            context_label=superdir.name, on_done=on_finalized,
+            volume_data=volume_data, paired_data=paired_data)
         gating_panel.pack(fill=tk.BOTH, expand=True)
 
-    ttk.Button(top, text='Discover Buoyant Mass data',
+    ttk.Button(top, text='Discover Buoyant Mass + Volume data',
               command=_discover).grid(row=1, column=1, sticky='w', pady=(8, 0))
 
     # Auto-discover once a *new* valid directory is in place — whether typed
@@ -1480,7 +1663,7 @@ def _build_ifxm_embedded_page(parent: tk.Widget, *, initial_superdir=None,
               command=_discover).grid(row=1, column=1, sticky='w', pady=(8, 0))
 
     # Auto-discover once a *new* valid directory is in place — see the
-    # matching comment in _build_bm_embedded_page.
+    # matching comment in _build_combined_embedded_page.
     _last_auto_dir = {'value': None}
 
     def _auto_discover(*_a):

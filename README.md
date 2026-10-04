@@ -106,30 +106,29 @@ Housekeeping: prune_timestamped_subdirs.py
 One-stop-shop wizard that walks the buoyant-mass → baseline-density →
 gating → compile portion of the workflow above as a sequence of "step"
 pages with Previous/Next navigation, embedding the existing GUIs for
-`calculate_baseline_density.py`, `gate_experiments_inplace.py` (once each
-for BM and iFXM), and `compile_experiment.py` rather than reimplementing
+`calculate_baseline_density.py`, `gate_experiments_inplace.py` (combined
+mass + volume mode), and `compile_experiment.py` rather than reimplementing
 them. Each of those scripts still works standalone from the CLI exactly as
 documented below — the wizard just calls a `build_embedded_page(...)`
 function each one exposes for this purpose.
 
-Pages, sharing one experiment-directory field across pages 2-4 (typing in
-any one updates the others live; page 5 seeds from it once):
+Pages, sharing one experiment-directory field across pages 2-3 (typing in
+either updates the other live; page 4 seeds from it once):
 1. Buoyant mass — placeholder: run the MATLAB SMR analysis separately first.
 2. Baseline density — placeholder text + `calculate_baseline_density.py`'s
    GUI. A valid directory must be set here before Next becomes available.
-3. Gate: Buoyant Mass — `gate_experiments_inplace.py` in BM mode (mass,
-   normalized baseline, baseline slope, average node deviation — see below).
-   Auto-discovers as soon as the directory is set — no Discover click
-   needed. Skipped if the directory has volume data but no mass data.
-4. Gate: iFXM Volume — the same script in iFXM mode, auto-discovering the
-   same way. Skipped if the directory has mass data but no volume data.
-5. Compile experiment — `compile_experiment.py`'s GUI, directory pre-filled
-   from pages 2-4 but (unlike pages 3/4) still requiring an explicit
+3. Gating: Buoyant Mass + Volume — `gate_experiments_inplace.py` in combined
+   mode: mass, normalized baseline, baseline slope, average node deviation
+   and iFXM volume, all gated per-sample together (see below). Whichever of
+   mass/volume data is present gets gated. Auto-discovers as soon as the
+   directory is set — no Discover click needed.
+4. Compile experiment — `compile_experiment.py`'s GUI, directory pre-filled
+   from pages 2-3 but (unlike page 3) still requiring an explicit
    "Discover Samples" click. Clicking its Done button closes the wizard.
 
-Pages 3 and 4 each require clicking their embedded panel's **Finalize
-gating** button before Next becomes available (re-running discovery on
-either page revokes this until Finalize is clicked again).
+Page 3 requires clicking its embedded panel's **Finalize gating** button
+before Next becomes available (re-running discovery there revokes this
+until Finalize is clicked again).
 
 ```bash
 python analysis_wizard.py
@@ -575,41 +574,51 @@ column per sample is shown in the GUI.
 
 **Workflow**
 
-1. A data-type dialog asks whether you are gating **Buoyant Mass** or **iFXM Volume** data.
-2. The script discovers the relevant data file for each sample subdir. iFXM
-   gates a single histogram (`volume_fl`); BM gates **four** independent
-   histograms side by side — buoyant mass, normalized baseline (`avg_baseline`
-   divided by its mean over the first 10% of the run), baseline slope
-   (`bl_slope`), and average node deviation (`node_dev_mean`), porting the
-   four-attribute gate from this repo's MATLAB `gate_mass_results.m`.
+1. A data-type dialog asks whether you are gating **Buoyant Mass + iFXM
+   Volume** together, or **iFXM Volume only**.
+2. The script discovers the relevant data file for each sample subdir.
+   iFXM-only gates a single histogram (`volume_fl`); combined gates **five**
+   independent histograms in a 2x3 grid — buoyant mass, normalized baseline
+   (`avg_baseline` divided by its mean over the first 10% of the run),
+   baseline slope (`bl_slope`), and average node deviation
+   (`node_dev_mean`), porting the four-attribute gate from this repo's MATLAB
+   `gate_mass_results.m`, plus iFXM volume (log x axis). A sample with only
+   mass or only volume data just doesn't appear in the other kind's
+   histogram(s); the volume histogram is omitted if no sample has volume data.
 3. A single window shows the sample list on the left and the histogram(s) on
    the right. Selecting (or deselecting) samples in the list immediately
    previews their overlaid histogram(s), with shared bin edges — no separate
    step needed to "activate" a selection.
 4. Click on a histogram to set a lower cutoff (red dashed line), then again
    for an upper cutoff (blue dashed line); changing the left-list selection
-   while doing this restarts the cutoff for the new selection. For BM, each
-   of the four histograms is independently clickable at all times (no
+   while doing this restarts the cutoff for the new selection. In combined
+   mode, each histogram is independently clickable at all times (no
    per-plot "arm" button) and gating each one is optional — the eventual
-   per-sample gate is the logical AND of whichever attribute(s) were
-   actually gated. Each gated histogram shows a live "Retained: X%" readout
-   (its own data only); BM also shows the pooled % retained by the AND of
-   every attribute currently gated. **Apply cutoffs** commits the group
-   (confirming first if BM has zero attributes gated) and returns the
-   panel to an idle preview.
+   per-sample mass gate is the logical AND of whichever mass attribute(s)
+   were actually gated. Each gated histogram shows a live "Retained: X%"
+   readout (its own data only); combined mode also shows the pooled % of
+   mass cells retained by the AND of every mass attribute currently gated,
+   and, for samples with matched mass+volume cells, the % of paired cells
+   inside both the mass and volume gates. **Apply cutoffs** commits the
+   group (confirming first if nothing is gated) and returns the panel to
+   an idle preview.
 5. Repeat step 3–4 until all samples are assigned; **Finalize gating**
    (highlighted green) then becomes available.
 6. **← Back** undoes the last group of cutoffs, restoring those samples to the
    remaining list (can be pressed repeatedly).
 
-On the iFXM page, if a sample already has a BM gate on disk (written by a
-previous run of step 3/4, or a wizard visit to it) and matched mass+volume
+On the iFXM-only page, if a sample already has a BM gate on disk (written by a
+previous combined run) and matched mass+volume
 cells, an extra readout shows the % of paired mass+volume cells retained by
 the BM gate's mass_pg bound together with the volume gate being set now.
 
 **Output**
 
-A YAML gate file written into each sample subfolder, and a summary folder in the superdir:
+A YAML gate file written into each sample subfolder, and a summary folder in the
+superdir. Combined mode writes both kinds: a BM gate for samples with mass data
+and an iFXM volume gate for samples with volume data. A gate YAML without
+`lower`/`upper` means that sample was deliberately left ungated (it still
+supersedes any older gate on disk).
 
 ```
 <sample_subdir>/<sample_subdir_name>_<mode>_gate.yaml      (mode = bm | ifxm-vol)
