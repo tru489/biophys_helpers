@@ -169,7 +169,9 @@ _ATTR_LABELS = {a['key']: a['label'] for a in _BM_ATTRS}
 # population, so its gate is never AND-ed with the mass-table gates — it's
 # written out as its own iFXM volume gate YAML on Finalize.
 _VOLUME_ATTR = {'key': 'volume_fl', 'label': 'iFXM volume',
-                'xlabel': 'Volume (fL)', 'source': 'volume', 'scale': 'log'}
+                'xlabel': 'Volume (fL)', 'source': 'volume', 'scale': 'log',
+                # On a log axis x_pad is a fraction of the range in decades.
+                'x_pad': 0.25}
 
 
 def _baseline_norm(df: pd.DataFrame) -> np.ndarray:
@@ -1143,8 +1145,15 @@ class MultiAttributeGatingPanel(tk.Frame):
 
         pooled = np.concatenate([v for _, v in arrays])
         pmin, pmax = float(pooled.min()), float(pooled.max())
-        pad = spec.get('x_pad', 0.0) * (pmax - pmin)
-        st['full_xlim'] = (pmin - pad, pmax + pad)
+        x_pad = spec.get('x_pad', 0.0)
+        if log:
+            # Pad by a fraction of the range in decades, so the margin looks
+            # the same on both sides of a log axis and never crosses zero.
+            factor = (pmax / pmin) ** x_pad
+            st['full_xlim'] = (pmin / factor, pmax * factor)
+        else:
+            pad = x_pad * (pmax - pmin)
+            st['full_xlim'] = (pmin - pad, pmax + pad)
         if not st['xmin_var'].get() and not st['xmax_var'].get():
             st['xmin_var'].set(f"{st['full_xlim'][0]:.4g}")
             st['xmax_var'].set(f"{st['full_xlim'][1]:.4g}")
