@@ -477,6 +477,12 @@ resonant frequency (Hz). This value is the absolute-density offset to add to the
 **relative** `buoyant_density` written by `compile_experiment.py`. Without a
 calibration JSON the mean baseline is still reported but `baseline_density` is `NaN`.
 
+In the GUI (standalone or the analysis wizard's step 2), the reference frequency
+autofills from the `reference_frequency` field of the newest
+`<YYYYMMDD_HHMM>_reference_values.json` (written by the acquisition LabVIEW)
+directly inside the chosen superdir. A value you type yourself is never
+overwritten.
+
 **Output** (written inside `<superdir>`, at the same level as the sample subdirs)
 
 ```

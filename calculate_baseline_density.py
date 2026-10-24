@@ -34,7 +34,10 @@ Usage:
 If <superdir>, --rfreq and --calib-json are all given on the command line, the
 computation runs headlessly (as before) and prints its report to stdout.
 Otherwise a small GUI form opens to collect whichever of the three inputs is
-still missing.
+still missing. In the GUI, the reference frequency autofills from the
+'reference_frequency' field of the newest <YYYYMMDD_HHMM>_reference_values.json
+(written by the acquisition LabVIEW) directly inside the chosen superdir,
+whenever the superdir changes — unless the user has typed a value of their own.
 """
 import argparse
 import json
@@ -96,6 +99,31 @@ def load_calibration(path: Path) -> dict:
 def apply_calculation(mean_baseline: float, cal: dict, rfreq: float) -> float:
     """Converts a sample's mean avg_baseline to fluid baseline density."""
     return (rfreq - mean_baseline - cal['intercept']) / cal['slope']
+
+
+_REFERENCE_VALUES_PATTERN = re.compile(r'^\d{8}_\d{4}_reference_values\.json$')
+
+
+def find_reference_frequency(superdir: Path) -> tuple[float, Path] | None:
+    """
+    (reference_frequency, source_path) from the newest
+    <YYYYMMDD_HHMM>_reference_values.json directly inside superdir (written by
+    the acquisition LabVIEW), or None if there's no such file or it has no
+    usable reference_frequency.
+    """
+    if not superdir.is_dir():
+        return None
+    files = sorted(f for f in superdir.iterdir()
+                   if f.is_file() and _REFERENCE_VALUES_PATTERN.match(f.name))
+    if not files:
+        return None
+    path = files[-1]   # names are timestamp-prefixed, so last = newest
+    try:
+        with open(path) as f:
+            return float(json.load(f)['reference_frequency']), path
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"  [warn] could not read reference_frequency from {path.name}: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +288,18 @@ class BaselineDensityGUI(ttk.Frame):
         ttk.Button(form, text='Browse…', command=self._pick_calib_json).grid(row=1, column=2, pady=(6, 0))
 
         ttk.Label(form, text='Reference frequency (Hz):').grid(row=2, column=0, sticky='w', pady=(6, 0))
-        ttk.Entry(form, textvariable=self._rfreq, width=16).grid(row=2, column=1, sticky='w', padx=(6, 6), pady=(6, 0))
+        rfreq_row = ttk.Frame(form)
+        rfreq_row.grid(row=2, column=1, columnspan=2, sticky='w', padx=(6, 6), pady=(6, 0))
+        ttk.Entry(rfreq_row, textvariable=self._rfreq, width=16).pack(side=tk.LEFT)
+        self._rfreq_note = ttk.Label(rfreq_row, text='', foreground='gray30')
+        self._rfreq_note.pack(side=tk.LEFT, padx=(8, 0))
+        # Autofill from the superdir's reference-values JSON whenever the
+        # directory changes; never clobbers a value the user typed themselves.
+        self._autofilled_rfreq: str | None = None
+        self._superdir.trace_add('write', lambda *_a: self._autofill_rfreq())
+        self._rfreq.trace_add('write', lambda *_a: self._rfreq_edited())
+        if rfreq is None:
+            self._autofill_rfreq()
 
         self._run_button = ttk.Button(form, text='Run', command=self._run)
         self._run_button.grid(row=3, column=1, sticky='w', pady=(10, 0))
@@ -327,6 +366,32 @@ class BaselineDensityGUI(ttk.Frame):
                                          initialdir=self._superdir.get() or None)
         if chosen:
             self._superdir.set(chosen)
+
+    def _autofill_rfreq(self):
+        """Set the reference frequency from the superdir's newest reference-values
+        JSON, unless the field holds a value the user entered by hand."""
+        current = self._rfreq.get().strip()
+        if current and current != self._autofilled_rfreq:
+            return
+        text = self._superdir.get().strip()
+        found = find_reference_frequency(Path(text)) if text else None
+        if found is None:
+            if self._autofilled_rfreq is not None:   # directory changed away: undo our fill
+                self._rfreq.set('')
+                self._autofilled_rfreq = None
+            self._rfreq_note.configure(text='')
+            return
+        value, path = found
+        self._autofilled_rfreq = f'{value:.10g}'
+        self._rfreq.set(self._autofilled_rfreq)
+        self._rfreq_note.configure(text=f'(from {path.name})')
+
+    def _rfreq_edited(self):
+        # Once the user types over the autofilled value, it's theirs: drop the
+        # "(from …)" note and stop treating the field as ours to replace.
+        if self._autofilled_rfreq is not None and self._rfreq.get().strip() != self._autofilled_rfreq:
+            self._autofilled_rfreq = None
+            self._rfreq_note.configure(text='')
 
     def _pick_calib_json(self):
         chosen = filedialog.askopenfilename(
