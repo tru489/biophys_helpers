@@ -9,8 +9,9 @@ sample group.
 Workflow:
     1. The script discovers all sample subdirs in the given superdir that contain
        a *_mass_results folder with a mass_pg column CSV.
-    2. If a *_bm_gating folder is also present, the gate thresholds (lower/upper)
-       are pre-loaded and saved to the output automatically.
+    2. If a gate file from gate_experiments_inplace.py is also present
+       (<timestamp>_gating/), its mass_pg thresholds (lower/upper) are
+       pre-loaded and saved to the output automatically.
     3. If --coulter is given, column names from that CSV are available as a
        "Coulter Col" dropdown per row. Setting a Coulter column on any run in a
        group auto-fills the same column for all other runs in that group.
@@ -42,7 +43,8 @@ import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
-import yaml
+
+from gating.gates import find_gate_file, load_gate_file
 
 
 # ---------------------------------------------------------------------------
@@ -154,19 +156,14 @@ def _discover_runs(superdir: Path) -> dict:
 
         df = pd.read_csv(csv_path)
 
+        # Only the mass_pg bounds are carried over (recorded in metadata.csv).
         bm_gate = None
-        bm_gate_dirs = sorted(
-            d for d in sample_dir.iterdir()
-            if d.is_dir() and re.search(r'_bm_gating$', d.name)
-        )
-        if bm_gate_dirs:
-            yaml_files = list(bm_gate_dirs[-1].glob('*.yaml'))
-            if yaml_files:
-                try:
-                    gate = yaml.safe_load(yaml_files[0].read_text(encoding='utf-8'))
-                    bm_gate = (gate['lower'], gate['upper'])
-                except Exception as exc:
-                    print(f"  [warn] {sample_dir.name}: could not read bm_gate YAML: {exc}")
+        gate_path = find_gate_file(sample_dir)
+        if gate_path is not None:
+            try:
+                bm_gate = load_gate_file(gate_path).get('mass_pg')
+            except Exception as exc:
+                print(f"  [warn] {sample_dir.name}: could not read gate file: {exc}")
 
         result[sample_dir.name] = {
             'csv_path': csv_path,

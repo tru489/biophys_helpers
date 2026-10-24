@@ -261,7 +261,7 @@ def main():
 
     def build_gating(parent):
         return gate_experiments_inplace.build_embedded_page(
-            parent, 'combined', superdir_var=experiment_superdir,
+            parent, superdir_var=experiment_superdir,
             on_finalized=lambda: wiz.mark_complete(2),
             on_discover=lambda: wiz.mark_incomplete(2))
 

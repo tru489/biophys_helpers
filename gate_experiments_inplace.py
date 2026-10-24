@@ -1,64 +1,54 @@
 """
-gate_experiment_subfolder.py
+gate_experiments_inplace.py
 
-Interactive GUI for gating buoyant mass (BM) or iFXM volume data across all
-sample subfolders in an experiment superdir. One column per sample is shown in
-the GUI. After gating, a YAML file recording the gate bounds is written into
-each sample subfolder, and a timestamped summary folder is written into the
-superdir.
+Interactive GUI for gating buoyant mass (BM) and iFXM volume data across all
+sample subfolders in an experiment superdir. After gating, one YAML file
+recording every gate is written into each sample subfolder, and a timestamped
+summary folder is written into the superdir.
 
 Workflow:
-    1. A data-type selection dialog asks whether you are gating Buoyant Mass
-       + iFXM Volume together (combined) or iFXM Volume only.
-    2. The script discovers the relevant data file for each sample subdir.
-       iFXM-only gates a single histogram (volume_fl). Combined gates FIVE
-       independent histograms at once — mass_pg, normalized baseline
-       (avg_baseline divided by its mean over the first 10% of the run),
-       bl_slope, and node_dev_mean, porting the four-attribute gate from
-       this repo's MATLAB gate_mass_results.m, plus volume_fl (see
-       MultiAttributeGatingPanel). A sample with only mass or only volume
-       data simply doesn't appear in the other kind's histogram(s); the
-       volume histogram is omitted entirely if no sample has volume data.
-    3. A single window shows the sample list on the left and the
-       histogram(s) on the right. Selecting/deselecting samples in the list
-       immediately previews their overlaid histogram(s) (shared bin edges).
-    4. The user clicks on a histogram to set lower and upper cutoffs (either order);
-       changing the left-list selection while doing this restarts the cutoff
-       for the new selection. For BM, every one of the four histograms is
-       independently clickable at all times (no per-plot "arm" button) and
-       gating each is optional — the eventual per-sample mass gate is the
-       logical AND of whichever mass attribute(s) were actually gated, and
-       each gated histogram shows a live "% retained" readout (combined also
-       shows the pooled mass AND retained %). "Apply cutoffs" commits the group (BM:
-       confirming first if zero attributes are gated) and returns the
-       panel to an idle preview.
-    5. Step 3-4 repeats until all samples are assigned. "Finalize gating"
+    1. The script discovers each sample subdir's mass table and volume data.
+       Up to FIVE independent histograms are gated at once — mass_pg,
+       normalized baseline (avg_baseline divided by its mean over the first
+       10% of the run), bl_slope, and node_dev_mean, porting the
+       four-attribute gate from this repo's MATLAB gate_mass_results.m, plus
+       volume_fl (see MultiAttributeGatingPanel). A sample with only mass or
+       only volume data simply doesn't appear in the other kind's
+       histogram(s); the volume histogram is omitted entirely if no sample has
+       volume data.
+    2. A single window shows the sample list on the left and the histograms
+       on the right. Selecting/deselecting samples in the list immediately
+       previews their overlaid histograms (shared bin edges).
+    3. The user clicks on a histogram to set lower and upper cutoffs (either
+       order); changing the left-list selection while doing this restarts the
+       cutoffs for the new selection. Every histogram is independently
+       clickable at all times (no per-plot "arm" button) and gating each is
+       optional — the eventual per-sample gate is the logical AND of whichever
+       attribute(s) were actually gated. Each gated histogram shows a live
+       "% retained" readout, and the bottom bar shows the pooled mass AND
+       retained %. "Apply cutoffs" commits the group (confirming first if zero
+       attributes are gated) and returns the panel to an idle preview.
+    4. Step 2-3 repeats until all samples are assigned. "Finalize gating"
        (highlighted) then becomes available.
-    6. On "Finalize gating":
-         - A YAML gate file is written into each sample subfolder:
-             <sample_subdir_name>_<mode>_gate.yaml
-           Combined mode writes both a BM gate (samples with mass data) and
-           an iFXM volume gate (samples with volume data), exactly as the
-           separate modes used to. The BM YAML includes a `gates:` mapping of
-           every mass attribute actually gated; top-level lower/upper mirror
-           the mass_pg gate specifically, for backward compatibility with
-           compile_experiment.py's gate reader. A gate YAML with no
-           lower/upper means that sample was deliberately left ungated.
-         - A summary folder per data type is written into the superdir:
-             <YYMMDD.HHMMSS>_<mode>_gating_summary/
+    5. On "Finalize gating":
+         - One gate file is written into each sample subfolder (format in
+           gating/gates.py):
+             <sample_subdir>/<YYYYMMDD_HHMMSS>_gating/<sample_subdir_name>_gate.yaml
+           holding a `gates:` mapping of every attribute actually gated for
+           that sample (only attributes the sample has data for). An empty
+           `gates: {}` means the sample was deliberately left ungated.
+           compile_experiment.py applies the AND of all of them.
+         - A summary folder is written into the superdir:
+             <YYMMDD.HHMMSS>_gating_summary/
                cutoff_log.txt
                cutoff_stats.csv
-               histograms/group_NN.png    (2x2 per attribute, for BM)
-    7. A "← Back" button undoes the last group of cutoffs, restoring those
+               histograms/group_NN.png    (one panel per attribute)
+    6. A "← Back" button undoes the last group of cutoffs, restoring those
        samples to the remaining list. Can be pressed repeatedly.
 
-On the combined page, for samples with matched mass+volume cells
-(analysis/density/cells in the CELLGROUPED hdf5), a readout shows the % of
-paired cells inside both the live mass_pg gate and the live volume gate.
-On the iFXM-only page, if a sample already has a BM gate on disk (see
-_read_bm_gate_bounds) and matched mass+volume cells (analysis/density/cells
-in its CELLGROUPED hdf5), an extra readout shows the % of paired cells
-retained by that BM mass_pg bound together with the volume gate being set.
+For samples with matched mass+volume cells (analysis/density/cells in the
+CELLGROUPED hdf5), a readout shows the % of paired cells inside both the live
+mass_pg gate and the live volume gate.
 
 Expected directory structure:
 
@@ -76,7 +66,7 @@ Expected directory structure:
         Target column: volume_fl (hdf5) or volume (legacy csv)
 
 Usage:
-    python gate_experiment_subfolder.py <superdir>
+    python gate_experiments_inplace.py <superdir>
 """
 import argparse
 import re
@@ -89,7 +79,6 @@ import numpy as np
 import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-import yaml
 
 import matplotlib
 matplotlib.use('TkAgg')
@@ -97,54 +86,20 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from gating.common import (GatingPanel, ask_data_type_dialog, positive_range,
-                           save_group_histograms, style_finalize_button,
-                           write_stats_csv, write_log)
+from gating.common import style_finalize_button
+from gating.gates import (MASS_GATE_COLUMNS, mass_attr_values, mass_gate_mask,
+                          write_gate_file)
 
 from fsutil import is_appledouble
 
 
 # ---------------------------------------------------------------------------
-# Mode configuration
+# Gate attributes: the four mass-table attributes (mass, normalized baseline,
+# baseline slope, average node deviation) — ported from the four-histogram
+# gate in MATLAB's gate_mass_results.m (smr_data_analysis) — plus iFXM volume.
 # ---------------------------------------------------------------------------
 
-_MODE = {
-    'bm': {
-        'label':       'Buoyant Mass',
-        'unit':        'pg',
-        'xlabel':      'Buoyant Mass (pg)',
-        'scale':       'linear',
-        'bins':        lambda vals: np.linspace(vals.min(), vals.max(), 201),
-        'xlim':        None,
-        'data_type':    'bm',
-        'dir_suffix':   '_bm_gating_summary',
-        'yaml_suffix':  '_bm_gate.yaml',
-        'yaml_dir_tag': 'bm_gating',
-    },
-    'ifxm': {
-        'label':        'iFXM Volume',
-        'unit':         'fL',
-        'xlabel':       'Volume (fL)',
-        'scale':        'log',
-        # Log-spaced edges so bars are equal width on the log x axis.
-        'bins':         lambda vals: np.geomspace(*positive_range(vals), 201),
-        'xlim':         None,
-        'data_type':    'ifxm_volume',
-        'dir_suffix':   '_ifxm_volume_gating_summary',
-        'yaml_suffix':  '_ifxm_volume_gate.yaml',
-        'yaml_dir_tag': 'ifxm-vol_gating',
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# BM multi-attribute gating (mass, normalized baseline, baseline slope,
-# average node deviation) — ports the four-histogram gate from MATLAB's
-# gate_mass_results.m (smr_data_analysis) into this script's BM gating page.
-# ---------------------------------------------------------------------------
-
-_BM_REQUIRED_COLUMNS = ('mass_pg', 'avg_baseline', 'bl_slope', 'node_dev_mean',
-                        'peak_time_m')
+_BM_REQUIRED_COLUMNS = MASS_GATE_COLUMNS
 
 _BM_ATTRS = [
     {'key': 'mass_pg', 'label': 'Buoyant mass',
@@ -163,46 +118,33 @@ _ATTR_SPEC = {a['key']: a for a in _BM_ATTRS}
 _ATTR_KEYS = [a['key'] for a in _BM_ATTRS]
 _ATTR_LABELS = {a['key']: a['label'] for a in _BM_ATTRS}
 
-# The optional 5th histogram on the combined gating page: iFXM volume. Unlike
-# the four BM attributes (all columns of one per-cell mass table), volume
-# comes from separate per-sample data (_discover_ifxm) with its own cell
-# population, so its gate is never AND-ed with the mass-table gates — it's
-# written out as its own iFXM volume gate YAML on Finalize.
+# The optional 5th histogram: iFXM volume. Unlike the four BM attributes (all
+# columns of one per-cell mass table), volume comes from separate per-sample
+# data (_discover_ifxm) with its own cell population, so the live "mass
+# retained" readout never ANDs it in. It's written to the same per-sample gate
+# file, though, and compile_experiment.py ANDs it with the mass-table gates on
+# matched cells (via analysis/density/cells' matched_peak_index).
 _VOLUME_ATTR = {'key': 'volume_fl', 'label': 'iFXM volume',
                 'xlabel': 'Volume (fL)', 'source': 'volume', 'scale': 'log',
                 # On a log axis x_pad is a fraction of the range in decades.
                 'x_pad': 0.25}
-
-
-def _baseline_norm(df: pd.DataFrame) -> np.ndarray:
-    """
-    avg_baseline normalized to the mean baseline over the first 10% of the
-    run (by peak_time_m) — mirrors gate_mass_results.m's values_for_spec for
-    the 'baseline_norm' derived quantity. Falls back to the raw avg_baseline
-    if there's no usable reference window.
-    """
-    bl = df['avg_baseline'].to_numpy(dtype=float)
-    tm = df['peak_time_m'].to_numpy(dtype=float)
-    good = np.isfinite(bl) & np.isfinite(tm)
-    if not good.any():
-        return bl
-    tmin = tm[good].min()
-    tmax = tm[good].max()
-    thr = tmin + 0.10 * (tmax - tmin)
-    ref_mask = good & (tm <= thr)
-    if not ref_mask.any():
-        ref_mask = good
-    ref = bl[ref_mask].mean()
-    if not np.isfinite(ref) or ref == 0:
-        return bl
-    return bl / ref
+_ALL_ATTRS = _BM_ATTRS + [_VOLUME_ATTR]
+_ATTR_LABELS[_VOLUME_ATTR['key']] = _VOLUME_ATTR['label']
 
 
 def _attr_values(df: pd.DataFrame, attr: dict) -> np.ndarray:
     """The vector of values one BM attribute spec operates on for a sample table."""
-    if attr.get('derived'):
-        return _baseline_norm(df)
-    return df[attr['key']].to_numpy(dtype=float)
+    return mass_attr_values(df, attr['key'])
+
+
+def _sample_values(name: str, spec: dict, mass_data: dict,
+                   volume_data: dict) -> np.ndarray | None:
+    """One sample's values for one attribute (mass table or volume), or None
+    if that sample has no data of this attribute's kind."""
+    if spec.get('source') == 'volume':
+        return volume_data.get(name)
+    df = mass_data.get(name)
+    return None if df is None else _attr_values(df, spec)
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +153,8 @@ def _attr_values(df: pd.DataFrame, attr: dict) -> np.ndarray:
 
 def parse_cli_args() -> Path:
     parser = argparse.ArgumentParser(
-        description="Interactively gate BM or iFXM data across sample "
-                    "subfolders of an experiment superdir."
+        description="Interactively gate BM and iFXM volume data across "
+                    "sample subfolders of an experiment superdir."
     )
     parser.add_argument('superdir', type=str,
                         help='Path to the experiment superdir')
@@ -377,16 +319,10 @@ def _discover_ifxm(superdir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Paired mass+volume retained-% indicator (iFXM gating page)
-#
-# When a sample has both a BM gate already recorded (by the BM gating page,
-# read back off the *_bm_gating/*_bm_gate.yaml written to disk — not
-# in-memory state, so this works regardless of which session wrote it) and
-# matched mass+volume cells (the CELLGROUPED hdf5's analysis/density/cells
-# table, the same source compile_experiment.py pairs from), this powers an
-# extra "% of paired data retained" readout on the iFXM gating page: the
-# fraction of matched cells whose mass_pg falls in the BM gate AND whose
-# volume_fl falls in the volume gate being set right now.
+# Paired mass+volume cells, for the panel's "% of paired data retained"
+# readout: the fraction of matched cells (the CELLGROUPED hdf5's
+# analysis/density/cells table, the same source compile_experiment.py pairs
+# from) inside both the live mass_pg gate and the live volume gate.
 # ---------------------------------------------------------------------------
 
 def _find_cellgrouped_hdf5(sample_dir: Path) -> Path | None:
@@ -451,178 +387,60 @@ def _discover_combined(superdir: Path) -> tuple[dict, dict, dict]:
     return mass_data, volume_data, paired_data
 
 
-def _read_bm_gate_bounds(sample_dir: Path) -> tuple | None:
-    """
-    The mass_pg (lower, upper) bounds from the newest
-    <sample_dir>/*_bm_gating/*_bm_gate.yaml, or None if there isn't one (or
-    it has no mass_pg gate — e.g. only the other 3 BM attributes were gated).
-    """
-    gate_dirs = sorted(
-        d for d in sample_dir.iterdir()
-        if d.is_dir() and not is_appledouble(d) and d.name.endswith('_bm_gating')
-    )
-    if not gate_dirs:
-        return None
-    yaml_files = sorted(f for f in gate_dirs[-1].glob('*.yaml') if not is_appledouble(f))
-    if not yaml_files:
-        return None
-    try:
-        payload = yaml.safe_load(yaml_files[0].read_text(encoding='utf-8'))
-        return float(payload['lower']), float(payload['upper'])
-    except Exception:
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-def _write_yaml_files(superdir: Path, sample_dirs: dict,
-                      cutoffs: dict, mode_cfg: dict, timestamp: str):
-    """
-    Creates a gating subdir inside each sample subfolder and writes a YAML
-    gate file recording the bounds applied to that sample.
+def _relevant_gates(name: str, ranges: dict, mass_data: dict,
+                    volume_data: dict) -> dict:
+    """The subset of a group's gates that apply to one sample: mass-table
+    attributes only if it has mass data, volume only if it has volume data."""
+    out = {}
+    for key, r in ranges.items():
+        has = (name in volume_data) if key == _VOLUME_ATTR['key'] else (name in mass_data)
+        if has:
+            out[key] = r
+    return out
 
-    Subdir:    <sample_subdir>/<YYYYMMDD_HHMMSS>_<mode_tag>/
-    File:      <sample_subdir_name>_<mode>_gate.yaml
-    Content:
-        experiment: <superdir_name>
-        data_type:  bm | ifxm_volume
-        lower:      <float>
-        upper:      <float>
-    """
-    subdir_name = f"{timestamp}_{mode_cfg['yaml_dir_tag']}"
 
-    for sample, bounds in cutoffs.items():
-        sample_dir = sample_dirs[sample]
-        gate_dir = sample_dir / subdir_name
-        gate_dir.mkdir(exist_ok=True)
-        fname = f"{sample_dir.name}_{mode_cfg['yaml_suffix'].lstrip('_')}"
-        out_path = gate_dir / fname
-        payload = {
-            'experiment': superdir.name,
-            'data_type':  mode_cfg['data_type'],
-        }
-        # bounds is None for a sample deliberately left ungated (combined
-        # page): the file is still written so it supersedes any older gate.
-        if bounds is not None:
-            lo, hi = bounds
-            payload['lower'] = float(lo)
-            payload['upper'] = float(hi)
-        with open(out_path, 'w') as fh:
-            yaml.dump(payload, fh, default_flow_style=False, sort_keys=False)
+def _write_gate_files(superdir: Path, sample_dirs: dict, cutoffs: dict,
+                      timestamp: str):
+    """One <sample>/<timestamp>_gating/<sample>_gate.yaml per sample (format in
+    gating/gates.py). Written even for a sample with no gates, so it
+    supersedes any older gate file on disk."""
+    for sample, gates in cutoffs.items():
+        out_path = write_gate_file(sample_dirs[sample], superdir.name, gates,
+                                   timestamp)
         print(f"Written: {out_path}")
-
     print(f"[yaml] {len(cutoffs)} gate file(s) written.")
 
 
-def _write_output(superdir: Path, sample_dirs: dict, columns: list,
-                  data: dict, cutoffs: dict,
-                  groups: list, mode_cfg: dict) -> Path:
-    timestamp = datetime.now().strftime('%y%m%d.%H%M%S')
-    suffix = mode_cfg['dir_suffix']
-    summary_dir = superdir / f'{timestamp}{suffix}'
-    summary_dir.mkdir()
-
-    hist_dir = summary_dir / 'histograms'
-    hist_dir.mkdir()
-
-    ts_yaml = datetime.now().strftime('%Y%m%d_%H%M%S')
-    _write_yaml_files(superdir, sample_dirs, cutoffs, mode_cfg, ts_yaml)
-    save_group_histograms(hist_dir, data, groups, mode_cfg)
-
-    ts = timestamp  # YYMMDD.HHMMSS
-    run_str = f"20{ts[:2]}-{ts[2:4]}-{ts[4:6]} {ts[7:9]}:{ts[9:11]}:{ts[11:13]}"
-    header_lines = [
-        f"gate_experiment_subfolder — {mode_cfg['label']} Cutoff Log",
-        "=" * 60,
-        f"Experiment:  {superdir.name}",
-        f"Superdir:    {superdir}",
-        f"Run:         {run_str}",
-    ]
-    log_path = summary_dir / 'cutoff_log.txt'
-    write_log(log_path, header_lines, data, groups, mode_cfg)
-
-    stats_path = summary_dir / 'cutoff_stats.csv'
-    write_stats_csv(stats_path, data, cutoffs, groups, mode_cfg)
-
-    return summary_dir
-
-
-# ---------------------------------------------------------------------------
-# Output — BM multi-attribute (mass / normalized baseline / baseline slope /
-# average node deviation)
-# ---------------------------------------------------------------------------
-
-def _bm_multi_mask(df: pd.DataFrame, ranges: dict) -> np.ndarray:
-    """Boolean AND of every attribute range set in `ranges` ({key: (lo, hi)})."""
-    mask = np.ones(len(df), dtype=bool)
-    for key, (lo, hi) in ranges.items():
-        v = _attr_values(df, _ATTR_SPEC[key])
-        mask &= (v >= lo) & (v <= hi)
-    return mask
-
-
-def _write_bm_multi_yaml_files(superdir: Path, sample_dirs: dict,
-                               cutoffs: dict, timestamp: str):
-    """
-    Like _write_yaml_files, but for the multi-attribute BM page: `cutoffs`
-    maps sample -> {attr_key: (lower, upper)} (0-4 entries; an attribute not
-    gated for a sample is simply absent). Written under the same
-    <sample_subdir>/<timestamp>_bm_gating/<sample>_bm_gate.yaml path
-    compile_experiment.py already looks for, so it keeps working unchanged.
-
-    Content:
-        experiment: <superdir_name>
-        data_type:  bm
-        lower/upper:  the mass_pg gate specifically, kept at the top level
-                      for backward compatibility with compile_experiment.py's
-                      _load_gate (which reads exactly these two keys) — only
-                      present if mass_pg was one of the gated attributes.
-        gates:        {attr_key: {lower, upper}, ...} for every attribute
-                      actually gated for that sample (mass_pg included).
-    """
-    mode_cfg = _MODE['bm']
-    subdir_name = f"{timestamp}_{mode_cfg['yaml_dir_tag']}"
-
-    for sample, ranges in cutoffs.items():
-        sample_dir = sample_dirs[sample]
-        gate_dir = sample_dir / subdir_name
-        gate_dir.mkdir(exist_ok=True)
-        fname = f"{sample_dir.name}_{mode_cfg['yaml_suffix'].lstrip('_')}"
-        out_path = gate_dir / fname
-        payload = {
-            'experiment': superdir.name,
-            'data_type':  mode_cfg['data_type'],
-        }
-        if 'mass_pg' in ranges:
-            lo, hi = ranges['mass_pg']
-            payload['lower'] = float(lo)
-            payload['upper'] = float(hi)
-        if ranges:
-            payload['gates'] = {
-                key: {'lower': float(lo), 'upper': float(hi)}
-                for key, (lo, hi) in ranges.items()
-            }
-        with open(out_path, 'w') as fh:
-            yaml.dump(payload, fh, default_flow_style=False, sort_keys=False)
-        print(f"Written: {out_path}")
-
-    print(f"[yaml] {len(cutoffs)} gate file(s) written.")
-
-
-def _save_bm_multi_group_histograms(hist_dir: Path, data: dict, groups: list):
-    """One 2x2 PNG per cutoff group — all four attributes, mirroring the
-    gate_mass_results.m layout — with cutoff lines drawn for whichever
-    attributes were actually gated in that group."""
+def _save_group_histograms(hist_dir: Path, mass_data: dict, volume_data: dict,
+                           groups: list):
+    """One PNG per cutoff group — every attribute with data in that group
+    (2x2 for the four mass-table attributes, 2x3 with volume) — with cutoff
+    lines drawn for whichever attributes were actually gated."""
     for i, (ranges, names) in enumerate(groups, 1):
-        fig, axs = plt.subplots(2, 2, figsize=(12, 8))
-        for ax, spec in zip(axs.flat, _BM_ATTRS):
+        specs = [s for s in _ALL_ATTRS
+                 if any(_sample_values(n, s, mass_data, volume_data) is not None
+                        for n in names)]
+        if not specs:
+            continue
+        n_cols = 2 if len(specs) <= 4 else 3
+        n_rows = (len(specs) + n_cols - 1) // n_cols
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows),
+                                squeeze=False)
+        for ax in axs.flat[len(specs):]:
+            ax.axis('off')
+        for ax, spec in zip(axs.flat, specs):
             key = spec['key']
+            log = spec.get('scale') == 'log'
             arrays = []
             for name in names:
-                v = _attr_values(data[name], spec)
-                v = v[np.isfinite(v)]
+                v = _sample_values(name, spec, mass_data, volume_data)
+                if v is None:
+                    continue
+                v = v[np.isfinite(v) & (v > 0)] if log else v[np.isfinite(v)]
                 if v.size:
                     arrays.append((name, v))
             if not arrays:
@@ -636,8 +454,8 @@ def _save_bm_multi_group_histograms(hist_dir: Path, data: dict, groups: list):
                 if view is not None:
                     lo, hi = view
             if hi <= lo:
-                hi = lo + 1
-            edges = np.linspace(lo, hi, 101)
+                hi = lo * 2 if log else lo + 1
+            edges = np.geomspace(lo, hi, 101) if log else np.linspace(lo, hi, 101)
 
             for name, v in arrays:
                 ax.hist(v, bins=edges, alpha=0.5, edgecolor='black',
@@ -649,6 +467,8 @@ def _save_bm_multi_group_histograms(hist_dir: Path, data: dict, groups: list):
                 ax.axvline(ghi, color='steelblue', linestyle='--', linewidth=1.2,
                           label=f'upper = {ghi:.4g}')
                 ax.axvspan(glo, ghi, alpha=0.1, color='green')
+            if log:
+                ax.set_xscale('log')
             ax.set_xlim(lo, hi)
             ax.set_xlabel(spec['xlabel'], fontsize=9)
             ax.set_ylabel('count')
@@ -663,18 +483,35 @@ def _save_bm_multi_group_histograms(hist_dir: Path, data: dict, groups: list):
         print(f"Written: {out_path}")
 
 
-def _write_bm_multi_log(log_path: Path, superdir: Path, data: dict, groups: list):
+def _retained_counts(name: str, gates: dict, mass_data: dict,
+                     volume_data: dict) -> dict:
+    """n_before/n_after for a sample's mass table (AND of the mass-table
+    gates) and volume data (volume gate) — None where it has no such data."""
+    out = {'mass': None, 'volume': None}
+    df = mass_data.get(name)
+    if df is not None:
+        out['mass'] = (len(df), int(np.count_nonzero(mass_gate_mask(df, gates))))
+    vol = volume_data.get(name)
+    if vol is not None:
+        g = gates.get(_VOLUME_ATTR['key'])
+        n_after = (len(vol) if g is None
+                   else int(np.count_nonzero((vol >= g[0]) & (vol <= g[1]))))
+        out['volume'] = (len(vol), n_after)
+    return out
+
+
+def _write_cutoff_log(log_path: Path, superdir: Path, mass_data: dict,
+                      volume_data: dict, cutoffs: dict, groups: list):
     lines = [
-        "gate_experiments_inplace — Buoyant Mass (multi-attribute) Cutoff Log",
+        "gate_experiments_inplace — Cutoff Log",
         "=" * 70,
         f"Experiment:  {superdir.name}",
         f"Superdir:    {superdir}",
         f"Run:         {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        "Cutoff groups",
+        "Cutoff groups (mass = AND of the mass-table gates; volume = volume gate)",
         "-" * 70,
     ]
-    total_before = total_after = 0
     for i, (ranges, names) in enumerate(groups, 1):
         if ranges:
             range_desc = '; '.join(
@@ -684,122 +521,90 @@ def _write_bm_multi_log(log_path: Path, superdir: Path, data: dict, groups: list
             range_desc = '(no gates set — all points accepted)'
         lines.append(f"Group {i}   {range_desc}")
 
-        flat_ranges = {k: (lo, hi) for k, (lo, hi, _v) in ranges.items()}
         for name in names:
-            df = data[name]
-            n_before = len(df)
-            n_after = int(np.count_nonzero(_bm_multi_mask(df, flat_ranges)))
-            n_removed = n_before - n_after
-            pct = 100 * n_removed / n_before if n_before else 0.0
-            total_before += n_before
-            total_after += n_after
-            lines.append(f"  {name:<40s}  {n_before} -> {n_after}"
-                         f"  ({n_removed} removed, {pct:.1f}%)")
+            counts = _retained_counts(name, cutoffs.get(name, {}),
+                                      mass_data, volume_data)
+            parts = []
+            for kind in ('mass', 'volume'):
+                if counts[kind] is None:
+                    continue
+                n_before, n_after = counts[kind]
+                pct = 100 * (n_before - n_after) / n_before if n_before else 0.0
+                parts.append(f"{kind} {n_before} -> {n_after} ({pct:.1f}% removed)")
+            lines.append(f"  {name:<40s}  {'   '.join(parts)}")
         lines.append("")
-
-    total_removed = total_before - total_after
-    total_pct = 100 * total_removed / total_before if total_before else 0.0
-    n_items = sum(len(names) for _, names in groups)
-    lines.append(
-        f"Total: {total_before} -> {total_after} rows retained across "
-        f"{n_items} item(s)  ({total_removed} removed, {total_pct:.1f}%)")
 
     log_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     print(f"Written: {log_path}")
 
 
-def _write_bm_multi_stats_csv(stats_path: Path, data: dict, cutoffs: dict, groups: list):
+def _write_stats_csv(stats_path: Path, mass_data: dict, volume_data: dict,
+                     cutoffs: dict, groups: list):
     rows = []
     for _ranges, names in groups:
         for name in names:
-            df = data[name]
-            flat_ranges = cutoffs.get(name, {})
-            mask = _bm_multi_mask(df, flat_ranges)
-            mass = df['mass_pg'].to_numpy(dtype=float)[mask]
-            mass = mass[np.isfinite(mass)]
+            gates = cutoffs.get(name, {})
+            row = {'sample': name}
+            for spec in _ALL_ATTRS:
+                lo, hi = gates.get(spec['key'], (np.nan, np.nan))
+                row[f"{spec['key']}_lower"] = lo
+                row[f"{spec['key']}_upper"] = hi
 
-            row = {'sample': name, 'n_before': len(df),
-                  'n_after': int(np.count_nonzero(mask))}
-            for key in _ATTR_KEYS:
-                lo, hi = flat_ranges.get(key, (np.nan, np.nan))
-                row[f'{key}_lower'] = lo
-                row[f'{key}_upper'] = hi
-            if mass.size:
-                row['mass_mean'] = float(mass.mean())
-                row['mass_median'] = float(np.median(mass))
-                row['mass_std'] = float(mass.std())
-            else:
-                row['mass_mean'] = row['mass_median'] = row['mass_std'] = np.nan
+            counts = _retained_counts(name, gates, mass_data, volume_data)
+            for kind in ('mass', 'volume'):
+                n_before, n_after = counts[kind] or (np.nan, np.nan)
+                row[f'n_{kind}_before'] = n_before
+                row[f'n_{kind}_after'] = n_after
+
+            mass = np.array([])
+            df = mass_data.get(name)
+            if df is not None:
+                mass = df['mass_pg'].to_numpy(dtype=float)[mass_gate_mask(df, gates)]
+                mass = mass[np.isfinite(mass)]
+            row['mass_mean'] = float(mass.mean()) if mass.size else np.nan
+            row['mass_median'] = float(np.median(mass)) if mass.size else np.nan
+            row['mass_std'] = float(mass.std()) if mass.size else np.nan
+
+            vol = volume_data.get(name)
+            if vol is not None:
+                g = gates.get(_VOLUME_ATTR['key'])
+                if g is not None:
+                    vol = vol[(vol >= g[0]) & (vol <= g[1])]
+            row['volume_median'] = (float(np.median(vol))
+                                    if vol is not None and vol.size else np.nan)
             rows.append(row)
 
     pd.DataFrame(rows).to_csv(stats_path, index=False)
     print(f"Written: {stats_path}")
 
 
-def _write_bm_multi_output(superdir: Path, sample_dirs: dict, data: dict,
-                          cutoffs: dict, groups: list) -> Path:
-    mode_cfg = _MODE['bm']
-    timestamp = datetime.now().strftime('%y%m%d.%H%M%S')
-    summary_dir = superdir / f'{timestamp}{mode_cfg["dir_suffix"]}'
-    summary_dir.mkdir()
-
-    hist_dir = summary_dir / 'histograms'
-    hist_dir.mkdir()
-
-    ts_yaml = datetime.now().strftime('%Y%m%d_%H%M%S')
-    _write_bm_multi_yaml_files(superdir, sample_dirs, cutoffs, ts_yaml)
-    _save_bm_multi_group_histograms(hist_dir, data, groups)
-    _write_bm_multi_log(summary_dir / 'cutoff_log.txt', superdir, data, groups)
-    _write_bm_multi_stats_csv(summary_dir / 'cutoff_stats.csv', data, cutoffs, groups)
-
-    return summary_dir
-
-
-def _write_combined_output(superdir: Path, sample_dirs: dict, mass_data: dict,
-                           volume_data: dict, cutoffs: dict, groups: list) -> str:
+def _write_output(superdir: Path, sample_dirs: dict, mass_data: dict,
+                  volume_data: dict, cutoffs: dict, groups: list) -> Path:
     """
-    Splits the combined page's gates back into the two existing outputs, so
-    compile_experiment.py reads them unchanged:
-      - BM: the four mass-table attributes, for every sample with mass data
-        (_write_bm_multi_output — *_bm_gating/ YAMLs + summary folder).
-      - iFXM volume: for every sample with volume data
-        (_write_output — *_ifxm-vol_gating/ YAMLs + summary folder). A
-        sample whose group didn't gate volume still gets a YAML, without
-        lower/upper, so it supersedes any older volume gate on disk.
+    Writes every sample's gate file plus one summary folder.
 
     `cutoffs` maps sample -> {attr_key: (lower, upper)} and `groups` is an
     ordered list of ({attr_key: (lower, upper, view)}, [sample, ...]), with
-    'volume_fl' as just another attribute key. Returns the summary folder(s)
-    written, newline-separated.
+    'volume_fl' as just another attribute key. Each sample's gate file only
+    gets the attributes it has data for (see _relevant_gates).
     """
-    vkey = _VOLUME_ATTR['key']
-    out_dirs = []
+    cutoffs = {name: _relevant_gates(name, ranges, mass_data, volume_data)
+               for name, ranges in cutoffs.items()}
 
-    bm_cutoffs = {name: {k: r for k, r in ranges.items() if k != vkey}
-                  for name, ranges in cutoffs.items() if name in mass_data}
-    if bm_cutoffs:
-        bm_groups = []
-        for ranges, names in groups:
-            names = [n for n in names if n in mass_data]
-            if names:
-                bm_groups.append(({k: r for k, r in ranges.items() if k != vkey}, names))
-        out_dirs.append(_write_bm_multi_output(
-            superdir, sample_dirs, mass_data, bm_cutoffs, bm_groups))
+    timestamp = datetime.now().strftime('%y%m%d.%H%M%S')
+    summary_dir = superdir / f'{timestamp}_gating_summary'
+    summary_dir.mkdir()
+    hist_dir = summary_dir / 'histograms'
+    hist_dir.mkdir()
 
-    vol_cutoffs = {name: ranges.get(vkey)
-                   for name, ranges in cutoffs.items() if name in volume_data}
-    if vol_cutoffs:
-        vol_groups = []
-        for ranges, names in groups:
-            names = [n for n in names if n in volume_data]
-            if names and vkey in ranges:
-                lo, hi, view = ranges[vkey]
-                vol_groups.append((lo, hi, names, view))
-        out_dirs.append(_write_output(
-            superdir, sample_dirs, list(volume_data), volume_data,
-            vol_cutoffs, vol_groups, _MODE['ifxm']))
-
-    return '\n'.join(str(d) for d in out_dirs)
+    _write_gate_files(superdir, sample_dirs, cutoffs,
+                      datetime.now().strftime('%Y%m%d_%H%M%S'))
+    _save_group_histograms(hist_dir, mass_data, volume_data, groups)
+    _write_cutoff_log(summary_dir / 'cutoff_log.txt', superdir, mass_data,
+                      volume_data, cutoffs, groups)
+    _write_stats_csv(summary_dir / 'cutoff_stats.csv', mass_data, volume_data,
+                     cutoffs, groups)
+    return summary_dir
 
 
 # ---------------------------------------------------------------------------
@@ -831,11 +636,11 @@ class MultiAttributeGatingPanel(tk.Frame):
     If `volume_data` is given, a 5th iFXM volume histogram (log x axis) is
     added to the grid (2x3 instead of 2x2) and gated per-sample together with
     the other four. Its cells are a separate population from the mass table,
-    so its gate isn't part of the mass-table AND; instead, for samples with
-    matched mass+volume cells (`paired_data`), the bottom bar also shows the
-    % of paired cells inside both the mass_pg and the volume gate. Samples
-    may have mass data, volume data, or both; each histogram just skips
-    samples lacking its data.
+    so the live mass-table AND readout leaves it out; instead, for samples
+    with matched mass+volume cells (`paired_data`), the bottom bar also shows
+    the % of paired cells inside both the mass_pg and the volume gate.
+    Samples may have mass data, volume data, or both; each histogram just
+    skips samples lacking its data.
 
     Args:
         parent:        parent tkinter widget
@@ -1102,10 +907,7 @@ class MultiAttributeGatingPanel(tk.Frame):
     def _values(self, name: str, spec: dict) -> np.ndarray | None:
         """One sample's values for one attribute, or None if that sample has
         no data of this attribute's kind (mass table vs. volume)."""
-        if spec.get('source') == 'volume':
-            return self._volume_data.get(name)
-        df = self._data.get(name)
-        return None if df is None else _attr_values(df, spec)
+        return _sample_values(name, spec, self._data, self._volume_data)
 
     def _draw_idle_attr(self, key: str, text: str = 'Select samples\non the left'):
         st = self._attr[key]
@@ -1306,7 +1108,7 @@ class MultiAttributeGatingPanel(tk.Frame):
             if df is None:
                 continue
             total += len(df)
-            kept += int(np.count_nonzero(_bm_multi_mask(df, flat_ranges)))
+            kept += int(np.count_nonzero(mass_gate_mask(df, flat_ranges)))
         if total:
             pct = 100 * kept / total
             retained = f'Mass retained (AND of BM gates): {pct:.1f}%  ({kept}/{total})'
@@ -1356,52 +1158,25 @@ class MultiAttributeGatingPanel(tk.Frame):
 def main():
     superdir = parse_cli_args()
 
+    print(f"Discovering Buoyant Mass + iFXM Volume data in {superdir.name}...")
+    mass_data, volume_data, paired_data = _discover_combined(superdir)
+    columns = sorted(mass_data.keys() | volume_data.keys())
+    if not columns:
+        print(f"No Buoyant Mass or iFXM Volume data found in {superdir}")
+        sys.exit(1)
+    sample_dirs = {name: superdir / name for name in columns}
+    print(f"Found {len(columns)} sample(s): {', '.join(columns)}")
+
+    def on_finish(cutoffs, groups):
+        return _write_output(superdir, sample_dirs, mass_data, volume_data,
+                             cutoffs, groups)
+
     root = tk.Tk()
-    root.withdraw()
-    mode_key = ask_data_type_dialog(root, [
-        ('Buoyant Mass + iFXM Volume', 'combined'),
-        ('iFXM Volume only', 'ifxm'),
-    ])
-
-    if mode_key == 'combined':
-        print(f"Discovering Buoyant Mass + iFXM Volume data in {superdir.name}...")
-        mass_data, volume_data, paired_data = _discover_combined(superdir)
-        columns = sorted(mass_data.keys() | volume_data.keys())
-        if not columns:
-            print(f"No Buoyant Mass or iFXM Volume data found in {superdir}")
-            sys.exit(1)
-        sample_dirs = {name: superdir / name for name in columns}
-        print(f"Found {len(columns)} sample(s): {', '.join(columns)}")
-
-        def on_finish(cutoffs, groups):
-            return _write_combined_output(superdir, sample_dirs, mass_data,
-                                          volume_data, cutoffs, groups)
-
-        root.deiconify()
-        panel = MultiAttributeGatingPanel(root, columns, mass_data, on_finish,
-                                          context_label=superdir.name,
-                                          on_done=root.destroy,
-                                          volume_data=volume_data,
-                                          paired_data=paired_data)
-    else:
-        mode_cfg = _MODE[mode_key]
-        print(f"Discovering {mode_cfg['label']} data in {superdir.name}...")
-        data = _discover_ifxm(superdir)
-        if not data:
-            print(f"No {mode_cfg['label']} data found in {superdir}")
-            sys.exit(1)
-        sample_dirs = {name: superdir / name for name in data}
-        columns = list(data.keys())
-        print(f"Found {len(columns)} sample(s): {', '.join(columns)}")
-
-        def on_finish(cutoffs, groups):
-            return _write_output(superdir, sample_dirs, columns,
-                                 data, cutoffs, groups, mode_cfg)
-
-        root.deiconify()
-        panel = GatingPanel(root, columns, data, mode_cfg, on_finish,
-                            context_label=superdir.name, on_done=root.destroy)
-
+    panel = MultiAttributeGatingPanel(root, columns, mass_data, on_finish,
+                                      context_label=superdir.name,
+                                      on_done=root.destroy,
+                                      volume_data=volume_data,
+                                      paired_data=paired_data)
     root.title(panel.title)
     panel.pack(fill=tk.BOTH, expand=True)
     root.mainloop()
@@ -1411,33 +1186,29 @@ def main():
 # Embedding
 # ---------------------------------------------------------------------------
 
-def build_embedded_page(parent: tk.Widget, mode_key: str, *,
+def build_embedded_page(parent: tk.Widget, *,
                         initial_superdir: str | None = None,
                         superdir_var: tk.StringVar | None = None,
                         on_finalized=None, on_discover=None) -> ttk.Frame:
     """
     Build this tool's gating UI as a Frame suitable for embedding in a larger
-    application, e.g. a wizard page. `mode_key` is 'combined' (the BM
-    four-attribute page plus an iFXM volume histogram, gated together
-    per-sample — the volume histogram is simply absent if the directory has
-    no volume data) or 'ifxm' (volume only).
+    application, e.g. a wizard page: the four mass-table histograms plus an
+    iFXM volume histogram, gated together per-sample (the volume histogram is
+    simply absent if the directory has no volume data).
 
-    Unlike the standalone main(), the data-type is fixed by `mode_key` rather
-    than asked via ask_data_type_dialog (a wizard page is already scoped to
-    one mode), and there is a directory field + "Discover" button in place of
-    the CLI's positional superdir argument. Discovery also runs automatically
-    whenever the directory field resolves to a *new* valid directory —
-    whether typed here, chosen via Browse, or (via a shared `superdir_var`)
-    set from another page entirely — so a wizard step ahead of this one
-    setting the directory is enough; the button remains only for an explicit
-    manual re-discover (e.g. after files changed on disk without the path
-    itself changing). Either way, (re)running discovery (re)builds the
-    gating panel underneath from scratch, so changing directories after
-    gating has started simply starts over.
+    A directory field + "Discover" button stand in for the CLI's positional
+    superdir argument. Discovery also runs automatically whenever the
+    directory field resolves to a *new* valid directory — whether typed here,
+    chosen via Browse, or (via a shared `superdir_var`) set from another page
+    entirely — so a wizard step ahead of this one setting the directory is
+    enough; the button remains only for an explicit manual re-discover (e.g.
+    after files changed on disk without the path itself changing). Either
+    way, (re)running discovery (re)builds the gating panel underneath from
+    scratch, so changing directories after gating has started simply starts
+    over.
 
     Pass an existing `superdir_var` (rather than `initial_superdir`) to bind
-    this page's directory field to a StringVar shared with another page —
-    e.g. the BM and iFXM gating pages of a wizard sharing one directory.
+    this page's directory field to a StringVar shared with another page.
 
     `on_finalized`, if given, is called once each time the embedded panel's
     "Finalize gating" is clicked (i.e. its own on_done) — e.g. a wizard uses
@@ -1447,22 +1218,6 @@ def build_embedded_page(parent: tk.Widget, mode_key: str, *,
     to re-disable Next, since a fresh discovery means whatever was
     previously finalized here no longer applies.
     """
-    if mode_key == 'combined':
-        return _build_combined_embedded_page(parent, initial_superdir=initial_superdir,
-                                             superdir_var=superdir_var,
-                                             on_finalized=on_finalized,
-                                             on_discover=on_discover)
-    if mode_key == 'ifxm':
-        return _build_ifxm_embedded_page(parent, initial_superdir=initial_superdir,
-                                         superdir_var=superdir_var,
-                                         on_finalized=on_finalized,
-                                         on_discover=on_discover)
-    raise ValueError(f"Unknown mode_key: {mode_key!r} (expected 'combined' or 'ifxm')")
-
-
-def _build_combined_embedded_page(parent: tk.Widget, *, initial_superdir=None,
-                                  superdir_var=None, on_finalized=None,
-                                  on_discover=None) -> ttk.Frame:
     page = ttk.Frame(parent)
 
     top = ttk.Frame(page)
@@ -1515,9 +1270,9 @@ def _build_combined_embedded_page(parent: tk.Widget, *, initial_superdir=None,
         sample_dirs = {name: superdir / name for name in columns}
 
         def on_finish(cutoffs, groups):
-            out = _write_combined_output(superdir, sample_dirs, mass_data,
-                                         volume_data, cutoffs, groups)
-            status_var.set(f'Gate files written to: {out.replace(chr(10), "; ")}')
+            out = _write_output(superdir, sample_dirs, mass_data, volume_data,
+                                cutoffs, groups)
+            status_var.set(f'Gate files written; summary in: {out}')
             return out
 
         gating_panel = MultiAttributeGatingPanel(
@@ -1538,141 +1293,6 @@ def _build_combined_embedded_page(parent: tk.Widget, *, initial_superdir=None,
     # effective directory the same; the button above remains for an
     # explicit manual re-discover (e.g. after files changed on disk without
     # the path itself changing).
-    _last_auto_dir = {'value': None}
-
-    def _auto_discover(*_a):
-        text = superdir_var.get().strip()
-        if text and Path(text).is_dir() and text != _last_auto_dir['value']:
-            _last_auto_dir['value'] = text
-            _discover()
-
-    superdir_var.trace_add('write', _auto_discover)
-    _auto_discover()
-
-    return page
-
-
-def _build_ifxm_embedded_page(parent: tk.Widget, *, initial_superdir=None,
-                              superdir_var=None, on_finalized=None,
-                              on_discover=None) -> ttk.Frame:
-    mode_cfg = _MODE['ifxm']
-    page = ttk.Frame(parent)
-
-    top = ttk.Frame(page)
-    top.pack(fill=tk.X, padx=8, pady=8)
-    top.columnconfigure(1, weight=1)
-
-    ttk.Label(top, text='Experiment superdir:').grid(row=0, column=0, sticky='w')
-    if superdir_var is None:
-        superdir_var = tk.StringVar(value=initial_superdir or '')
-    ttk.Entry(top, textvariable=superdir_var).grid(
-        row=0, column=1, sticky='ew', padx=(6, 6))
-
-    def _browse():
-        chosen = filedialog.askdirectory(
-            title='Select experiment superdir',
-            initialdir=superdir_var.get() or None)
-        if chosen:
-            superdir_var.set(chosen)
-
-    ttk.Button(top, text='Browse…', command=_browse).grid(row=0, column=2)
-
-    status_var = tk.StringVar(value='')
-    ttk.Label(page, textvariable=status_var, foreground='#a00').pack(fill=tk.X, padx=8)
-
-    paired_var = tk.StringVar(value='')
-    tk.Label(page, textvariable=paired_var, anchor='w',
-            font=('TkDefaultFont', 9, 'bold'), foreground='#1a6b1a').pack(
-        fill=tk.X, padx=8)
-
-    panel_container = ttk.Frame(page)
-    panel_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
-
-    def _discover():
-        if on_discover is not None:
-            on_discover()
-        for child in panel_container.winfo_children():
-            child.destroy()
-        status_var.set('')
-        paired_var.set('')
-
-        superdir_text = superdir_var.get().strip()
-        if not superdir_text:
-            status_var.set('Choose an experiment superdir first.')
-            return
-        superdir = Path(superdir_text)
-        if not superdir.is_dir():
-            status_var.set(f'Directory not found: {superdir}')
-            return
-
-        data = _discover_ifxm(superdir)
-        if not data:
-            status_var.set(f'No {mode_cfg["label"]} data found under {superdir}.')
-            return
-
-        sample_dirs = {name: superdir / name for name in data}
-        columns = list(data.keys())
-
-        # Pre-load, per sample, whatever's needed for the paired mass+volume
-        # indicator: a BM gate already on disk (from the BM gating page —
-        # possibly a previous session's, that's fine) and a matched
-        # mass+volume table. Only samples with both contribute.
-        paired_info = {}
-        for name in columns:
-            bounds = _read_bm_gate_bounds(sample_dirs[name])
-            if bounds is None:
-                continue
-            hdf5_path = _find_cellgrouped_hdf5(sample_dirs[name])
-            if hdf5_path is None:
-                continue
-            paired_df = _load_paired_mass_volume(hdf5_path)
-            if paired_df is None or paired_df.empty:
-                continue
-            paired_info[name] = (bounds, paired_df)
-
-        def on_finish(cutoffs, groups):
-            out_dir = _write_output(superdir, sample_dirs, columns,
-                                    data, cutoffs, groups, mode_cfg)
-            status_var.set(f'Gate files written to: {out_dir}')
-            return out_dir
-
-        def _update_paired_indicator():
-            if not paired_info:
-                paired_var.set('')
-                return
-            selection, lower, upper = gating_panel.get_active_gate()
-            if selection is None or lower is None or upper is None:
-                paired_var.set('')
-                return
-            relevant = [s for s in selection if s in paired_info]
-            if not relevant:
-                paired_var.set('Paired mass+volume retained: n/a for this selection')
-                return
-            total = 0
-            kept = 0
-            for name in relevant:
-                (mlo, mhi), pdf = paired_info[name]
-                mass = pdf['mass_pg'].to_numpy(dtype=float)
-                vol = pdf['volume_fl'].to_numpy(dtype=float)
-                total += len(pdf)
-                kept += int(np.count_nonzero(
-                    (mass >= mlo) & (mass <= mhi) & (vol >= lower) & (vol <= upper)))
-            pct = 100 * kept / total if total else 0.0
-            paired_var.set(
-                f'Paired mass+volume retained (BM gate x this volume gate): '
-                f'{pct:.1f}%  ({kept}/{total})')
-
-        gating_panel = GatingPanel(panel_container, columns, data, mode_cfg,
-                                   on_finish, context_label=superdir.name,
-                                   on_done=on_finalized,
-                                   on_gate_change=_update_paired_indicator)
-        gating_panel.pack(fill=tk.BOTH, expand=True)
-
-    ttk.Button(top, text=f'Discover {mode_cfg["label"]} data',
-              command=_discover).grid(row=1, column=1, sticky='w', pady=(8, 0))
-
-    # Auto-discover once a *new* valid directory is in place — see the
-    # matching comment in _build_combined_embedded_page.
     _last_auto_dir = {'value': None}
 
     def _auto_discover(*_a):

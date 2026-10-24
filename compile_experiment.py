@@ -14,8 +14,27 @@ Recognised sub-subdir types (all optional; most-recent used if multiple exist):
                                SMRFXMAnalysis flattened its output nest these
                                under a stage2_analysis/ subdir instead; both
                                layouts are checked.
-    *_bm_gating             — YAML with lower/upper thresholds
-    *_ifxm-vol_gating       — YAML with lower/upper thresholds
+    <timestamp>_gating      — <sample>_gate.yaml written by
+                               gate_experiments_inplace.py (format in
+                               gating/gates.py): lower/upper per attribute for
+                               any of mass_pg, baseline_norm, bl_slope,
+                               node_dev_mean, volume_fl. The older separate
+                               *_bm_gating / *_ifxm-vol_gating folders are no
+                               longer read (a warning is printed if a sample
+                               has only those).
+
+Gating:
+    Every tabular block written to the workbook holds only the cells passing
+    the logical AND of every gate in the sample's gate file:
+      MASS   the four mass-table gates, on the mass CSV (baseline_norm is
+             computed over the full, ungated table, as at gating time).
+      PAIRED the same mass-table verdict, looked up on each matched cell's
+             mass CSV row via analysis/density/cells' matched_peak_index,
+             AND the volume_fl gate.
+      VOLUME the volume_fl gate.
+    A sample with no gate file is written ungated (has_gate = False in the
+    metadata sheet). The gate bounds themselves go in the metadata sheet's
+    gate_<attr>_lower / gate_<attr>_upper columns.
 
 The legacy *_ProcessedVolumes.csv (imaging_fxm_results) and
 *_pairing_results/*_PairedSMRVolumes.csv sources are deprecated and no longer
@@ -62,7 +81,9 @@ indexes axis 0 of the tensors. Samples without a cache are simply absent;
 
 experiment_data.xlsx layout:
     metadata sheet   — one row per sample; sample_name, sheet_name (the sample's
-                       worksheet name), hdf5_key, has_* flags, gate bounds,
+                       worksheet name), hdf5_key, has_* flags, gate bounds
+                       (gate_<attr>_lower/upper, NaN where not gated), per-block
+                       n_<block>_ungated / n_<block>_gated cell counts,
                        coulter_column (when --coulter is used), plus any custom
                        annotation columns added in the GUI, each written as
                        meta_<column name> (e.g. meta_is_activated) so they're
@@ -107,12 +128,15 @@ from datetime import datetime
 from pathlib import Path
 
 import h5py
+import numpy as np
 import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-import yaml
 
 from fsutil import is_appledouble
+from gating.gates import (GATE_KEYS, MASS_GATE_COLUMNS, MASS_GATE_KEYS,
+                          VOLUME_GATE_KEY, find_gate_file, has_legacy_gate_dirs,
+                          load_gate_file, mass_gate_mask, range_mask)
 
 # The VQ-VAE crop-cache concatenator, reused so the pair written here is
 # byte-identical to what `python concat_vqvae_caches.py <superdir>` produces.
@@ -217,7 +241,7 @@ def _discover_sample(sample_dir: Path) -> dict:
     Locate the relevant file path for each known data type inside sample_dir.
 
     Returns a dict with keys:
-        mass_path, cellgrouped_path, bm_gate_path, ifxm_gate_path
+        mass_path, cellgrouped_path, gate_path
     Any key whose source is absent is set to None.
 
     The legacy *_ProcessedVolumes.csv and *_pairing_results/*_PairedSMRVolumes
@@ -230,8 +254,7 @@ def _discover_sample(sample_dir: Path) -> dict:
     paths = {
         'mass_path':        None,
         'cellgrouped_path': None,
-        'bm_gate_path':     None,
-        'ifxm_gate_path':   None,
+        'gate_path':        None,
     }
 
     # --- mass_results ---
@@ -259,21 +282,8 @@ def _discover_sample(sample_dir: Path) -> dict:
                 paths['cellgrouped_path'] = f
                 break
 
-    # --- bm_gating ---
-    bm_gate_dir = _last_matching_dir(sample_dir, re.compile(r'_bm_gating$'))
-    if bm_gate_dir is not None:
-        yaml_files = sorted(f for f in bm_gate_dir.glob('*.yaml')
-                            if not is_appledouble(f))
-        if yaml_files:
-            paths['bm_gate_path'] = yaml_files[0]
-
-    # --- ifxm-vol_gating ---
-    ifxm_gate_dir = _last_matching_dir(sample_dir, re.compile(r'_ifxm-vol_gating$'))
-    if ifxm_gate_dir is not None:
-        yaml_files = sorted(f for f in ifxm_gate_dir.glob('*.yaml')
-                            if not is_appledouble(f))
-        if yaml_files:
-            paths['ifxm_gate_path'] = yaml_files[0]
+    # --- gating ---
+    paths['gate_path'] = find_gate_file(sample_dir)
 
     return paths
 
@@ -282,14 +292,47 @@ def _discover_sample(sample_dir: Path) -> dict:
 # Per-type loaders
 # ---------------------------------------------------------------------------
 
-def _load_gate(path: Path) -> tuple[float, float] | None:
-    """Read a gating YAML and return (lower, upper), or None on failure."""
-    try:
-        data = yaml.safe_load(path.read_text(encoding='utf-8'))
-        return (float(data['lower']), float(data['upper']))
-    except Exception as exc:
-        print(f"  [warn] could not read gate YAML {path.name}: {exc}")
-        return None
+def _apply_gates(name: str, gates: dict, mass_df, pairing_df, volume_df):
+    """
+    Filter each block's cells to the AND of every gate (see "Gating" in the
+    module docstring). Returns (mass_df, pairing_df, volume_df, counts), where
+    counts maps block -> (n_ungated, n_gated) for each block present.
+    """
+    counts = {}
+    mass_gates = {k: g for k, g in gates.items() if k in MASS_GATE_KEYS}
+    vol_gate = gates.get(VOLUME_GATE_KEY)
+
+    mass_keep = None
+    if mass_df is not None:
+        missing = [c for c in MASS_GATE_COLUMNS if c not in mass_df.columns]
+        if mass_gates and missing:
+            raise ValueError(f"{name}: mass CSV is missing column(s) "
+                             f"{', '.join(missing)} needed by its gates")
+        mass_keep = mass_gate_mask(mass_df, mass_gates)
+        counts['mass'] = (len(mass_df), int(mass_keep.sum()))
+        mass_df = mass_df[mass_keep]
+
+    if pairing_df is not None:
+        keep = range_mask(pairing_df['volume_fl'], vol_gate)
+        if mass_gates:
+            if mass_keep is None:
+                raise ValueError(f"{name}: has mass-table gates and paired cells "
+                                 f"but no mass CSV to evaluate them on")
+            idx = pairing_df['matched_peak_index'].to_numpy()
+            valid = (idx >= 0) & (idx < len(mass_keep))
+            if not valid.all():
+                print(f"  [warn] {name}: {int((~valid).sum())} paired cell(s) "
+                      f"have a matched_peak_index outside the mass CSV; dropped")
+            keep &= valid & mass_keep[np.where(valid, idx, 0)]
+        counts['paired'] = (len(pairing_df), int(keep.sum()))
+        pairing_df = pairing_df[keep]
+
+    if volume_df is not None:
+        keep = range_mask(volume_df['volume_fl'], vol_gate)
+        counts['volume'] = (len(volume_df), int(keep.sum()))
+        volume_df = volume_df[keep]
+
+    return mass_df, pairing_df, volume_df, counts
 
 
 def _load_coulter(path: Path) -> pd.DataFrame:
@@ -443,23 +486,36 @@ def compile_experiment(superdir: Path) -> list[dict]:
         if pairing_df is None and paths['cellgrouped_path'] is not None:
             volume_df = _load_cellgrouped_volume(paths['cellgrouped_path'])
 
-        bm_gate = (_load_gate(paths['bm_gate_path'])
-                   if paths['bm_gate_path'] else None)
-        ifxm_gate = (_load_gate(paths['ifxm_gate_path'])
-                     if paths['ifxm_gate_path'] else None)
+        # Gates: an unreadable gate file is fatal rather than silently
+        # compiling that sample ungated.
+        gates = None
+        if paths['gate_path'] is not None:
+            try:
+                gates = load_gate_file(paths['gate_path'])
+            except Exception as exc:
+                raise ValueError(f"{name}: could not read gate file "
+                                 f"{paths['gate_path']}: {exc}") from exc
+        elif has_legacy_gate_dirs(sample_dir):
+            print(f"  [warn] {name}: only old-format *_bm_gating / "
+                  f"*_ifxm-vol_gating folders found; these are no longer "
+                  f"read — re-run gate_experiments_inplace.py. Compiling "
+                  f"UNGATED.")
+        mass_df, pairing_df, volume_df, gate_counts = _apply_gates(
+            name, gates or {}, mass_df, pairing_df, volume_df)
 
         def _tick(val):
             return 'ok' if val is not None else '--'
 
         has_volume = pairing_df is not None or volume_df is not None
+        kept = '  '.join(f"{blk} {n0}->{n1}" for blk, (n0, n1) in gate_counts.items())
         print(
             f"[{name}]"
             f"  mass={_tick(mass_df)}"
             f"  volume={'ok' if has_volume else '--'}"
             f"  pairing={_tick(pairing_df)}"
-            f"  bm_gate={_tick(bm_gate)}"
-            f"  ifxm_gate={_tick(ifxm_gate)}"
+            f"  gate={'--' if gates is None else ', '.join(gates) or 'none set'}"
             f"  vqvae={'ok' if vqvae_src is not None else '--'}"
+            + (f"\n    gated: {kept}" if gates else '')
         )
 
         sample_records.append({
@@ -468,8 +524,8 @@ def compile_experiment(superdir: Path) -> list[dict]:
             'volume_df':   volume_df,
             'has_volume':  has_volume,
             'pairing_df':  pairing_df,
-            'bm_gate':     bm_gate,
-            'ifxm_gate':   ifxm_gate,
+            'gates':       gates,
+            'gate_counts': gate_counts,
             'vqvae_src':   vqvae_src,
         })
 
@@ -1265,6 +1321,15 @@ def _build_readme_df(timestamp: str, has_vqvae: bool = False) -> pd.DataFrame:
                             'pair_volume_fl (already calibrated, femtoliters) and '
                             'pair_cell_density_g_per_mL (ABSOLUTE density) and '
                             'confidence/QC columns.'),
+        ('Gating',          'Every block holds only cells passing the AND of all '
+                            'gates in the sample\'s gate file (from '
+                            'gate_experiments_inplace.py): mass_pg, baseline_norm, '
+                            'bl_slope, node_dev_mean on MASS (and on PAIRED, via '
+                            'each matched cell\'s mass row), volume_fl on PAIRED '
+                            'and VOLUME. The bounds are in the metadata sheet '
+                            '(gate_<attr>_lower/upper; NaN = not gated, '
+                            'has_gate = False = no gate file, written ungated), '
+                            'with n_<block>_ungated / n_<block>_gated counts.'),
         ('Blocks are independent',
                             'Row N of one block is unrelated to row N of another; '
                             'they are separate distributions, not aligned.'),
@@ -1390,9 +1455,8 @@ def _write_output(superdir: Path, sample_records: list,
 
     meta_rows = []
     for rec in sample_records:
-        name = rec['name']
-        bm   = rec['bm_gate']
-        ifxm = rec['ifxm_gate']
+        name  = rec['name']
+        gates = rec['gates'] or {}
         entry = {
             'sample_name':       name,
             'sheet_name':        sheet_names[name],
@@ -1400,15 +1464,18 @@ def _write_output(superdir: Path, sample_records: list,
             'has_mass':          rec['mass_df'] is not None,
             'has_volume':        rec['has_volume'],
             'has_pairing':       rec['pairing_df'] is not None,
-            'has_bm_gate':       bm is not None,
-            'has_ifxm_gate':     ifxm is not None,
+            'has_gate':          rec['gates'] is not None,
             'has_vqvae':         rec['name'] in vqvae_names,
-            'bm_gate_lower':     bm[0]   if bm   else float('nan'),
-            'bm_gate_upper':     bm[1]   if bm   else float('nan'),
-            'ifxm_gate_lower':   ifxm[0] if ifxm else float('nan'),
-            'ifxm_gate_upper':   ifxm[1] if ifxm else float('nan'),
-            'coulter_column':    pairing.get(name, ''),
         }
+        for key in GATE_KEYS:
+            lo, hi = gates.get(key, (float('nan'), float('nan')))
+            entry[f'gate_{key}_lower'] = lo
+            entry[f'gate_{key}_upper'] = hi
+        for blk in ('mass', 'paired', 'volume'):
+            n0, n1 = rec['gate_counts'].get(blk, (float('nan'), float('nan')))
+            entry[f'n_{blk}_ungated'] = n0
+            entry[f'n_{blk}_gated'] = n1
+        entry['coulter_column'] = pairing.get(name, '')
         # Append custom annotation columns (checkbox cols normalised to yes/no),
         # prefixed meta_ so they're identifiable (e.g. by other tools keying off
         # that prefix) among the sheet's structural/gate columns.

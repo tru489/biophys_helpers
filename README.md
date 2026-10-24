@@ -347,7 +347,7 @@ instruments, then matching peaks within a tolerance window. Reads a volume-only
 diagnostic figures.
 
 The output `*_PairedSMRVolumes.csv` is exactly the `*_pairing_results` file that
-`compile_experiment.py` (and `gate_experiments_inplace.py` for iFXM) discover
+`compile_experiment.py` discovers
 automatically, so pairing feeds straight into compilation.
 
 **Output** (`<analysis_dir>/<YYYYMMDD_HHMMSS>_pairing_results/`)
@@ -567,72 +567,60 @@ Total: 3798 → 3724 values retained across 2 column(s)  (74 removed, 1.9%)
 
 ### `gate_experiments_inplace.py`  · _GUI_
 
-Interactive GUI for gating buoyant mass (BM) or iFXM volume data across all sample
+Interactive GUI for gating buoyant mass (BM) and iFXM volume data across all sample
 subfolders in an experiment superdir, writing the gate bounds **back into each sample
-subfolder** as a YAML file (plus a timestamped summary folder in the superdir). One
-column per sample is shown in the GUI.
+subfolder** as one YAML file (plus a timestamped summary folder in the superdir).
 
 **Workflow**
 
-1. A data-type dialog asks whether you are gating **Buoyant Mass + iFXM
-   Volume** together, or **iFXM Volume only**.
-2. The script discovers the relevant data file for each sample subdir.
-   iFXM-only gates a single histogram (`volume_fl`); combined gates **five**
-   independent histograms in a 2x3 grid — buoyant mass, normalized baseline
-   (`avg_baseline` divided by its mean over the first 10% of the run),
-   baseline slope (`bl_slope`), and average node deviation
+1. The script discovers each sample subdir's mass table and volume data, and
+   shows up to **five** independent histograms in a 2x3 grid — buoyant mass,
+   normalized baseline (`avg_baseline` divided by its mean over the first 10%
+   of the run), baseline slope (`bl_slope`), and average node deviation
    (`node_dev_mean`), porting the four-attribute gate from this repo's MATLAB
    `gate_mass_results.m`, plus iFXM volume (log x axis). A sample with only
    mass or only volume data just doesn't appear in the other kind's
    histogram(s); the volume histogram is omitted if no sample has volume data.
-3. A single window shows the sample list on the left and the histogram(s) on
+2. A single window shows the sample list on the left and the histograms on
    the right. Selecting (or deselecting) samples in the list immediately
-   previews their overlaid histogram(s), with shared bin edges — no separate
+   previews their overlaid histograms, with shared bin edges — no separate
    step needed to "activate" a selection.
-4. Click on a histogram to set a lower cutoff (red dashed line), then again
+3. Click on a histogram to set a lower cutoff (red dashed line), then again
    for an upper cutoff (blue dashed line); changing the left-list selection
-   while doing this restarts the cutoff for the new selection. In combined
-   mode, each histogram is independently clickable at all times (no
-   per-plot "arm" button) and gating each one is optional — the eventual
-   per-sample mass gate is the logical AND of whichever mass attribute(s)
-   were actually gated. Each gated histogram shows a live "Retained: X%"
-   readout (its own data only); combined mode also shows the pooled % of
-   mass cells retained by the AND of every mass attribute currently gated,
-   and, for samples with matched mass+volume cells, the % of paired cells
-   inside both the mass and volume gates. **Apply cutoffs** commits the
-   group (confirming first if nothing is gated) and returns the panel to
-   an idle preview.
-5. Repeat step 3–4 until all samples are assigned; **Finalize gating**
+   while doing this restarts the cutoffs for the new selection. Each
+   histogram is independently clickable at all times (no per-plot "arm"
+   button) and gating each one is optional — the eventual per-sample gate is
+   the logical AND of whichever attribute(s) were actually gated. Each gated
+   histogram shows a live "Retained: X%" readout (its own data only); the
+   bottom bar shows the pooled % of mass cells retained by the AND of every
+   mass attribute currently gated and, for samples with matched mass+volume
+   cells, the % of paired cells inside both the mass and volume gates.
+   **Apply cutoffs** commits the group (confirming first if nothing is
+   gated) and returns the panel to an idle preview.
+4. Repeat step 2–3 until all samples are assigned; **Finalize gating**
    (highlighted green) then becomes available.
-6. **← Back** undoes the last group of cutoffs, restoring those samples to the
+5. **← Back** undoes the last group of cutoffs, restoring those samples to the
    remaining list (can be pressed repeatedly).
-
-On the iFXM-only page, if a sample already has a BM gate on disk (written by a
-previous combined run) and matched mass+volume
-cells, an extra readout shows the % of paired mass+volume cells retained by
-the BM gate's mass_pg bound together with the volume gate being set now.
 
 **Output**
 
-A YAML gate file written into each sample subfolder, and a summary folder in the
-superdir. Combined mode writes both kinds: a BM gate for samples with mass data
-and an iFXM volume gate for samples with volume data. A gate YAML without
-`lower`/`upper` means that sample was deliberately left ungated (it still
-supersedes any older gate on disk).
+One gate file per sample subfolder, and a summary folder in the superdir:
 
 ```
-<sample_subdir>/<sample_subdir_name>_<mode>_gate.yaml      (mode = bm | ifxm-vol)
-<superdir>/<YYMMDD.HHMMSS>_<mode>_gating_summary/
+<sample_subdir>/<YYYYMMDD_HHMMSS>_gating/<sample_subdir_name>_gate.yaml
+<superdir>/<YYMMDD.HHMMSS>_gating_summary/
   cutoff_log.txt
   cutoff_stats.csv
-  histograms/group_NN.png                (2x2, one per attribute, for BM)
+  histograms/group_NN.png                (one panel per attribute)
 ```
 
-For BM, the YAML's top-level `lower`/`upper` record the mass_pg bound
-specifically (kept for backward compatibility with `compile_experiment.py`'s
-gate reader — present only if mass_pg was one of the gated attributes), and
-a `gates:` mapping records every attribute actually gated for that sample
-(`mass_pg`, `baseline_norm`, `bl_slope`, `node_dev_mean` — 0 to 4 keys).
+The gate file (format defined in [`gating/gates.py`](gating/gates.py)) holds a
+`gates:` mapping with `lower`/`upper` for every attribute actually gated for that
+sample — any of `mass_pg`, `baseline_norm`, `bl_slope`, `node_dev_mean`, `volume_fl`,
+limited to the kinds of data the sample has. `gates: {}` means the sample was
+deliberately left ungated (it still supersedes any older gate file on disk).
+`compile_experiment.py` applies the AND of all of them. The older separate
+`*_bm_gating` / `*_ifxm-vol_gating` folders are no longer written or read.
 
 **Expected directory structure**
 
@@ -675,8 +663,8 @@ group.
 **Workflow**
 
 1. Discovers all sample subdirs under the given superdir that contain a `*_mass_results`
-   folder with a `mass_pg` CSV. Any `*_bm_gating` folder present is pre-loaded so its
-   gate thresholds are saved automatically.
+   folder with a `mass_pg` CSV. Any gate file from `gate_experiments_inplace.py` is
+   pre-loaded so its `mass_pg` thresholds are saved automatically.
 2. If `--coulter` is given, that CSV's column names become a per-row **"Coulter Col"**
    dropdown. Setting a Coulter column on any run in a group auto-fills it for all runs
    in that group.
@@ -780,9 +768,16 @@ type exist.
                         (runs from before SMRFXMAnalysis dropped its stage1/stage2
                         split nest these under stage2_analysis/ instead)
 *_pairing_results       *_PairedSMRVolumes.csv
-*_bm_gating             YAML with lower/upper thresholds
-*_ifxm-vol_gating       YAML with lower/upper thresholds
+<timestamp>_gating      <sample>_gate.yaml from gate_experiments_inplace.py
 ```
+
+**Gating.** Every block in the workbook holds only cells passing the logical AND of
+every gate in the sample's gate file: the four mass-table gates (`mass_pg`,
+`baseline_norm`, `bl_slope`, `node_dev_mean`) filter the MASS block, and also the PAIRED
+block via each matched cell's mass-CSV row (`matched_peak_index`); `volume_fl` filters
+the PAIRED and VOLUME blocks. The metadata sheet records the bounds
+(`gate_<attr>_lower` / `gate_<attr>_upper`, NaN where not gated), `has_gate` (False = no
+gate file, sample written ungated), and `n_<block>_ungated` / `n_<block>_gated` counts.
 
 **Output** (`<superdir>/YYYYMMDD_HHMMSS_compiled/`)
 
