@@ -107,7 +107,7 @@ One-stop-shop wizard that walks the buoyant-mass → baseline-density →
 gating → compile portion of the workflow above as a sequence of "step"
 pages with Previous/Next navigation, embedding the existing GUIs for
 `calculate_baseline_density.py`, `gate_experiments_inplace.py` (combined
-mass + volume mode), and `compile_experiment.py` rather than reimplementing
+mass + volume mode), `compile_experiment.py` and `new_analysis_dir.py` rather than reimplementing
 them. Each of those scripts still works standalone from the CLI exactly as
 documented below — the wizard just calls a `build_embedded_page(...)`
 function each one exposes for this purpose.
@@ -124,7 +124,12 @@ either updates the other live; page 4 seeds from it once):
    directory is set — no Discover click needed.
 4. Compile experiment — `compile_experiment.py`'s GUI, directory pre-filled
    from pages 2-3 but (unlike page 3) still requiring an explicit
-   "Discover Samples" click. Clicking its Done button closes the wizard.
+   "Discover Samples" click. Clicking its Done button advances to page 5.
+5. New analysis dir — `new_analysis_dir.py`'s GUI, using the shared
+   directory as its raw data dir (no list picker): **Create** scaffolds the
+   code and data_analysis dirs named after it, then offers to copy in its
+   `*_compiled` and `*_gating_summary` dirs. Its Close button closes the
+   wizard.
 
 Page 3 requires clicking its embedded panel's **Finalize gating** button
 before Next becomes available (re-running discovery there revokes this
@@ -151,6 +156,28 @@ Reload the profile (`. $PROFILE`, or open a new shell) and run:
 
 ```powershell
 analysis-wizard
+```
+
+### `new_analysis_dir.py`  · _GUI_
+
+Scaffolds a new downstream analysis and pulls in its compiled raw data. Lists
+the subdirs of `RAW_DATA_DIR` (newest first, filterable); the chosen dir's name
+becomes the analysis name `<name>`, and it creates
+
+- `<BIOPHYS_CODE_DIR>/<name>/` — code (plotting drivers etc.)
+- `<DATA_ANALYSIS_DIR>/<name>/{data,fig}/` — data + figures
+
+then looks in the chosen raw dir for the newest `*_compiled` (contents →
+`<name>/data/`) and `*_gating_summary` (→ `<name>/gating/`) and offers to copy
+them, with a progress bar and cancel. Nothing is copied until you click Copy,
+and existing files are never overwritten.
+
+The three paths are machine-specific constants at the top of the script — edit
+them when running on a different computer.
+
+```bash
+python new_analysis_dir.py            # pick from the list
+python new_analysis_dir.py wnki       # prefill the list filter
 ```
 
 ---

@@ -24,11 +24,17 @@ existing per-stage GUIs rather than reimplementing them:
                              field is seeded from the shared directory the
                              first time this page is built, but (unlike
                              step 3) still requires an explicit "Discover
-                             Samples" click. Clicking its Done button closes
+                             Samples" click. Clicking its Done button
+                             advances to step 5.
+    5. New analysis dir   — new_analysis_dir.py embedded, using the shared
+                             directory as its raw data dir: Create scaffolds
+                             the code + data_analysis dirs named after it,
+                             then offers to copy in its *_compiled and
+                             *_gating_summary dirs. Its Close button closes
                              the wizard.
 
-Steps 2-3 share one experiment-directory field (typing in either updates
-the other live); step 4 seeds from it once. Step 3 requires its embedded
+Steps 2-3 and 5 share one experiment-directory field (typing in 2 or 3
+updates the others live); step 4 seeds from it once. Step 3 requires its embedded
 gating panel's "Finalize gating" to be clicked before Next becomes
 available — re-running Discover there (a new directory, or just starting
 over) revokes that until Finalize is clicked again.
@@ -50,6 +56,7 @@ from pathlib import Path
 import calculate_baseline_density
 import compile_experiment
 import gate_experiments_inplace
+import new_analysis_dir
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +85,13 @@ _BASELINE_DENSITY_TEXT = (
     "run separately, outside this GUI.\n\n"
     "The fluid baseline density calculation below can be run alongside "
     "that separate analysis, using each sample's buoyant mass data."
+)
+
+_NEW_ANALYSIS_DIR_TEXT = (
+    "Step 5 — New analysis dir\n\n"
+    "Scaffold the downstream analysis for this experiment: Create makes the "
+    "code and data_analysis dirs named after the experiment directory, then "
+    "you can copy in its compiled data and gating summary."
 )
 
 
@@ -224,6 +238,10 @@ class Wizard:
         if idx >= 0:
             self._show(idx)
 
+    def go_next(self):
+        """Advance as the Next button would (no-op if this step isn't ready)."""
+        self._go_next()
+
     def _go_next(self):
         if not self._step_ready(self._index):
             return   # guard directly, don't rely solely on the button's disabled state
@@ -243,9 +261,10 @@ def main():
     root.title('Biophysics Analysis Wizard')
     root.minsize(1000, 700)
 
-    # Shared across steps 2 (baseline density) and 3 (gating): both pages'
-    # directory fields are bound to this same StringVar, so typing in either
-    # updates the other live. The compile page (step 4) only reads its
+    # Shared across steps 2 (baseline density), 3 (gating) and 5 (new analysis
+    # dir): steps 2-3's directory fields are bound to this same StringVar, so
+    # typing in either updates the other live, and step 5 displays it as its
+    # raw data dir. The compile page (step 4) only reads its
     # current value once, as an initial seed, since compilation may
     # reasonably target a different directory afterward.
     experiment_superdir = tk.StringVar(value='')
@@ -268,7 +287,19 @@ def main():
     def build_compile(parent):
         return compile_experiment.build_embedded_page(
             parent, initial_superdir=experiment_superdir.get(),
-            on_done=root.destroy)
+            on_done=wiz.go_next)
+
+    def build_new_analysis_dir(parent):
+        page = ttk.Frame(parent)
+        ttk.Label(page, text=_NEW_ANALYSIS_DIR_TEXT, wraplength=760,
+                 justify='left').pack(anchor='nw', padx=8, pady=(8, 12))
+        panel = new_analysis_dir.build_embedded_page(
+            page, raw_dir_var=experiment_superdir, on_close=root.destroy)
+        panel.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        # Closing the window mid-copy would kill the copy thread mid-file;
+        # route it through the panel so the copy is cancelled cleanly first.
+        root.protocol('WM_DELETE_WINDOW', panel.on_close)
+        return page
 
     def _has_superdir():
         text = experiment_superdir.get().strip()
@@ -283,6 +314,7 @@ def main():
         {'title': 'Gating: Buoyant Mass + Volume', 'builder': build_gating,
          'requires_finalize': True},
         {'title': 'Compile Experiment', 'builder': build_compile},
+        {'title': 'New Analysis Dir', 'builder': build_new_analysis_dir},
     ]
 
     wiz = Wizard(root, steps)
