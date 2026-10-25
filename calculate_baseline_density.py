@@ -13,31 +13,41 @@ density using a base-frequency / density calibration:
     baseline_density = (rfreq - mean_avg_baseline - intercept) / slope
 
 where ``slope`` and ``intercept`` come from a calibration JSON (see --calib-json,
-required) and ``rfreq`` is the experiment's resonant frequency (Hz), passed on
-the command line. This mirrors the per-run calculation in the standalone
-baseline_density_calc.py analysis script, generalised to sweep a whole superdir.
+required) and ``rfreq`` is the resonant (reference) frequency in Hz. This
+mirrors the per-run calculation in the standalone baseline_density_calc.py
+analysis script, generalised to sweep a whole superdir.
+
+``rfreq`` comes from one of two sources:
+    single      one value (--rfreq) applied to every sample.
+    per-sample  (--per-sample-rfreq) each sample's own value, read from the
+                'reference_frequency' field of the newest
+                <YYYYMMDD_HHMM>_reference_values.json directly inside that
+                sample's subdir (written by the acquisition LabVIEW). A sample
+                without a readable one gets rfreq = baseline_density = NaN.
 
 Output (written at the same level as the sample subdirs, i.e. inside <superdir>):
     <YYYYMMDD_HHMMSS>_baseline_density.csv
         one row per sample: sample, n_cells, mean_avg_baseline, baseline_density,
-        rfreq, slope, intercept, source_csv
+        rfreq, rfreq_source, slope, intercept, source_csv
+        (rfreq_source is 'user' in single mode, else the reference-values JSON
+        path relative to <superdir>, or empty when it was missing)
 
 Usage:
     python calculate_baseline_density.py <superdir> --rfreq <hz> --calib-json <path>
+    python calculate_baseline_density.py <superdir> --per-sample-rfreq --calib-json <path>
     python calculate_baseline_density.py                      # opens a GUI form
 
-    <superdir>      Experiment directory whose immediate subdirs are samples,
-                    each containing a *_mass_results folder.
-    --rfreq         Resonant frequency in Hz.
-    --calib-json    Path to a calibration JSON with 'slope' and 'intercept' keys.
+    <superdir>          Experiment directory whose immediate subdirs are samples,
+                        each containing a *_mass_results folder.
+    --rfreq             Resonant frequency in Hz, applied to every sample.
+    --per-sample-rfreq  Use each sample's reference-values JSON instead.
+    --calib-json        Path to a calibration JSON with 'slope' and 'intercept' keys.
 
-If <superdir>, --rfreq and --calib-json are all given on the command line, the
-computation runs headlessly (as before) and prints its report to stdout.
-Otherwise a small GUI form opens to collect whichever of the three inputs is
-still missing. In the GUI, the reference frequency autofills from the
-'reference_frequency' field of the newest <YYYYMMDD_HHMM>_reference_values.json
-(written by the acquisition LabVIEW) directly inside the chosen superdir,
-whenever the superdir changes — unless the user has typed a value of their own.
+If <superdir>, --calib-json and one rfreq source are all given on the command
+line, the computation runs headlessly and prints its report to stdout.
+Otherwise a small GUI form opens to collect whatever is still missing; its
+"Use per-sample reference frequency" checkbox picks the rfreq source, and in
+per-sample mode the results table gains a per-sample rfreq column.
 """
 import argparse
 import json
@@ -66,8 +76,14 @@ def parse_cli_args() -> argparse.Namespace:
                         help='Experiment directory whose subdirs are samples, '
                              'each with a *_mass_results folder. If omitted '
                              '(along with --rfreq), a GUI form opens instead.')
-    parser.add_argument('--rfreq', type=float, default=None,
-                        help='Resonant frequency in Hz')
+    rfreq_src = parser.add_mutually_exclusive_group()
+    rfreq_src.add_argument('--rfreq', type=float, default=None,
+                           help='Resonant frequency in Hz, applied to every sample')
+    rfreq_src.add_argument('--per-sample-rfreq', action='store_true',
+                           help="Read each sample's rfreq from the "
+                                "reference_frequency field of the newest "
+                                "<YYYYMMDD_HHMM>_reference_values.json in its "
+                                "subdir, instead of one --rfreq for all")
     parser.add_argument('--calib-json', type=str, default=None,
                         help="Path to a calibration JSON with 'slope' and "
                              "'intercept' keys. Required for headless runs; if "
@@ -104,16 +120,16 @@ def apply_calculation(mean_baseline: float, cal: dict, rfreq: float) -> float:
 _REFERENCE_VALUES_PATTERN = re.compile(r'^\d{8}_\d{4}_reference_values\.json$')
 
 
-def find_reference_frequency(superdir: Path) -> tuple[float, Path] | None:
+def find_reference_frequency(sample_dir: Path) -> tuple[float, Path] | None:
     """
     (reference_frequency, source_path) from the newest
-    <YYYYMMDD_HHMM>_reference_values.json directly inside superdir (written by
-    the acquisition LabVIEW), or None if there's no such file or it has no
+    <YYYYMMDD_HHMM>_reference_values.json directly inside sample_dir (written
+    by the acquisition LabVIEW), or None if there's no such file or it has no
     usable reference_frequency.
     """
-    if not superdir.is_dir():
+    if not sample_dir.is_dir():
         return None
-    files = sorted(f for f in superdir.iterdir()
+    files = sorted(f for f in sample_dir.iterdir()
                    if f.is_file() and _REFERENCE_VALUES_PATTERN.match(f.name))
     if not files:
         return None
@@ -176,12 +192,39 @@ def per_sample_avg_baseline(superdir: Path) -> list:
     return rows
 
 
+def attach_rfreq(superdir: Path, rows: list, rfreq: float | None) -> list:
+    """
+    Extends each per_sample_avg_baseline() row to
+    (sample_name, n_cells, mean_avg_baseline, source_csv, rfreq, rfreq_source).
+
+    rfreq given: that value for every sample, rfreq_source 'user'.
+    rfreq None:  each sample's own value from its subdir's reference-values
+                 JSON (rfreq_source = that path relative to superdir), or NaN
+                 and '' when the sample has none.
+    """
+    out = []
+    for name, n, mean_b, source in rows:
+        if rfreq is not None:
+            out.append((name, n, mean_b, source, rfreq, 'user'))
+            continue
+        found = find_reference_frequency(superdir / name)
+        if found is None:
+            print(f"  [warn] {name}: no readable *_reference_values.json; "
+                  f"baseline density left NaN")
+            out.append((name, n, mean_b, source, float('nan'), ''))
+        else:
+            value, path = found
+            out.append((name, n, mean_b, source, value,
+                        str(path.relative_to(superdir))))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-def write_output(superdir: Path, rows: list, cal: dict,
-                 rfreq: float) -> Path:
+def write_output(superdir: Path, rows: list, cal: dict) -> Path:
+    """Writes attach_rfreq()-style rows (each carrying its own rfreq)."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_path = superdir / f'{timestamp}_baseline_density.csv'
 
@@ -189,13 +232,14 @@ def write_output(superdir: Path, rows: list, cal: dict,
     intercept = cal['intercept']
 
     out_rows = []
-    for name, n, mean_b, source in rows:
+    for name, n, mean_b, source, rfreq, rfreq_source in rows:
         out_rows.append({
             'sample':            name,
             'n_cells':           n,
             'mean_avg_baseline': mean_b,
             'baseline_density':  apply_calculation(mean_b, cal, rfreq),
             'rfreq':             rfreq,
+            'rfreq_source':      rfreq_source,
             'slope':             slope,
             'intercept':         intercept,
             'source_csv':        source,
@@ -206,15 +250,24 @@ def write_output(superdir: Path, rows: list, cal: dict,
     return out_path
 
 
-def format_report(superdir_name: str, rfreq: float, rows: list,
+def format_report(superdir_name: str, rfreq: float | None, rows: list,
                   cal: dict) -> str:
-    """The sample/n_cells/mean_baseline/baseline_density table as printable text."""
-    lines = [f"=== baseline density ({superdir_name}, rfreq={rfreq:g}) ==="]
-    lines.append(f"{'sample':<28}{'n_cells':>9}{'mean_baseline':>16}{'baseline_density':>18}")
-    lines.append("-" * 71)
-    for name, n, mean_b, _ in rows:
-        density = apply_calculation(mean_b, cal, rfreq)
-        lines.append(f"{name:<28}{n:>9d}{mean_b:>16.6g}{density:>18.6g}")
+    """The sample/n_cells/mean_baseline/baseline_density table as printable
+    text; rfreq None (per-sample mode) adds a per-row rfreq column."""
+    per_sample = rfreq is None
+    title = 'per-sample rfreq' if per_sample else f'rfreq={rfreq:g}'
+    lines = [f"=== baseline density ({superdir_name}, {title}) ==="]
+    header = f"{'sample':<28}{'n_cells':>9}{'mean_baseline':>16}"
+    if per_sample:
+        header += f"{'rfreq':>16}"
+    lines.append(header + f"{'baseline_density':>18}")
+    lines.append("-" * len(lines[-1]))
+    for name, n, mean_b, _source, row_rfreq, _rsrc in rows:
+        density = apply_calculation(mean_b, cal, row_rfreq)
+        line = f"{name:<28}{n:>9d}{mean_b:>16.6g}"
+        if per_sample:
+            line += f"{row_rfreq:>16.10g}"
+        lines.append(line + f"{density:>18.6g}")
     return '\n'.join(lines)
 
 
@@ -222,18 +275,20 @@ def format_report(superdir_name: str, rfreq: float, rows: list,
 # Computation (shared by the headless and GUI entry points)
 # ---------------------------------------------------------------------------
 
-def run_computation(superdir: Path, rfreq: float,
+def run_computation(superdir: Path, rfreq: float | None,
                     calib_json: Path) -> tuple[list, dict, Path | None]:
     """
-    Runs the full compute-and-write pipeline. Returns (rows, cal, out_path);
-    out_path (and rows) is empty/None when no buoyant mass CSVs were found
-    under superdir.
+    Runs the full compute-and-write pipeline. rfreq None means per-sample
+    (see attach_rfreq). Returns (rows, cal, out_path), rows as attach_rfreq()
+    returns them; out_path (and rows) is empty/None when no buoyant mass CSVs
+    were found under superdir.
     """
     cal = load_calibration(calib_json)
     rows = per_sample_avg_baseline(superdir)
     if not rows:
         return [], cal, None
-    out_path = write_output(superdir, rows, cal, rfreq)
+    rows = attach_rfreq(superdir, rows, rfreq)
+    out_path = write_output(superdir, rows, cal)
     return rows, cal, out_path
 
 
@@ -248,7 +303,9 @@ _UNCHECKED = '☐'  # ☐
 class BaselineDensityGUI(ttk.Frame):
     """
     Simple form: a superdir picker, a calibration-JSON picker, and a
-    resonant-frequency entry, with a Run button that computes and writes the
+    resonant-frequency entry (or, with the per-sample checkbox ticked, each
+    sample's value from its own reference-values JSON, shown as an extra
+    table column), with a Run button that computes and writes the
     same CSV as the headless path. Results are shown in a fixed-height,
     scrollable table with a checkbox per sample; Select All / Select None /
     Invert Selection buttons and a live average-density readout let the user
@@ -258,17 +315,19 @@ class BaselineDensityGUI(ttk.Frame):
     standalone root (see run_gui()) or a page of a larger embedding GUI.
     """
 
-    _COLUMNS = ('check', 'sample', 'n_cells', 'mean_baseline', 'density')
+    _COLUMNS = ('check', 'sample', 'n_cells', 'mean_baseline', 'rfreq', 'density')
 
     def __init__(self, parent: tk.Widget, *, superdir: str | None,
                  calib_json: str | None, rfreq: float | None,
-                 superdir_var: tk.StringVar | None = None):
+                 superdir_var: tk.StringVar | None = None,
+                 per_sample_rfreq: bool = False):
         super().__init__(parent)
         root = self
 
         self._superdir = superdir_var if superdir_var is not None else tk.StringVar(value=superdir or '')
         self._calib_json = tk.StringVar(value=calib_json or '')
         self._rfreq = tk.StringVar(value='' if rfreq is None else f'{rfreq:g}')
+        self._per_sample = tk.BooleanVar(value=per_sample_rfreq)
         self._checked: dict[str, bool] = {}
         self._densities: dict[str, float] = {}
         self._names: dict[str, str] = {}
@@ -287,22 +346,20 @@ class BaselineDensityGUI(ttk.Frame):
         ttk.Entry(form, textvariable=self._calib_json).grid(row=1, column=1, sticky='ew', padx=(6, 6), pady=(6, 0))
         ttk.Button(form, text='Browse…', command=self._pick_calib_json).grid(row=1, column=2, pady=(6, 0))
 
-        ttk.Label(form, text='Reference frequency (Hz):').grid(row=2, column=0, sticky='w', pady=(6, 0))
-        rfreq_row = ttk.Frame(form)
-        rfreq_row.grid(row=2, column=1, columnspan=2, sticky='w', padx=(6, 6), pady=(6, 0))
-        ttk.Entry(rfreq_row, textvariable=self._rfreq, width=16).pack(side=tk.LEFT)
-        self._rfreq_note = ttk.Label(rfreq_row, text='', foreground='gray30')
-        self._rfreq_note.pack(side=tk.LEFT, padx=(8, 0))
-        # Autofill from the superdir's reference-values JSON whenever the
-        # directory changes; never clobbers a value the user typed themselves.
-        self._autofilled_rfreq: str | None = None
-        self._superdir.trace_add('write', lambda *_a: self._autofill_rfreq())
-        self._rfreq.trace_add('write', lambda *_a: self._rfreq_edited())
-        if rfreq is None:
-            self._autofill_rfreq()
+        ttk.Checkbutton(
+            form, variable=self._per_sample,
+            text="Use per-sample reference frequency (from each sample's "
+                 "*_reference_values.json)",
+            command=self._update_rfreq_entry).grid(
+            row=2, column=1, columnspan=2, sticky='w', padx=(6, 6), pady=(6, 0))
+
+        ttk.Label(form, text='Reference frequency (Hz):').grid(row=3, column=0, sticky='w', pady=(6, 0))
+        self._rfreq_entry = ttk.Entry(form, textvariable=self._rfreq, width=16)
+        self._rfreq_entry.grid(row=3, column=1, sticky='w', padx=(6, 6), pady=(6, 0))
+        self._update_rfreq_entry()
 
         self._run_button = ttk.Button(form, text='Run', command=self._run)
-        self._run_button.grid(row=3, column=1, sticky='w', pady=(10, 0))
+        self._run_button.grid(row=4, column=1, sticky='w', pady=(10, 0))
 
         self._message = ttk.Label(root, text='', foreground='#a00')
         self._message.pack(fill=tk.X, padx=8)
@@ -324,9 +381,10 @@ class BaselineDensityGUI(ttk.Frame):
         self._tree = ttk.Treeview(table_frame, columns=self._COLUMNS, show='headings',
                                   height=14, selectmode='none')
         headings = {'check': '', 'sample': 'Sample', 'n_cells': 'n cells',
-                    'mean_baseline': 'Mean baseline', 'density': 'Baseline density'}
+                    'mean_baseline': 'Mean baseline', 'rfreq': 'Ref. frequency (Hz)',
+                    'density': 'Baseline density'}
         widths = {'check': 30, 'sample': 220, 'n_cells': 70,
-                 'mean_baseline': 130, 'density': 140}
+                 'mean_baseline': 130, 'rfreq': 140, 'density': 140}
         for col in self._COLUMNS:
             anchor = 'center' if col == 'check' else 'w'
             self._tree.heading(col, text=headings[col])
@@ -346,6 +404,7 @@ class BaselineDensityGUI(ttk.Frame):
         table_frame.columnconfigure(0, weight=1)
 
         self._tree.bind('<Button-1>', self._on_tree_click)
+        self._show_rfreq_column(False)
 
         self._current_average: float | None = None
 
@@ -367,31 +426,9 @@ class BaselineDensityGUI(ttk.Frame):
         if chosen:
             self._superdir.set(chosen)
 
-    def _autofill_rfreq(self):
-        """Set the reference frequency from the superdir's newest reference-values
-        JSON, unless the field holds a value the user entered by hand."""
-        current = self._rfreq.get().strip()
-        if current and current != self._autofilled_rfreq:
-            return
-        text = self._superdir.get().strip()
-        found = find_reference_frequency(Path(text)) if text else None
-        if found is None:
-            if self._autofilled_rfreq is not None:   # directory changed away: undo our fill
-                self._rfreq.set('')
-                self._autofilled_rfreq = None
-            self._rfreq_note.configure(text='')
-            return
-        value, path = found
-        self._autofilled_rfreq = f'{value:.10g}'
-        self._rfreq.set(self._autofilled_rfreq)
-        self._rfreq_note.configure(text=f'(from {path.name})')
-
-    def _rfreq_edited(self):
-        # Once the user types over the autofilled value, it's theirs: drop the
-        # "(from …)" note and stop treating the field as ours to replace.
-        if self._autofilled_rfreq is not None and self._rfreq.get().strip() != self._autofilled_rfreq:
-            self._autofilled_rfreq = None
-            self._rfreq_note.configure(text='')
+    def _update_rfreq_entry(self):
+        # The single-value field only applies when not using per-sample values.
+        self._rfreq_entry.state(['disabled'] if self._per_sample.get() else ['!disabled'])
 
     def _pick_calib_json(self):
         chosen = filedialog.askopenfilename(
@@ -403,21 +440,31 @@ class BaselineDensityGUI(ttk.Frame):
 
     # -- table population ---------------------------------------------------
 
-    def _populate_table(self, rows: list, cal: dict, rfreq: float):
+    def _show_rfreq_column(self, show: bool):
+        self._tree.configure(displaycolumns=[c for c in self._COLUMNS
+                                             if show or c != 'rfreq'])
+
+    def _populate_table(self, rows: list, cal: dict, per_sample: bool):
         self._tree.delete(*self._tree.get_children())
         self._checked.clear()
         self._densities.clear()
         self._names.clear()
         self._red.clear()
+        self._show_rfreq_column(per_sample)
 
-        for i, (name, n, mean_b, _source) in enumerate(rows):
+        for i, (name, n, mean_b, _source, rfreq, _rsrc) in enumerate(rows):
             iid = str(i)
             density = apply_calculation(mean_b, cal, rfreq)
-            self._checked[iid] = True
+            has_density = np.isfinite(density)
+            # A sample with no reference frequency has no density to average,
+            # so it starts (and stays effectively) out of the selection.
+            self._checked[iid] = bool(has_density)
             self._densities[iid] = density
             self._names[iid] = name
             self._tree.insert('', tk.END, iid=iid, values=(
-                _CHECKED, name, n, f'{mean_b:.6g}', f'{density:.6g}',
+                _CHECKED if has_density else _UNCHECKED, name, n, f'{mean_b:.6g}',
+                f'{rfreq:.10g}' if np.isfinite(rfreq) else 'no JSON',
+                f'{density:.6g}' if has_density else 'n/a',
             ))
             self._apply_row_color(iid)
 
@@ -479,7 +526,8 @@ class BaselineDensityGUI(ttk.Frame):
         self._update_average()
 
     def _update_average(self):
-        selected_iids = [iid for iid, checked in self._checked.items() if checked]
+        selected_iids = [iid for iid, checked in self._checked.items()
+                         if checked and np.isfinite(self._densities[iid])]
         if not selected_iids:
             self._current_average = None
             self._average_label.configure(text='Average density of selected samples: n/a')
@@ -516,13 +564,16 @@ class BaselineDensityGUI(ttk.Frame):
             messagebox.showerror('Baseline Density Calculator', f'Directory not found:\n{superdir}')
             return
 
-        rfreq_text = self._rfreq.get().strip()
-        try:
-            rfreq = float(rfreq_text)
-        except ValueError:
-            messagebox.showerror('Baseline Density Calculator',
-                                 f'Reference frequency must be a number, got: {rfreq_text!r}')
-            return
+        per_sample = self._per_sample.get()
+        rfreq = None
+        if not per_sample:
+            rfreq_text = self._rfreq.get().strip()
+            try:
+                rfreq = float(rfreq_text)
+            except ValueError:
+                messagebox.showerror('Baseline Density Calculator',
+                                     f'Reference frequency must be a number, got: {rfreq_text!r}')
+                return
 
         calib_text = self._calib_json.get().strip()
         if not calib_text:
@@ -550,16 +601,21 @@ class BaselineDensityGUI(ttk.Frame):
             self._update_average()
             return
 
-        self._message.configure(text='')
-        self._populate_table(rows, cal, rfreq)
+        missing = [r[0] for r in rows if not np.isfinite(r[4])]
+        self._message.configure(text=(
+            f"No readable *_reference_values.json for {len(missing)} sample(s), "
+            f"left out of the average: {', '.join(missing)}") if missing else '')
+        self._populate_table(rows, cal, per_sample)
         messagebox.showinfo('Baseline Density Calculator', f'Written:\n{out_path}')
 
 
-def run_gui(*, superdir: str | None, calib_json: str | None, rfreq: float | None):
+def run_gui(*, superdir: str | None, calib_json: str | None, rfreq: float | None,
+            per_sample_rfreq: bool = False):
     root = tk.Tk()
     root.title('Baseline Density Calculator')
     root.minsize(640, 480)
-    gui = BaselineDensityGUI(root, superdir=superdir, calib_json=calib_json, rfreq=rfreq)
+    gui = BaselineDensityGUI(root, superdir=superdir, calib_json=calib_json, rfreq=rfreq,
+                             per_sample_rfreq=per_sample_rfreq)
     gui.pack(fill=tk.BOTH, expand=True)
     root.mainloop()
 
@@ -571,17 +627,20 @@ def run_gui(*, superdir: str | None, calib_json: str | None, rfreq: float | None
 def build_embedded_page(parent: tk.Widget, *, superdir: str | None = None,
                         calib_json: str | None = None,
                         rfreq: float | None = None,
-                        superdir_var: tk.StringVar | None = None) -> ttk.Frame:
+                        superdir_var: tk.StringVar | None = None,
+                        per_sample_rfreq: bool = False) -> ttk.Frame:
     """
     Build this tool's GUI as a Frame suitable for embedding in a larger
     application (e.g. a wizard page), rather than owning its own Tk root.
 
     Pass an existing `superdir_var` (rather than `superdir`) to bind this
     page's directory field to a StringVar shared with another page — e.g. a
-    wizard sharing one directory across several steps.
+    wizard sharing one directory across several steps. `per_sample_rfreq`
+    sets the initial state of the per-sample reference-frequency checkbox.
     """
     return BaselineDensityGUI(parent, superdir=superdir, calib_json=calib_json,
-                              rfreq=rfreq, superdir_var=superdir_var)
+                              rfreq=rfreq, superdir_var=superdir_var,
+                              per_sample_rfreq=per_sample_rfreq)
 
 
 # ---------------------------------------------------------------------------
@@ -593,19 +652,22 @@ def run_headless(args: argparse.Namespace):
     if not superdir.is_dir():
         raise FileNotFoundError(f"Directory not found: {superdir}")
 
-    rows, cal, _ = run_computation(superdir, args.rfreq, Path(args.calib_json))
+    rfreq = None if args.per_sample_rfreq else args.rfreq
+    rows, cal, _ = run_computation(superdir, rfreq, Path(args.calib_json))
     if not rows:
         print(f"No buoyant mass CSVs found under {superdir}.")
         return
-    print(format_report(superdir.name, args.rfreq, rows, cal))
+    print(format_report(superdir.name, rfreq, rows, cal))
 
 
 def main():
     args = parse_cli_args()
-    if args.superdir is not None and args.rfreq is not None and args.calib_json is not None:
+    has_rfreq = args.rfreq is not None or args.per_sample_rfreq
+    if args.superdir is not None and has_rfreq and args.calib_json is not None:
         run_headless(args)
     else:
-        run_gui(superdir=args.superdir, calib_json=args.calib_json, rfreq=args.rfreq)
+        run_gui(superdir=args.superdir, calib_json=args.calib_json, rfreq=args.rfreq,
+                per_sample_rfreq=args.per_sample_rfreq)
 
 
 if __name__ == '__main__':

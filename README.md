@@ -477,30 +477,38 @@ resonant frequency (Hz). This value is the absolute-density offset to add to the
 **relative** `buoyant_density` written by `compile_experiment.py`. Without a
 calibration JSON the mean baseline is still reported but `baseline_density` is `NaN`.
 
-In the GUI (standalone or the analysis wizard's step 2), the reference frequency
-autofills from the `reference_frequency` field of the newest
+`rfreq` is either one value applied to every sample (`--rfreq`), or **per-sample**
+(`--per-sample-rfreq`): each sample's `reference_frequency` from the newest
 `<YYYYMMDD_HHMM>_reference_values.json` (written by the acquisition LabVIEW)
-directly inside the chosen superdir. A value you type yourself is never
-overwritten.
+directly inside that sample's subdir. A sample without one gets `rfreq` and
+`baseline_density` = `NaN`. In the GUI (standalone or the analysis wizard's
+step 2, where it starts ticked), a **Use per-sample reference frequency** checkbox picks the mode; when
+ticked, the single-value field is disabled, the results table gains a per-sample
+*Ref. frequency* column, and samples with no JSON are unchecked and left out of
+the average.
 
 **Output** (written inside `<superdir>`, at the same level as the sample subdirs)
 
 ```
 <YYYYMMDD_HHMMSS>_baseline_density.csv
     one row per sample: sample, n_cells, mean_avg_baseline, baseline_density,
-    rfreq, slope, intercept, source_csv
+    rfreq, rfreq_source, slope, intercept, source_csv
+    (rfreq_source: 'user' for --rfreq, else the sample's reference-values JSON
+    path relative to <superdir>, or empty if it had none)
 ```
 
 **Usage**
 
 ```
 python calculate_baseline_density.py <superdir> --rfreq <hz> [--calib-json <path>]
+python calculate_baseline_density.py <superdir> --per-sample-rfreq [--calib-json <path>]
 ```
 
 | Argument | Description |
 |---|---|
 | `superdir` | Experiment superdir whose immediate subdirs are samples, each with a `*_mass_results` folder |
-| `--rfreq HZ` | Resonant frequency in Hz (required) |
+| `--rfreq HZ` | Resonant frequency in Hz, applied to every sample (this or `--per-sample-rfreq` is required) |
+| `--per-sample-rfreq` | Use each sample's own `*_reference_values.json` instead of `--rfreq` |
 | `--calib-json PATH` | Calibration JSON with `slope` and `intercept` keys (optional; `baseline_density` is `NaN` if omitted) |
 
 **Example**

@@ -274,7 +274,7 @@ def main():
         ttk.Label(page, text=_BASELINE_DENSITY_TEXT, wraplength=760,
                  justify='left').pack(anchor='nw', padx=8, pady=(8, 12))
         panel = calculate_baseline_density.build_embedded_page(
-            page, superdir_var=experiment_superdir)
+            page, superdir_var=experiment_superdir, per_sample_rfreq=True)
         panel.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         return page
 
