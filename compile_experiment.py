@@ -1001,8 +1001,9 @@ class CompileAnnotationWindow(ttk.Frame):
         tk.Label(top, text="Column name:").grid(
             row=0, column=0, padx=10, pady=(10, 4), sticky='w')
         name_var = tk.StringVar()
-        tk.Entry(top, textvariable=name_var, width=24).grid(
-            row=0, column=1, padx=10, pady=(10, 4))
+        name_entry = tk.Entry(top, textvariable=name_var, width=24)
+        name_entry.grid(row=0, column=1, padx=10, pady=(10, 4))
+        name_entry.focus_set()
 
         checkbox_var = tk.BooleanVar(value=False)
         tk.Checkbutton(top, text="Checkbox values (yes / no)",
@@ -1022,6 +1023,7 @@ class CompileAnnotationWindow(ttk.Frame):
         tk.Button(btn_frame, text="OK",     command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
 
+        top.bind('<Return>', lambda e: _ok())
         top.protocol('WM_DELETE_WINDOW', _cancel)
         self.wait_window(top)
 
@@ -1062,7 +1064,9 @@ class CompileAnnotationWindow(ttk.Frame):
         for col in self._custom_cols:
             listbox.insert(tk.END, col)
         listbox.select_set(0)
+        listbox.activate(0)
         listbox.pack(padx=14, pady=(0, 8))
+        listbox.focus_set()
 
         def _ok():
             sel = listbox.curselection()
@@ -1078,6 +1082,7 @@ class CompileAnnotationWindow(ttk.Frame):
         tk.Button(btn_frame, text="Remove", command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
 
+        top.bind('<Return>', lambda e: _ok())
         top.protocol('WM_DELETE_WINDOW', _cancel)
         self.wait_window(top)
 
@@ -1120,18 +1125,31 @@ class CompileAnnotationWindow(ttk.Frame):
         value_frame.grid(row=1, column=1, padx=10, pady=4, sticky='w')
 
         value_var = tk.StringVar()
+        # Whether the value widget currently shown is the yes/no combobox
+        # (None before the first build).
+        shown_as_checkbox = {'value': None}
 
         def _build_value_widget(*_):
             for child in value_frame.winfo_children():
                 child.destroy()
-            if col_var.get() in self._checkbox_cols:
-                value_var.set('yes')
-                ttk.Combobox(value_frame, values=['yes', 'no'],
-                             textvariable=value_var, state='readonly',
-                             width=20).pack()
+            is_checkbox = col_var.get() in self._checkbox_cols
+            was_checkbox = shown_as_checkbox['value']
+            shown_as_checkbox['value'] = is_checkbox
+            if is_checkbox:
+                # Keep typed text only if it's already a valid yes/no choice.
+                if value_var.get() not in ('yes', 'no'):
+                    value_var.set('yes')
+                widget = ttk.Combobox(value_frame, values=['yes', 'no'],
+                                      textvariable=value_var, state='readonly',
+                                      width=20)
             else:
-                value_var.set('')
-                tk.Entry(value_frame, textvariable=value_var, width=23).pack()
+                # Keep typed text across text columns; a yes/no picked from
+                # a checkbox column's dropdown wasn't typed, so drop it.
+                if was_checkbox is not False:
+                    value_var.set('')
+                widget = tk.Entry(value_frame, textvariable=value_var, width=23)
+            widget.pack()
+            widget.focus_set()
 
         col_box.bind('<<ComboboxSelected>>', _build_value_widget)
         _build_value_widget()
@@ -1160,6 +1178,7 @@ class CompileAnnotationWindow(ttk.Frame):
         tk.Button(btn_frame, text="OK",     command=_ok,     width=8).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="Cancel", command=_cancel, width=8).pack(side=tk.LEFT, padx=6)
 
+        top.bind('<Return>', lambda e: _ok())
         top.protocol('WM_DELETE_WINDOW', _cancel)
         self.wait_window(top)
 
