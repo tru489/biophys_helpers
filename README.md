@@ -816,9 +816,16 @@ type exist.
 every gate in the sample's gate file: the four mass-table gates (`mass_pg`,
 `baseline_norm`, `bl_slope`, `node_dev_mean`) filter the MASS block, and also the PAIRED
 block via each matched cell's mass-CSV row (`matched_peak_index`); `volume_fl` filters
-the PAIRED and VOLUME blocks. The metadata sheet records the bounds
+the PAIRED and VOLUME blocks. The VQ-VAE crop cache (`.pt` + parquet) is gated the same
+way, by cell: a crop (one frame) is kept only if its `cell_id` passes the same gates,
+evaluated on the CELLGROUPED hdf5's per-cell table (the PAIRED rule, or the VOLUME rule for
+a sample with no PAIRED block). Only gates remove crops — a cell the workbook drops for its
+`status_code` alone keeps its crops — so with both mass and volume gates set, the cache
+holds exactly the PAIRED block's cells. A sample whose cache can't be gated is left out of
+the merge (with a warning) rather than merged ungated. The metadata sheet records the bounds
 (`gate_<attr>_lower` / `gate_<attr>_upper`, NaN where not gated), `has_gate` (False = no
-gate file, sample written ungated), and `n_<block>_ungated` / `n_<block>_gated` counts.
+gate file, sample written ungated), and `n_<block>_ungated` / `n_<block>_gated` counts
+(`n_vqvae_*` count crop rows).
 
 **Output** (`<superdir>/YYYYMMDD_HHMMSS_compiled/`)
 
@@ -838,7 +845,7 @@ experiment_data.xlsx  (Excel workbook — shareable, no HDF5 tooling needed)
   README sheet           units, block meaning, and a pandas read recipe
 
 concat_vqvae_cache.pt                every discovered sample's stage-2 crop cache,
-concat_vqvae_cache_metadata.parquet  concatenated along axis 0 (see below)
+concat_vqvae_cache_metadata.parquet  gated and concatenated along axis 0 (see below)
 ```
 
 > The `buoyant_density` column is **relative**. Add the per-sample offset from
@@ -863,8 +870,10 @@ nothing is computed from it. Assignment is optional — leave rows blank and Don
 Every sample that has a stage-2 `*_vqvae_cache.pt` is merged into a single `.pt` +
 `.parquet` pair beside the workbook, by importing
 [`concat_vqvae_caches.py`](concat_vqvae_caches.py) rather than shelling out to it — so the
-pair is byte-identical to what running that script over the same superdir produces, and
-carries the same `experiment` / `sample_name` / `cache_row` columns. The merge streams
+pair has the same format and `experiment` / `sample_name` / `cache_row` columns as that
+script's output, minus the gated-out rows (see **Gating** above; an ungated sample's rows
+are all kept, byte-identical to the standalone merge). `cache_row` is renumbered over the
+kept rows, so it still indexes axis 0 of the tensors. The merge streams
 blobs a chunk at a time, so it is flat in memory no matter how large the caches are, but
 the output can still be many gigabytes; `--no-vqvae` skips it.
 

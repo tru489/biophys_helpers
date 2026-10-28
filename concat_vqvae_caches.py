@@ -51,7 +51,9 @@ Usage:
 compile_experiment.py imports this module to write the same pair into its own
 `*_compiled/` output dir for the samples it discovered, via
 `_sample_cache` -> `plan_concat` -> `run_concat`. Keep those three importable
-without side effects.
+without side effects. It also sets each CacheSource's optional `row_keep` mask
+so only gated-in rows are written (to the tensors and the parquet alike); this
+script's own CLI never sets it, so standalone merges keep every row.
 """
 import argparse
 import io
@@ -63,6 +65,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -176,10 +179,19 @@ class CacheSource:
         self.tensors: dict[str, _TensorInfo] = {}
         self.nrows: int = 0
         self.columns: list[str] = []
+        # Optional per-row boolean mask (length nrows): only rows where it is
+        # True are written, to the tensors and the parquet alike. None keeps
+        # every row. compile_experiment.py sets it to apply its gates.
+        self.row_keep: np.ndarray | None = None
 
     @property
     def label(self) -> str:
         return f'{self.experiment}/{self.sample_name}'
+
+    @property
+    def kept_rows(self) -> int:
+        """Rows this source contributes to the output."""
+        return self.nrows if self.row_keep is None else int(self.row_keep.sum())
 
 
 def _last_matching_dir(parent: Path, pattern: re.Pattern) -> Path | None:
@@ -342,6 +354,9 @@ def inspect_source(src: CacheSource) -> str | None:
     n = distinct.pop()
     if src.nrows != n:
         return (f'parquet has {src.nrows:,} rows but tensors have N={n:,}')
+    if src.row_keep is not None and len(src.row_keep) != n:
+        return (f'row mask has {len(src.row_keep):,} entries but the cache has '
+                f'{n:,} rows')
     return None
 
 
@@ -543,6 +558,59 @@ def _copy_blob(src_path: Path, storage_key: str, dst, expect: int) -> int:
     return written
 
 
+def _read_exact(fh, n: int) -> bytes:
+    """n bytes from fh, or fewer only at end of stream."""
+    parts, got = [], 0
+    while got < n:
+        chunk = fh.read(n - got)
+        if not chunk:
+            break
+        parts.append(chunk)
+        got += len(chunk)
+    return b''.join(parts)
+
+
+def _copy_blob_rows(src_path: Path, storage_key: str, dst, expect: int,
+                    keep: np.ndarray) -> int:
+    """
+    Like _copy_blob, but write only the axis-0 rows where `keep` is True.
+
+    A contiguous tensor's row i is bytes [i * row_bytes, (i + 1) * row_bytes) of
+    its blob, so selecting rows is selecting byte ranges. Still streamed a chunk
+    of whole rows at a time, so memory stays flat. Returns bytes written.
+    """
+    n = len(keep)
+    if n == 0:
+        return 0
+    if expect % n:
+        raise ValueError(f'{src_path.name}: storage {storage_key} is {expect:,} '
+                         f'bytes, not a whole number of {n:,} rows')
+    row_bytes = expect // n
+    rows_per_chunk = max(1, _CHUNK_BYTES // row_bytes)
+    written = 0
+    with zipfile.ZipFile(str(src_path)) as zf:
+        name = _blob_name(zf, storage_key)
+        with zf.open(name) as fh:
+            for start in range(0, n, rows_per_chunk):
+                stop = min(n, start + rows_per_chunk)
+                buf = _read_exact(fh, (stop - start) * row_bytes)
+                if len(buf) != (stop - start) * row_bytes:
+                    raise ValueError(f'{src_path.name}: storage {storage_key} '
+                                     f'ended early (expected {expect:,} bytes)')
+                sel = keep[start:stop]
+                if sel.all():
+                    dst.write(buf)
+                    written += len(buf)
+                elif sel.any():
+                    rows = np.frombuffer(buf, dtype=np.uint8).reshape(-1, row_bytes)[sel]
+                    dst.write(rows.tobytes())
+                    written += rows.nbytes
+            if fh.read(1):
+                raise ValueError(f'{src_path.name}: storage {storage_key} held '
+                                 f'more than the expected {expect:,} bytes')
+    return written
+
+
 def write_concat_pt(sources: list[CacheSource], keys: list[str],
                     out_path: Path, prefix: str = 'archive') -> dict:
     """
@@ -550,6 +618,7 @@ def write_concat_pt(sources: list[CacheSource], keys: list[str],
 
     Returns {key: shape}. Sources are consumed in list order, which is the same
     order the parquet pass uses, so tensor rows and parquet rows stay aligned.
+    A source's row_keep, if set, is applied here and in the parquet pass alike.
     """
     shapes = {}
     plan = []           # (storage_key, tensor key, total bytes)
@@ -557,7 +626,7 @@ def write_concat_pt(sources: list[CacheSource], keys: list[str],
     for i, key in enumerate(keys):
         first = sources[0].tensors[key]
         tail = tuple(int(d) for d in first.shape[1:])
-        total_n = sum(int(s.tensors[key].shape[0]) for s in sources)
+        total_n = sum(s.kept_rows for s in sources)
         storage_class = first.storage.storage_class
         itemsize = _STORAGE_ITEMSIZE[storage_class]
 
@@ -587,8 +656,12 @@ def write_concat_pt(sources: list[CacheSource], keys: list[str],
                 for src in sources:
                     info = src.tensors[key]
                     itemsize = _STORAGE_ITEMSIZE[info.storage.storage_class]
-                    _copy_blob(src.pt_path, info.storage.key, dst,
-                               info.numel * itemsize)
+                    if src.row_keep is None:
+                        _copy_blob(src.pt_path, info.storage.key, dst,
+                                   info.numel * itemsize)
+                    else:
+                        _copy_blob_rows(src.pt_path, info.storage.key, dst,
+                                        info.numel * itemsize, src.row_keep)
     return shapes
 
 
@@ -656,15 +729,24 @@ def write_concat_parquet(sources: list[CacheSource], out_path: Path,
 
     cache_row counts rows across the whole output, so it indexes axis 0 of the
     concatenated tensor. Sources are consumed in the same order as the tensor
-    pass, which is what keeps the two in step.
+    pass, which is what keeps the two in step; a source's row_keep drops the
+    same rows here as there.
     """
     written = 0
     writer = pq.ParquetWriter(str(out_path), schema)
     try:
         for src in sources:
             pf = pq.ParquetFile(str(src.parquet_path))
+            src_offset = 0
             try:
                 for batch in pf.iter_batches(batch_size=_BATCH_ROWS):
+                    if src.row_keep is not None:
+                        sel = src.row_keep[src_offset:src_offset + batch.num_rows]
+                        src_offset += batch.num_rows
+                        if not sel.any():
+                            continue
+                        if not sel.all():
+                            batch = batch.filter(pa.array(sel))
                     n = batch.num_rows
                     columns = []
                     present = {_renamed(name): batch.column(i)
@@ -773,7 +855,7 @@ class ConcatPlan:
 
     @property
     def total_rows(self) -> int:
-        return sum(s.nrows for s in self.usable)
+        return sum(s.kept_rows for s in self.usable)
 
 
 class ConcatResult:
